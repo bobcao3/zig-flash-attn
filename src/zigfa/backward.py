@@ -1,0 +1,472 @@
+import functools
+import heapq
+import math
+from typing import NamedTuple
+
+from . import runtime, specialization
+from .tensormap import as_four_dimensional, tensor_map, tiled_tensor_map
+from .tensors import (
+    LOG2_E,
+    View,
+    build_scheduler_metadata,
+    default_softmax_scale,
+    require_aligned,
+    require_window,
+    scheduler_metadata_entries,
+    sequence_layout,
+    varlen_blocks,
+    view_of,
+)
+
+PREPROCESS_SIGNATURE = "p" * 7 + "u" + "p" * 11 + "u"
+SCALAR_SIGNATURE = "uuu" + "ff" + "ii"
+BACKWARD_SIGNATURE = "p" * 11 + SCALAR_SIGNATURE + "p" * 23 + "u"
+TENSOR_MAP_BACKWARD_SIGNATURE = "m" * 4 + "p" * 7 + SCALAR_SIGNATURE + "p" * 11 + "u"
+DQ_ACCUM_MAP_BACKWARD_SIGNATURE = "m" * 5 + "p" * 6 + SCALAR_SIGNATURE + "p" * 8 + "u"
+DQ_SIGNATURE = "m" * 4 + "p" * 5 + SCALAR_SIGNATURE + "p" * 5 + "u"
+POSTPROCESS_SIGNATURE = "ppp" + "uf" + "p" * 6 + "u"
+PREPROCESS_ROWS = 32
+POSTPROCESS_ROWS = 16
+AUXILIARY_THREADS = 256
+
+
+ACCUMULATOR_PADDING_ROWS = 128
+HEAD_SPLITS = 4
+HEAD_SPLIT_MINIMUM_GROUP = 16
+HEAD_SPLIT_EFFICIENCY = 0.92
+WAVE_SPLIT_TRIGGER_EFFICIENCY = 0.85
+WAVE_SPLIT_TARGET_EFFICIENCY = 0.9
+TWO_CTA_HEAD_SPLIT_MIN_ROWS = 4096
+CLEAR_SIGNATURE = "pu"
+CLEAR_BLOCKS = 512
+
+
+class BackwardWorkspace(NamedTuple):
+    facts: specialization.ShapeFacts
+    lse_padding: int
+    accumulator_padding: int
+    dkv_accum: bool
+    scheduler_metadata_rows: int
+
+
+def accumulator_shape(q_shape, padding_rows):
+    total = q_shape[0] * q_shape[1] if len(q_shape) == 4 else q_shape[0]
+    return q_shape[-2], total + padding_rows, q_shape[-1]
+
+
+@functools.cache
+def backward_workspace_layout(
+    device_id, q_shape, k_shape, window_size_left, window_size_right, cu_seqlens_shape, max_seqlen_q, max_seqlen_k
+):
+    facts = specialization.facts(q_shape, k_shape, cu_seqlens_shape, max_seqlen_q, max_seqlen_k)
+    infos = specialization.reachable(device_id, "bwd", q_shape[-1], facts)
+    return BackwardWorkspace(
+        facts,
+        max(max(info.block_m, info.dq_block_m) for info in infos),
+        max(ACCUMULATOR_PADDING_ROWS, *(info.block_m for info in infos)),
+        k_shape is not None
+        and any(
+            info.head_split and head_split_pays(device_id, info, q_shape, k_shape, window_size_left, window_size_right)
+            for info in infos
+        ),
+        min(((info.cluster_ctas or 1) * info.block_n for info in infos if info.scheduler_metadata), default=0),
+    )
+
+
+@functools.cache
+def backward_mode(
+    device_id, q_shape, k_shape, window_size_left, window_size_right, cu_seqlens_shape, max_seqlen_q, max_seqlen_k
+):
+    layout = backward_workspace_layout(
+        device_id, q_shape, k_shape, window_size_left, window_size_right, cu_seqlens_shape, max_seqlen_q, max_seqlen_k
+    )
+    regular = next((info for _, info in specialization.declared_instances(device_id, "bwd", q_shape[-1], (specialization.Mode.REGULAR,))), None)
+    two_cta_split = bool(regular and regular.head_split and regular.cluster_ctas) and head_split_pays(
+        device_id, regular, q_shape, k_shape, window_size_left, window_size_right
+    )
+    mode = specialization.Mode.REGULAR if two_cta_split else specialization.choose(
+        device_id,
+        "bwd",
+        q_shape[-1],
+        layout.facts,
+        lambda info, facts: specialization.accepts(info, facts)
+        and (
+            not info.head_split
+            or head_split_pays(device_id, info, q_shape, k_shape, window_size_left, window_size_right)
+        ),
+    )
+    specialization.log_choice(
+        "backward", device_id, q_shape[-1], mode, q=q_shape, k=k_shape,
+        window=(window_size_left, window_size_right), cu_seqlens=cu_seqlens_shape,
+        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+    )
+    return mode
+
+
+def backward_workspace_shapes(
+    q_shape,
+    lse_shape,
+    k_shape=None,
+    window_size_left=-1,
+    window_size_right=-1,
+    *,
+    cu_seqlens_shape=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+):
+    require_window(window_size_left, window_size_right)
+    layout = backward_workspace_layout(
+        runtime.current_device().device_id,
+        q_shape,
+        k_shape,
+        window_size_left,
+        window_size_right,
+        cu_seqlens_shape,
+        max_seqlen_q,
+        max_seqlen_k,
+    )
+    lse_elements = math.prod(lse_shape) + layout.lse_padding
+    shapes = (lse_elements,), (lse_elements,), accumulator_shape(q_shape, layout.accumulator_padding)
+    if layout.dkv_accum:
+        shapes += ((2, *accumulator_shape(k_shape, layout.accumulator_padding)),)
+    if layout.scheduler_metadata_rows:
+        if k_shape is None:
+            raise ValueError("backward_workspace_shapes needs k_shape for varlen inputs")
+        shapes += ((scheduler_metadata_entries(k_shape[0], layout.facts.batch_size, layout.scheduler_metadata_rows), 2),)
+    return shapes
+
+
+@functools.cache
+def schedule_efficiency(batch_size, num_n_blocks, num_head_kv, qhead_per_kvhead, num_m_blocks, block_ratio, num_sm):
+    works = [
+        qhead_per_kvhead * (num_m_blocks - block * block_ratio)
+        for _ in range(batch_size)
+        for _ in range(num_head_kv)
+        for block in range(num_n_blocks)
+    ]
+    finish = [0] * num_sm
+    for work in works:
+        heapq.heappush(finish, heapq.heappop(finish) + work)
+    return sum(works) / num_sm / max(finish)
+
+
+def two_cta_head_splits(device_id, info, q_shape, k_shape, window_size_left, window_size_right):
+    if len(q_shape) != 4 or window_size_left >= 0 or window_size_right >= 0 or q_shape[1] < TWO_CTA_HEAD_SPLIT_MIN_ROWS:
+        return 1
+    batch_size, _, num_head, _ = q_shape
+    seqlen_k, num_head_kv = k_shape[1], k_shape[2]
+    clusters = batch_size * num_head_kv * -(-seqlen_k // (info.cluster_ctas * info.block_n))
+    slots = runtime.num_sm(device_id) // info.cluster_ctas
+    num_qhead_splits = 1
+    while (
+        specialization.fill(clusters * num_qhead_splits, slots) < WAVE_SPLIT_TARGET_EFFICIENCY
+        and num_head // num_head_kv % (2 * num_qhead_splits) == 0
+    ):
+        num_qhead_splits *= 2
+    return num_qhead_splits
+
+
+def head_split_pays(device_id, info, q_shape, k_shape, window_size_left, window_size_right):
+    if info.cluster_ctas:
+        return two_cta_head_splits(device_id, info, q_shape, k_shape, window_size_left, window_size_right) > 1
+    if len(q_shape) != 4 or window_size_left >= 0 or window_size_right != 0:
+        return False
+    batch_size, seqlen_q, num_head, _ = q_shape
+    seqlen_k, num_head_kv = k_shape[1], k_shape[2]
+    qhead_per_kvhead = num_head // num_head_kv
+    if qhead_per_kvhead < HEAD_SPLIT_MINIMUM_GROUP or qhead_per_kvhead % HEAD_SPLITS or seqlen_q != seqlen_k:
+        return False
+    efficiency = schedule_efficiency(
+        batch_size,
+        (seqlen_k + info.block_n - 1) // info.block_n,
+        num_head_kv,
+        qhead_per_kvhead,
+        (seqlen_q + info.block_m - 1) // info.block_m,
+        info.block_n // info.block_m,
+        runtime.num_sm(device_id),
+    )
+    return efficiency < HEAD_SPLIT_EFFICIENCY
+
+
+def accumulator_strides(q_shape, padding_rows):
+    heads, rows, head_dim = accumulator_shape(q_shape, padding_rows)
+    batch_stride = q_shape[1] * head_dim if len(q_shape) == 4 else 0
+    return batch_stride, head_dim, rows * head_dim
+
+
+def backward(
+    q,
+    k,
+    v,
+    out,
+    dout,
+    softmax_lse,
+    dq,
+    dk,
+    dv,
+    workspace,
+    *,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+    softmax_scale=None,
+    window_size_left=-1,
+    window_size_right=-1,
+    stream=None,
+):
+    lse_log2, dpsum, dq_accum, *extra = workspace
+    views = {name: view_of(t) for name, t in dict(
+        q=q, k=k, v=v, out=out, dout=dout, lse=softmax_lse, dq=dq, dk=dk, dv=dv,
+        lse_log2=lse_log2, dpsum=dpsum, dq_accum=dq_accum,
+    ).items()}
+    head_dim = views["q"].shape[-1]
+    num_head, num_head_kv = views["q"].shape[-2], views["k"].shape[-2]
+    qhead_per_kvhead = num_head // num_head_kv
+    require_window(window_size_left, window_size_right)
+    for name in ("q", "k", "v", "out", "dout", "dq", "dk", "dv"):
+        require_aligned(name, views[name], head_dim)
+    varlen = cu_seqlens_q is not None
+    device_id = runtime.current_device().device_id
+    key = (
+        device_id,
+        views["q"].shape,
+        views["k"].shape,
+        window_size_left,
+        window_size_right,
+        view_of(cu_seqlens_q).shape if varlen else None,
+        max_seqlen_q,
+        max_seqlen_k,
+    )
+    layout = backward_workspace_layout(*key)
+    if len(extra) != layout.dkv_accum + bool(layout.scheduler_metadata_rows):
+        raise ValueError("pass the workspace that backward_workspace_shapes returns for these shapes and this window")
+    (
+        batch_size, seqlen_q, seqlen_k, cu_seqlens_q_pointer, cu_seqlens_k_pointer, row_axis_len_q, row_axis_len_k,
+        lse_batch_stride, lse_head_stride,
+    ) = sequence_layout(views["q"], views["k"], views["lse"], cu_seqlens_q, cu_seqlens_k)
+    if not row_axis_len_q and not row_axis_len_k:
+        return
+    mode = backward_mode(*key)
+    main, info = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd", mode.value)
+    dkv_accum = extra[: layout.dkv_accum] if info.head_split else ()
+
+    def blocks(rows, block):
+        return varlen_blocks(rows, batch_size, block) if varlen else (rows + block - 1) // block
+
+    def row_blocks(rows, block):
+        return (rows + block - 1) // block if info.scheduler_metadata else blocks(rows, block)
+
+    cluster_ctas = info.cluster_ctas or 1
+    num_n_blocks = (
+        scheduler_metadata_entries(row_axis_len_k, batch_size, cluster_ctas * info.block_n)
+        if info.scheduler_metadata
+        else blocks(row_axis_len_k, cluster_ctas * info.block_n)
+    )
+
+    grid_z = 1 if varlen else batch_size
+    softmax_scale = default_softmax_scale(softmax_scale, head_dim)
+    head_splits = (
+        (two_cta_head_splits(device_id, info, tuple(views["q"].shape), tuple(views["k"].shape), window_size_left, window_size_right) if info.cluster_ctas else HEAD_SPLITS)
+        if dkv_accum
+        else 1
+    )
+    outputs = {name: views[name] for name in ("dk", "dv")}
+    if dkv_accum:
+        accumulator = view_of(dkv_accum[0])
+        _, accumulator_rows, _ = accumulator_shape(views["k"].shape, layout.accumulator_padding)
+        half = num_head_kv * accumulator_rows * head_dim
+        strides = (seqlen_k * head_dim, head_dim, accumulator_rows * head_dim, 1)
+        for index, name in enumerate(("dk", "dv")):
+            views[name] = View(accumulator.pointer + index * half * 4, views["k"].shape, strides)
+        clear, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_clear", mode.value)
+        runtime.run(
+            clear, (CLEAR_BLOCKS, 1, 1), AUXILIARY_THREADS, 0, CLEAR_SIGNATURE, (accumulator.pointer, half // 2), stream
+        )
+
+    def row_strides(name):
+        view = views[name]
+        return (0 if varlen else view.strides[0]), view.strides[-3], view.strides[-2]
+
+    accum_strides = accumulator_strides(tuple(views["q"].shape), layout.accumulator_padding)
+    preprocess, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_preprocess", mode.value)
+    if info.box_columns:
+        maps = tuple(
+            tensor_map(views[name].pointer, *as_four_dimensional(views[name]), rows, info.box_columns, info.swizzle_bytes)
+            for name, rows in (("q", info.block_m), ("k", info.block_n), ("v", info.block_n), ("dout", info.block_m))
+        )
+        scalars = (
+            cu_seqlens_q_pointer, cu_seqlens_k_pointer, seqlen_q, seqlen_k, qhead_per_kvhead,
+            softmax_scale * LOG2_E, softmax_scale, window_size_left, window_size_right,
+        )
+        if info.bulk_reduce:
+            signature = DQ_ACCUM_MAP_BACKWARD_SIGNATURE
+            accumulator_heads, accumulator_rows, accumulator_head_dim = accumulator_shape(
+                tuple(views["q"].shape), layout.accumulator_padding
+            )
+            if info.dq_accum_interleave:
+                dq_accum_map = tiled_tensor_map(
+                    views["dq_accum"].pointer,
+                    (accumulator_heads, info.block_m // 8, accumulator_rows, 2, accumulator_head_dim),
+                    (
+                        accumulator_rows * accumulator_head_dim,
+                        8 * accumulator_head_dim,
+                        accumulator_head_dim,
+                        4 * accumulator_head_dim,
+                        1,
+                    ),
+                    (1, info.block_m // 8, 4, 2, info.dq_accum_box_columns),
+                    info.dq_accum_box_columns * 4,
+                    element_bytes=4,
+                )
+            else:
+                dq_accum_map = tensor_map(
+                    views["dq_accum"].pointer,
+                    (1, accumulator_rows, accumulator_heads, accumulator_head_dim),
+                    (
+                        accumulator_heads * accumulator_rows * accumulator_head_dim,
+                        accumulator_head_dim,
+                        accumulator_rows * accumulator_head_dim,
+                        1,
+                    ),
+                    info.dq_accum_box_rows or info.block_m,
+                    info.dq_accum_box_columns,
+                    info.dq_accum_box_columns * 4,
+                    element_bytes=4,
+                )
+            maps += (dq_accum_map,)
+            main_values = (
+                *maps, views["lse_log2"].pointer, views["dpsum"].pointer, views["dk"].pointer, views["dv"].pointer,
+                *scalars, *row_strides("dk"), *row_strides("dv"), lse_batch_stride, lse_head_stride, batch_size,
+            )
+        else:
+            signature = TENSOR_MAP_BACKWARD_SIGNATURE
+            main_values = (
+                *maps, views["lse_log2"].pointer, views["dpsum"].pointer, views["dq_accum"].pointer,
+                views["dk"].pointer, views["dv"].pointer,
+                *scalars, *row_strides("dk"), *row_strides("dv"), *accum_strides,
+                lse_batch_stride, lse_head_stride, batch_size,
+            )
+    else:
+        signature = BACKWARD_SIGNATURE
+        main_values = (
+            views["q"].pointer, views["k"].pointer, views["v"].pointer, views["dout"].pointer,
+            views["lse_log2"].pointer, views["dpsum"].pointer, views["dq_accum"].pointer,
+            views["dk"].pointer, views["dv"].pointer, cu_seqlens_q_pointer, cu_seqlens_k_pointer,
+            seqlen_q, seqlen_k, qhead_per_kvhead, softmax_scale * LOG2_E, softmax_scale,
+            window_size_left, window_size_right,
+            *row_strides("q"), *row_strides("k"), *row_strides("v"), *row_strides("dout"),
+            *row_strides("dk"), *row_strides("dv"), *accum_strides, lse_batch_stride, lse_head_stride,
+            batch_size,
+        )
+    if info.scheduler_metadata:
+        signature += "p"
+        main_values += (
+            build_scheduler_metadata(
+                extra[-1], "bwd", head_dim, mode.value, "flash_attn_bwd", cu_seqlens_k_pointer, cu_seqlens_q_pointer,
+                batch_size, num_n_blocks, "backward_workspace_shapes", stream,
+            ),
+        )
+    if info.dkv_box_rows:
+        signature += "mm"
+        main_values += tuple(
+            tensor_map(view.pointer, *as_four_dimensional(view), info.dkv_box_rows, info.box_columns, info.swizzle_bytes)
+            for view in (outputs["dk"], outputs["dv"])
+        )
+    runtime.run(
+        preprocess,
+        (row_blocks(row_axis_len_q, PREPROCESS_ROWS), num_head, grid_z),
+        AUXILIARY_THREADS,
+        0,
+        PREPROCESS_SIGNATURE,
+        (
+            views["out"].pointer, views["dout"].pointer, views["lse"].pointer,
+            views["lse_log2"].pointer, views["dpsum"].pointer, views["dq_accum"].pointer,
+            cu_seqlens_q_pointer, seqlen_q,
+            *row_strides("out"), *row_strides("dout"), lse_batch_stride, lse_head_stride, *accum_strides,
+            batch_size,
+        ),
+        stream,
+    )
+    num_qhead_splits = 1
+    while (
+        info.min_qhead_per_split and window_size_left < 0 and 2 * num_qhead_splits <= info.max_qhead_splits
+        and qhead_per_kvhead % (2 * num_qhead_splits) == 0 and qhead_per_kvhead // (2 * num_qhead_splits) >= info.min_qhead_per_split
+        and (not info.qhead_split_bounded_only or window_size_right >= 0)
+    ):
+        num_qhead_splits *= 2
+    if num_qhead_splits == 1 and info.qhead_split_by_waves:
+        num_sm = runtime.num_sm(device_id)
+
+        def efficiency(count):
+            return specialization.fill(cluster_ctas * num_n_blocks * num_head_kv * count * grid_z, num_sm)
+
+        allowed = [
+            count for count in (1 << power for power in range(max(1, info.max_qhead_splits).bit_length()))
+            if qhead_per_kvhead % count == 0
+            and (count == 1 or qhead_per_kvhead // count >= info.min_qhead_per_split)
+        ]
+        if efficiency(1) < WAVE_SPLIT_TRIGGER_EFFICIENCY:
+            num_qhead_splits = next(
+                (count for count in allowed if efficiency(count) >= WAVE_SPLIT_TARGET_EFFICIENCY),
+                max(allowed, key=efficiency),
+            )
+    runtime.run(
+        main,
+        (cluster_ctas * num_n_blocks * head_splits, num_head_kv * num_qhead_splits, grid_z),
+        info.threads,
+        info.shared_bytes,
+        signature,
+        main_values,
+        stream,
+        pdl=info.pdl,
+        cluster_dims=(1, num_qhead_splits, 1) if num_qhead_splits > 1 else None,
+    )
+    if info.dq_block_m:
+        dq_kernel, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_dq", mode.value)
+        runtime.run(
+            dq_kernel,
+            (cluster_ctas * blocks(row_axis_len_q, info.dq_block_m), num_head, grid_z),
+            info.threads,
+            info.shared_bytes,
+            DQ_SIGNATURE,
+            (
+                *maps, views["lse_log2"].pointer, views["dpsum"].pointer, views["dq"].pointer,
+                cu_seqlens_q_pointer, cu_seqlens_k_pointer, seqlen_q, seqlen_k, qhead_per_kvhead,
+                softmax_scale * LOG2_E, softmax_scale, window_size_left, window_size_right,
+                *row_strides("dq"), lse_batch_stride, lse_head_stride, batch_size,
+            ),
+            stream,
+            pdl=info.pdl,
+        )
+        return
+    postprocess, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_postprocess", mode.value)
+    runtime.run(
+        postprocess,
+        (row_blocks(row_axis_len_q, POSTPROCESS_ROWS), num_head, grid_z),
+        AUXILIARY_THREADS,
+        0,
+        POSTPROCESS_SIGNATURE,
+        (
+            views["dq_accum"].pointer, views["dq"].pointer, cu_seqlens_q_pointer, seqlen_q, softmax_scale,
+            *accum_strides, *row_strides("dq"), batch_size,
+        ),
+        stream,
+        pdl=info.pdl,
+    )
+    for name, output in outputs.items() if dkv_accum else ():
+        runtime.run(
+            postprocess,
+            (blocks(row_axis_len_k, POSTPROCESS_ROWS), num_head_kv, grid_z),
+            AUXILIARY_THREADS,
+            0,
+            POSTPROCESS_SIGNATURE,
+            (
+                views[name].pointer, output.pointer, cu_seqlens_k_pointer, seqlen_k, 1.0,
+                *accumulator_strides(views["k"].shape, layout.accumulator_padding),
+                (0 if varlen else output.strides[0]),
+                output.strides[-3], output.strides[-2], batch_size,
+            ),
+            stream,
+            pdl=info.pdl,
+        )
