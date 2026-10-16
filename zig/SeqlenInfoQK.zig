@@ -28,7 +28,12 @@ pub fn resolve(
 }
 
 pub fn flatRows(cu_seqlens: u64, num_batch: u32, seqlen: u32) SeqlenInfoQK {
-    if (cu_seqlens == 0) return .{ .offset_q = 0, .offset_k = 0, .seqlen_q = seqlen, .seqlen_k = seqlen };
+    if (cu_seqlens == 0) return .{
+        .offset_q = 0,
+        .offset_k = 0,
+        .seqlen_q = seqlen,
+        .seqlen_k = seqlen,
+    };
     const m_cu_seqlens: [*]addrspace(.global) const i32 = @ptrFromInt(cu_seqlens);
     const first: u32 = @intCast(m_cu_seqlens[0]);
     const rows: u32 = @intCast(m_cu_seqlens[num_batch] - m_cu_seqlens[0]);

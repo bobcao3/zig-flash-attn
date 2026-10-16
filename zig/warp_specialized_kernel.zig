@@ -13,9 +13,9 @@ pub fn WarpSpecializedKernel(comptime Params: type, comptime Roles: type) type {
             var role_registers: u32 = 0;
             var next_warp: u32 = 0;
             for (Roles.roles) |role| {
-                role_registers += role.warps * role.registers * 32;
-                std.debug.assert(role.first_warp == next_warp);
-                next_warp += role.warps;
+                _, const warps, const registers = role;
+                role_registers += warps * registers * 32;
+                next_warp += warps;
             }
             std.debug.assert(role_registers <= Roles.max_registers * Roles.thread_count);
             std.debug.assert(next_warp == Roles.thread_count / 32);
@@ -40,32 +40,39 @@ pub fn WarpSpecializedKernel(comptime Params: type, comptime Roles: type) type {
                 if (elect.oneSync()) tma.prefetchMaps(args);
                 elect.reconverge();
             }
-            mbarrier.pipelineInitWait(Roles.init_scope, Roles.thread_count, if (initializes) .initializer else .other);
-            if (@hasDecl(Roles, "tmem_warps")) handOffTmem();
-            inline for (Roles.roles) |role| {
-                if (thread.warp() >= role.first_warp and thread.warp() < role.first_warp + role.warps) {
-                    if (role.registers > Roles.max_registers) {
-                        asm volatile (std.fmt.comptimePrint("setmaxnreg.inc.sync.aligned.u32 {d};", .{role.registers}));
-                    } else if (role.registers < Roles.max_registers) {
-                        asm volatile (std.fmt.comptimePrint("setmaxnreg.dec.sync.aligned.u32 {d};", .{role.registers}));
-                    }
-                    role.Role.run(params, args);
+            mbarrier.pipelineInitWait(
+                Roles.init_scope,
+                Roles.thread_count,
+                if (initializes) .initializer else .other,
+            );
+            const tmem = @hasDecl(Roles, "tmem_warps");
+            if (tmem and Roles.tmem_warps >> @intCast(thread.warp()) & 1 != 0) {
+                const clustered = Roles.init_scope == .launch and cluster.count() > 1;
+                if (Roles.init_scope == .cluster or clustered) {
+                    const tmem_threads = comptime @as(u32, @popCount(Roles.tmem_warps)) * 32;
+                    nvptx.barrierSyncAligned(Roles.tmem_barrier, tmem_threads);
                 }
+                tcgen05.fenceAfterSync();
             }
-        }
-
-        fn handOffTmem() void {
-            if (Roles.tmem_warps >> @intCast(thread.warp()) & 1 == 0) return;
-            switch (Roles.init_scope) {
-                .cta => {},
-                .cluster => syncTmemWarps(),
-                .launch => if (cluster.count() > 1) syncTmemWarps(),
+            comptime var first_warp: u32 = 0;
+            inline for (Roles.roles) |role| {
+                const runRole, const warps, const registers = role;
+                if (thread.warp() >= first_warp and thread.warp() < first_warp + warps) {
+                    if (registers > Roles.max_registers) {
+                        asm volatile (std.fmt.comptimePrint(
+                                "setmaxnreg.inc.sync.aligned.u32 {d};",
+                                .{registers},
+                            ));
+                    } else if (registers < Roles.max_registers) {
+                        asm volatile (std.fmt.comptimePrint(
+                                "setmaxnreg.dec.sync.aligned.u32 {d};",
+                                .{registers},
+                            ));
+                    }
+                    runRole(params, args);
+                }
+                first_warp += warps;
             }
-            tcgen05.fenceAfterSync();
-        }
-
-        fn syncTmemWarps() void {
-            nvptx.barrierSyncAligned(Roles.tmem_barrier, comptime @as(u32, @popCount(Roles.tmem_warps)) * 32);
         }
     };
 }

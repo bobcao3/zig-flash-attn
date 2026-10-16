@@ -21,37 +21,35 @@ pub const Scope = enum { cta, cluster, launch };
 pub const Waiter = enum { initializer, other };
 
 pub fn wait(comptime order: Order, barrier: *addrspace(.shared) Mbarrier, phase: u32) void {
-    const instruction = comptime if (nvptx.gpu.sm < 90) blk: {
-        std.debug.assert(order == .cta);
-        break :blk "mbarrier.test_wait.parity.shared.b64";
-    } else switch (order) {
-        .cta => "mbarrier.try_wait.parity.shared.b64",
-        .cluster => "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64",
-    };
-    const parity = switch (order) {
-        .cta => phase & 1,
-        .cluster => phase,
-    };
-    while (!asm volatile (instruction ++ " %[done], [%[barrier]], %[parity];"
-        : [done] "=b" (-> bool),
-        : [barrier] "r" (barrier),
-          [parity] "r" (parity),
-        : .{ .memory = true }))
-    {}
+    const parity = phase & 1;
+    if (comptime nvptx.gpu.sm < 90) {
+        comptime std.debug.assert(order == .cta);
+        while (!barrier.testWaitPhase(parity)) {}
+        return;
+    }
+    switch (order) {
+        .cta => while (!barrier.tryWaitPhase(parity, null, null)) {},
+        .cluster => while (!barrier.tryWaitPhase(phase, .{
+            .semantics = .acquire,
+            .scope = .cluster,
+        }, null)) {},
+    }
 }
 
-pub fn waitSuspendHint(barrier: *addrspace(.shared) Mbarrier, phase: u32, comptime nanoseconds: u32) void {
+pub fn waitSuspendHint(
+    barrier: *addrspace(.shared) Mbarrier,
+    phase: u32,
+    comptime nanoseconds: u32,
+) void {
     if (nanoseconds == 0) return wait(.cta, barrier, phase);
-    while (!asm volatile ("mbarrier.try_wait.parity.shared.b64 %[done], [%[barrier]], %[parity], %[hint];"
-        : [done] "=b" (-> bool),
-        : [barrier] "r" (barrier),
-          [parity] "r" (phase & 1),
-          [hint] "n" (nanoseconds),
-        : .{ .memory = true }))
-    {}
+    while (!barrier.tryWaitPhase(phase & 1, null, nanoseconds)) {}
 }
 
-pub fn waitBackoff(barrier: *addrspace(.shared) Mbarrier, phase: u32, comptime nanoseconds: u32) void {
+pub fn waitBackoff(
+    barrier: *addrspace(.shared) Mbarrier,
+    phase: u32,
+    comptime nanoseconds: u32,
+) void {
     if (nanoseconds == 0) return wait(.cta, barrier, phase);
     while (!barrier.tryWaitParity(@truncate(phase))) nvptx.nanosleep(nanoseconds);
 }
@@ -64,8 +62,10 @@ pub fn arrive(comptime arrival: Arrival, barrier: *addrspace(.shared) Mbarrier) 
             if (arrival != .warp) nvptx.barWarpSync(.all);
             if (elect.oneSync()) switch (arrival) {
                 .warp, .warp_synced => _ = barrier.arrive(),
-                .leader_cta => cluster.arrive(cluster.leaderAddress(barrier)),
-                .leader_release_cluster => cluster.arriveReleaseCluster(cluster.leaderAddress(barrier)),
+                .leader_cta => nvptx.mbarrier.arriveCluster(cluster.leaderAddress(barrier), null),
+                .leader_release_cluster => cluster.arriveReleaseCluster(
+                    cluster.leaderAddress(barrier),
+                ),
                 .peer_release_cluster => cluster.arriveReleaseCluster(cluster.peerAddress(barrier)),
                 else => comptime unreachable,
             };
@@ -84,15 +84,15 @@ pub fn arrivals(comptime arrival: Arrival, comptime warps: u32, ctas: u32) u32 {
 
 pub fn pipelineInitFence() void {
     if (nvptx.gpu.sm < 90) return;
-    asm volatile ("fence.mbarrier_init.release.cluster;" ::: .{ .memory = true });
+    nvptx.fenceMbarrierInit();
     nvptx.fenceProxyAsync(.shared);
 }
 
 pub fn pipelineInitArrive(comptime scope: Scope) void {
     switch (scope) {
         .cta => {},
-        .cluster => cluster.arriveRelaxed(),
-        .launch => if (cluster.count() > 1) cluster.arriveRelaxed(),
+        .cluster => nvptx.barrierClusterArrive(.relaxed, true),
+        .launch => if (cluster.count() > 1) nvptx.barrierClusterArrive(.relaxed, true),
     }
 }
 
@@ -142,7 +142,10 @@ test "the pipeline state gives the slot and the phase parity of a ring" {
             const state: PipelineState(stages) = .{ .count = @intCast(count) };
             try std.testing.expectEqual(count % stages, state.index());
             try std.testing.expectEqual(count / stages & 1, state.phase() & 1);
-            if (count >= stages) try std.testing.expectEqual((count / stages - 1) & 1, (state.phase() ^ 1) & 1);
+            if (count >= stages) try std.testing.expectEqual(
+                (count / stages - 1) & 1,
+                (state.phase() ^ 1) & 1,
+            );
         }
     }
 }

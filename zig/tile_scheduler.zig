@@ -9,7 +9,7 @@ const cluster = @import("cluster.zig");
 const mbarrier = @import("mbarrier.zig");
 const prepare_scheduler = @import("prepare_scheduler.zig");
 
-pub const SchedulingMode = enum { single_tile, static, dynamic, clc };
+pub const SchedulingMode = enum { single_tile, dynamic, clc };
 
 pub const WorkTileInfo = struct {
     block: u32,
@@ -60,8 +60,8 @@ pub const TileSchedulerArguments = struct {
     qhead_per_kvhead: u32,
     window_size_left: i32,
     window_size_right: i32,
-    cu_seqlens: u64,
-    cu_seqlens_other: u64,
+    cu_seqlens: u64 = 0,
+    cu_seqlens_other: u64 = 0,
     scheduler_metadata: u64 = 0,
 
     pub fn numHb(args: TileSchedulerArguments) u32 {
@@ -106,7 +106,13 @@ pub const SectionDivisors = struct {
     num_head_divmod: FastDivmodDivisor,
     qhead_per_kvhead_divmod: FastDivmodDivisor,
 
-    pub fn init(num_block: u32, num_hb: u32, l2_minor: u32, num_head: u32, qhead_per_kvhead: u32) SectionDivisors {
+    pub fn init(
+        num_block: u32,
+        num_hb: u32,
+        l2_minor: u32,
+        num_head: u32,
+        qhead_per_kvhead: u32,
+    ) SectionDivisors {
         return .{
             .l2_major_divmod = .init(l2_minor * num_block),
             .l2_minor_divmod = .init(l2_minor),
@@ -120,9 +126,13 @@ pub const SectionDivisors = struct {
     pub fn section(divisors: SectionDivisors, tile_idx: u32) Section {
         const section_idx = divisors.l2_major_divmod.divide(tile_idx);
         const l2_mod = tile_idx - section_idx * divisors.l2_major_divmod.divisor;
-        const heads = if (section_idx < divisors.full_sections) divisors.l2_minor_divmod else divisors.last_section_divmod;
+        const heads = if (section_idx < divisors.full_sections)
+            divisors.l2_minor_divmod
+        else
+            divisors.last_section_divmod;
         const block = heads.divide(l2_mod);
-        return .{ .block = block, .bidhb = section_idx * divisors.l2_minor_divmod.divisor + l2_mod - block * heads.divisor };
+        return .{ .block = block, .bidhb = section_idx * divisors.l2_minor_divmod.divisor +
+            l2_mod - block * heads.divisor };
     }
 };
 
@@ -168,7 +178,8 @@ pub fn section(tile_idx: u32, num_block: u32, num_hb: u32, l2_minor: u32) Sectio
     const section_idx = tile_idx / l2_major;
     const l2_mod = tile_idx % l2_major;
     const num_hb_quotient = num_hb / l2_minor;
-    const nheads_in_this_section = if (section_idx < num_hb_quotient) l2_minor else num_hb % l2_minor;
+    const nheads_in_this_section =
+        if (section_idx < num_hb_quotient) l2_minor else num_hb % l2_minor;
     return .{
         .block = l2_mod / nheads_in_this_section,
         .bidhb = section_idx * l2_minor + l2_mod % nheads_in_this_section,
@@ -194,7 +205,8 @@ pub fn locate(
     while (first_batch < num_batch) : (first_batch += 32) {
         const index = first_batch + lane;
         const blocks: u32 = if (index < num_batch)
-            (@as(u32, @intCast(m_cu_seqlens[index + 1] - m_cu_seqlens[index])) + block_m - 1) / block_m
+            (@as(u32, @intCast(m_cu_seqlens[index + 1] - m_cu_seqlens[index])) + block_m - 1) /
+                block_m
         else
             0;
         var inclusive = if (batch_major) blocks * heads else blocks;
@@ -213,13 +225,15 @@ pub fn locate(
                 const sequence_block = offset % owner_blocks;
                 return .{
                     .batch = first_batch + owner,
-                    .block = if (block_order == .descending) owner_blocks - 1 - sequence_block else sequence_block,
+                    .block = if (block_order == .descending) owner_blocks -
+                        1 - sequence_block else sequence_block,
                     .head = offset / owner_blocks,
                 };
             }
             return .{
                 .batch = first_batch + owner,
-                .block = if (block_order == .descending) owner_inclusive - 1 - local else local - (owner_inclusive - owner_blocks),
+                .block = if (block_order == .descending) owner_inclusive -
+                    1 - local else local - (owner_inclusive - owner_blocks),
             };
         }
         first_block += window_blocks;
@@ -248,7 +262,6 @@ pub fn PersistentScheduler(comptime mode: SchedulingMode, comptime options: ClcO
 
             pub fn producerTail(_: Scheduler) void {}
         },
-        .static => @compileError("a static persistent grid strides over the tiles without shared scheduler state"),
         .dynamic => DynamicPersistentTileFetch(2),
         .clc => ClcTileFetch(options),
     };
@@ -259,7 +272,8 @@ pub fn ClcTileFetch(comptime options: ClcOptions) type {
     const cluster_scope = clustered and options.release_scope == .cluster;
     const NextWork = if (options.axis == null) u32 else ?[3]u32;
     const order: mbarrier.Order = if (cluster_scope) .cluster else .cta;
-    const release: mbarrier.Arrival = if (!clustered) .thread else if (cluster_scope) .leader_release_cluster else .leader_cta;
+    const release: mbarrier.Arrival =
+        if (!clustered) .thread else if (cluster_scope) .leader_release_cluster else .leader_cta;
     return struct {
         count: u32,
 
@@ -291,14 +305,17 @@ pub fn ClcTileFetch(comptime options: ClcOptions) type {
         }
 
         pub fn prefetchNextWorkAs(fetch: Fetch, comptime role: ?CtaRole) void {
-            const leader_cta = if (role) |known| known == .leader else !clustered or cluster.rankIn2Cta() == 0;
+            const leader_cta =
+                if (role) |known| known == .leader else !clustered or cluster.rankIn2Cta() == 0;
             if (leader_cta and fetch.count > 0) mbarrier.wait(order, &empty, fetch.count - 1);
             if (elect.oneSync()) {
-                if (!cluster_scope and leader_cta) nvptx.fenceProxyAsync(if (clustered) null else .shared);
+                if (!cluster_scope and leader_cta) nvptx.fenceProxyAsync(
+                    if (clustered) null else .shared,
+                );
                 _ = full.arriveExpectTx(@sizeOf(@TypeOf(response)));
                 if (leader_cta) {
                     if (cluster_scope) {
-                        asm volatile ("fence.proxy.async::generic.acquire.sync_restrict::shared::cluster.cluster;" ::: .{ .memory = true });
+                        nvptx.fenceProxyAsyncSyncRestrict(.acquire);
                     }
                     if (options.ctas) |ctas| {
                         cluster.tryCancel(&response, &full, ctas > 1);
@@ -322,7 +339,7 @@ pub fn ClcTileFetch(comptime options: ClcOptions) type {
 
         pub fn consumerRelease(_: Fetch) void {
             if (cluster_scope) {
-                asm volatile ("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;" ::: .{ .memory = true });
+                nvptx.fenceProxyAsyncSyncRestrict(.release);
             }
             mbarrier.arrive(release, &empty);
         }
@@ -342,7 +359,8 @@ pub fn ClcTileFetch(comptime options: ClcOptions) type {
             mbarrier.wait(order, &full, fetch.count);
             fetch.advanceConsumerState();
             var ctaid: [3]u32 = undefined;
-            inline for (&ctaid, 0..) |*coordinate, dimension| coordinate.* = cluster.firstCtaid(&response, dimension);
+            inline for (&ctaid, 0..) |*coordinate, dimension| coordinate.* =
+                cluster.firstCtaid(&response, dimension);
             if (ctaid[0] == std.math.maxInt(u32)) return null;
             fetch.consumerRelease();
             if (clustered) ctaid[@backingInt(options.axis.?)] += cluster.rankIn2Cta();
@@ -451,19 +469,41 @@ pub fn SingleTileScheduler(comptime options: Options) type {
             const args = scheduler.args;
             if (options.batch_major and !options.scheduler_metadata and args.cu_seqlens != 0) {
                 const tile = grid.block + grid.num_block * grid.head;
-                const location = locate(args.cu_seqlens, args.num_batch, tile, grid.num_head, options.block_m, options.block_order, true) orelse return null;
+                const location = locate(
+                    args.cu_seqlens,
+                    args.num_batch,
+                    tile,
+                    grid.num_head,
+                    options.block_m,
+                    options.block_order,
+                    true,
+                ) orelse return null;
                 return .{ .block = location.block, .head = location.head, .batch = location.batch };
             }
             if (args.cu_seqlens != 0) return varlenWork(args, grid.block, grid.head);
-            return .{ .block = orderBlock(grid.block, args.num_block), .head = grid.head, .batch = grid.batch };
+            return .{
+                .block = orderBlock(grid.block, args.num_block),
+                .head = grid.head,
+                .batch = grid.batch,
+            };
         }
 
         fn varlenWork(args: TileSchedulerArguments, block: u32, head: u32) ?WorkTileInfo {
             if (options.scheduler_metadata) {
-                const entry = prepare_scheduler.lookup(args.scheduler_metadata, args.num_batch, block) orelse return null;
+                const entry =
+                    prepare_scheduler.lookup(args.scheduler_metadata, args.num_batch, block) orelse
+                    return null;
                 return .{ .block = entry[1], .head = head, .batch = entry[0] };
             }
-            const location = locate(args.cu_seqlens, args.num_batch, block, 1, options.block_m, options.block_order, false) orelse return null;
+            const location = locate(
+                args.cu_seqlens,
+                args.num_batch,
+                block,
+                1,
+                options.block_m,
+                options.block_order,
+                false,
+            ) orelse return null;
             return .{ .block = location.block, .head = head, .batch = location.batch };
         }
 
@@ -491,11 +531,21 @@ pub fn SingleTileLPTScheduler(comptime options: Options) type {
             const seqlen_other = sectionSeqlenOther(args);
             inline for (options.l2_swizzle) |rule| {
                 if (matches(rule, args, seqlen_other)) {
-                    const row_bytes = if (options.pack_gqa) options.row_bytes * args.qhead_per_kvhead else options.row_bytes;
-                    const l2_minor = if (rule.size_l2 == configurations.L2SwizzleRule.unlimited) sectionNumHb(args) else @min(swizzle(rule.size_l2, row_bytes, seqlen_other), sectionNumHb(args));
+                    const row_bytes = if (options.pack_gqa) options.row_bytes *
+                        args.qhead_per_kvhead else options.row_bytes;
+                    const l2_minor =
+                        if (rule.size_l2 == configurations.L2SwizzleRule.unlimited) sectionNumHb(
+                            args,
+                        ) else @min(
+                            swizzle(rule.size_l2, row_bytes, seqlen_other),
+                            sectionNumHb(args),
+                        );
                     return .{
                         .single = single,
-                        .l2_minor = if (rule.max_l2_major == configurations.L2SwizzleRule.unlimited) l2_minor else @min(l2_minor, @max(rule.max_l2_major / @max(args.num_block, 1), 1)),
+                        .l2_minor = if (rule.max_l2_major == configurations.L2SwizzleRule.unlimited)
+                            l2_minor
+                        else
+                            @min(l2_minor, @max(rule.max_l2_major / @max(args.num_block, 1), 1)),
                         .block_order = rule.block_order orelse default_block_order,
                     };
                 }
@@ -513,7 +563,11 @@ pub fn SingleTileLPTScheduler(comptime options: Options) type {
             return any;
         }
 
-        fn matches(comptime rule: configurations.L2SwizzleRule, args: TileSchedulerArguments, seqlen_other: u32) bool {
+        fn matches(
+            comptime rule: configurations.L2SwizzleRule,
+            args: TileSchedulerArguments,
+            seqlen_other: u32,
+        ) bool {
             comptime std.debug.assert(!rule.varlen or rule.block_order == null);
             var window_matches = false;
             inline for (comptime std.enums.values(configurations.Mask)) |kind| {
@@ -523,7 +577,8 @@ pub fn SingleTileLPTScheduler(comptime options: Options) type {
                         .causal => args.window_size_left < 0 and args.window_size_right == 0,
                         .local_right => args.window_size_left < 0 and args.window_size_right > 0,
                         .local_left => args.window_size_left >= 0 and args.window_size_right < 0,
-                        .local_two_sided => args.window_size_left >= 0 and args.window_size_right >= 0,
+                        .local_two_sided => args.window_size_left >= 0 and
+                            args.window_size_right >= 0,
                     };
                     window_matches = window_matches or is_kind;
                 }
@@ -531,12 +586,14 @@ pub fn SingleTileLPTScheduler(comptime options: Options) type {
             const ctas = @as(u64, args.num_block) * args.num_qhead_splits * sectionNumHb(args);
             return (rule.varlen or args.cu_seqlens == 0) and window_matches and
                 seqlen_other >= rule.min_seqlen_other and seqlen_other <= rule.max_seqlen_other and
-                args.num_block <= rule.max_num_block and (rule.max_ctas == configurations.L2SwizzleRule.unlimited or ctas <= rule.max_ctas);
+                args.num_block <= rule.max_num_block and
+                (rule.max_ctas == configurations.L2SwizzleRule.unlimited or ctas <= rule.max_ctas);
         }
 
         fn sectionSeqlenOther(args: TileSchedulerArguments) u32 {
             if (!varlen_sections or args.cu_seqlens_other == 0) return args.seqlen_other;
-            const m_cu_seqlens: [*]addrspace(.global) const i32 = @ptrFromInt(args.cu_seqlens_other);
+            const m_cu_seqlens: [*]addrspace(.global) const i32 =
+                @ptrFromInt(args.cu_seqlens_other);
             return @as(u32, @intCast(m_cu_seqlens[args.num_batch])) / @max(args.num_batch, 1);
         }
 
@@ -545,7 +602,10 @@ pub fn SingleTileLPTScheduler(comptime options: Options) type {
         }
 
         pub fn getCurrentWork(scheduler: Scheduler, tile_idx: u32) ?WorkTileInfo {
-            if ((options.batch_major or !varlen_sections) and scheduler.single.args.cu_seqlens != 0) return scheduler.single.getCurrentWork(tile_idx);
+            if ((options.batch_major or !varlen_sections) and
+                scheduler.single.args.cu_seqlens != 0) return scheduler.single.getCurrentWork(
+                tile_idx,
+            );
             return scheduler.sectionWork(tile_idx);
         }
 
@@ -560,10 +620,20 @@ pub fn SingleTileLPTScheduler(comptime options: Options) type {
 
         pub fn sectionDivisors(scheduler: Scheduler) SectionDivisors {
             const args = scheduler.single.args;
-            return .init(args.num_block, sectionNumHb(args), scheduler.l2_minor, args.num_head, args.qhead_per_kvhead);
+            return .init(
+                args.num_block,
+                sectionNumHb(args),
+                scheduler.l2_minor,
+                args.num_head,
+                args.qhead_per_kvhead,
+            );
         }
 
-        pub fn divmodWork(scheduler: Scheduler, divisors: SectionDivisors, tile_idx: u32) WorkTileInfo {
+        pub fn divmodWork(
+            scheduler: Scheduler,
+            divisors: SectionDivisors,
+            tile_idx: u32,
+        ) WorkTileInfo {
             const args = scheduler.single.args;
             const coordinates = divisors.section(tile_idx);
             const batch = divisors.num_head_divmod.divide(coordinates.bidhb);
@@ -579,8 +649,13 @@ pub fn SingleTileLPTScheduler(comptime options: Options) type {
 
         fn sectionWork(scheduler: Scheduler, tile_idx: u32) ?WorkTileInfo {
             const args = scheduler.single.args;
-            const coordinates = section(tile_idx, args.num_block, sectionNumHb(args), scheduler.l2_minor);
-            if (varlen_sections and args.cu_seqlens != 0) return Single.varlenWork(args, coordinates.block, coordinates.bidhb);
+            const coordinates =
+                section(tile_idx, args.num_block, sectionNumHb(args), scheduler.l2_minor);
+            if (varlen_sections and args.cu_seqlens != 0) return Single.varlenWork(
+                args,
+                coordinates.block,
+                coordinates.bidhb,
+            );
             return .{
                 .block = switch (scheduler.block_order) {
                     .ascending => coordinates.block,
@@ -629,7 +704,7 @@ pub fn keyArguments(params: BackwardParams, grid: GridTile) TileSchedulerArgumen
     };
 }
 
-test "section visits every block and pair once" {
+test "section and the precomputed divisors visit every block and pair once" {
     var seen: [8 * 12]bool = undefined;
     for (1..9) |num_block_index| {
         for (1..13) |num_hb_index| {
@@ -637,16 +712,22 @@ test "section visits every block and pair once" {
                 const num_block: u32 = @intCast(num_block_index);
                 const num_hb: u32 = @intCast(num_hb_index);
                 const l2_minor: u32 = @intCast(l2_minor_index);
+                const divisors: SectionDivisors = .init(num_block, num_hb, l2_minor, 3, 2);
                 @memset(&seen, false);
                 var tile_idx: u32 = 0;
                 while (tile_idx < num_block * num_hb) : (tile_idx += 1) {
                     const coordinates = section(tile_idx, num_block, num_hb, l2_minor);
-                    try std.testing.expect(coordinates.block < num_block and coordinates.bidhb < num_hb);
+                    try std.testing.expect(
+                        coordinates.block < num_block and coordinates.bidhb < num_hb,
+                    );
                     const index = coordinates.bidhb * num_block + coordinates.block;
                     try std.testing.expect(!seen[index]);
                     seen[index] = true;
-                    if (l2_minor == 1) try std.testing.expect(coordinates.block == tile_idx % num_block and coordinates.bidhb == tile_idx / num_block);
-                    if (l2_minor == num_hb) try std.testing.expect(coordinates.block == tile_idx / num_hb and coordinates.bidhb == tile_idx % num_hb);
+                    if (l2_minor == 1) try std.testing.expect(coordinates.block == tile_idx %
+                        num_block and coordinates.bidhb == tile_idx / num_block);
+                    if (l2_minor == num_hb) try std.testing.expect(coordinates.block == tile_idx /
+                        num_hb and coordinates.bidhb == tile_idx % num_hb);
+                    try std.testing.expectEqual(coordinates, divisors.section(tile_idx));
                 }
             }
         }
@@ -654,30 +735,36 @@ test "section visits every block and pair once" {
 }
 
 test "the multiply-shift division matches the integer division below 2^31" {
-    const divisors = [_]u32{ 1, 2, 3, 5, 7, 12, 21, 32, 63, 64, 65, 96, 128, 1000, 4097, 65535, 65536, 1 << 20, 3_000_017, (1 << 31) - 1, 1 << 31 };
-    const dividends = [_]u32{ 0, 1, 2, 63, 64, 65, 1023, 4095, 65535, 65537, 1_000_003, 3_000_016, 3_000_017, (1 << 30) + 7, (1 << 31) - 2, (1 << 31) - 1 };
+    const divisors =
+        [_]u32{
+            1,         2, 3, 5, 7, 12, 21, 32, 63, 64, 65, 96, 128, 1000, 4097, 65535, 65536,
+            1 <<
+                20,
+            3_000_017,
+            (1 << 31) -
+                1,
+            1 << 31,
+        };
+    const dividends =
+        [_]u32{
+            0, 1, 2, 63, 64, 65, 1023, 4095, 65535, 65537, 1_000_003, 3_000_016, 3_000_017,
+            (1 << 30) +
+                7,
+            (1 << 31) -
+                2,
+            (1 << 31) -
+                1,
+        };
     for (divisors) |divisor| {
         const fast: FastDivmodDivisor = .init(divisor);
-        for (dividends) |dividend| try std.testing.expectEqual(dividend / divisor, fast.divide(dividend));
+        for (
+            dividends,
+        ) |dividend| try std.testing.expectEqual(dividend / divisor, fast.divide(dividend));
         var dividend: u32 = 0;
-        while (dividend < 20_000) : (dividend += 1) try std.testing.expectEqual(dividend / divisor, fast.divide(dividend));
-    }
-}
-
-test "the precomputed section divisors decode every tile as section does" {
-    for (1..9) |num_block_index| {
-        for (1..13) |num_hb_index| {
-            for (1..num_hb_index + 1) |l2_minor_index| {
-                const num_block: u32 = @intCast(num_block_index);
-                const num_hb: u32 = @intCast(num_hb_index);
-                const l2_minor: u32 = @intCast(l2_minor_index);
-                const divisors: SectionDivisors = .init(num_block, num_hb, l2_minor, 3, 2);
-                var tile_idx: u32 = 0;
-                while (tile_idx < num_block * num_hb) : (tile_idx += 1) {
-                    try std.testing.expectEqual(section(tile_idx, num_block, num_hb, l2_minor), divisors.section(tile_idx));
-                }
-            }
-        }
+        while (dividend < 20_000) : (dividend += 1) try std.testing.expectEqual(
+            dividend / divisor,
+            fast.divide(dividend),
+        );
     }
 }
 
@@ -696,7 +783,13 @@ test "the swizzle is the largest power of two of reused rows that fit the budget
 }
 
 test "a policy without rules selects the single tile scheduler" {
-    const options: Options = .{ .block_m = 128, .row_bytes = 512, .pack_gqa = false, .block_order = .descending, .l2_swizzle = &.{} };
+    const options: Options = .{
+        .block_m = 128,
+        .row_bytes = 512,
+        .pack_gqa = false,
+        .block_order = .descending,
+        .l2_swizzle = &.{},
+    };
     try std.testing.expect(TileScheduler(options) == SingleTileScheduler(options));
     const swizzled: Options = comptime .{
         .block_m = 128,
@@ -715,9 +808,19 @@ test "the first rule that matches the mask kind, sequence length and grid select
         .pack_gqa = false,
         .block_order = .descending,
         .l2_swizzle = &.{
-            .{ .masks = .initOne(.causal), .size_l2 = configurations.L2SwizzleRule.unlimited, .max_num_block = 8, .max_ctas = 512, .block_order = .ascending },
+            .{
+                .masks = .initOne(.causal),
+                .size_l2 = configurations.L2SwizzleRule.unlimited,
+                .max_num_block = 8,
+                .max_ctas = 512,
+                .block_order = .ascending,
+            },
             .{ .masks = .initOne(.causal), .size_l2 = 16 << 20, .min_seqlen_other = 1024 },
-            .{ .masks = .initMany(&.{ .local_right, .local_two_sided }), .size_l2 = 16 << 20, .max_seqlen_other = 2048 },
+            .{
+                .masks = .initMany(&.{ .local_right, .local_two_sided }),
+                .size_l2 = 16 << 20,
+                .max_seqlen_other = 2048,
+            },
         },
     });
     const causal: TileSchedulerArguments = .{
@@ -728,8 +831,6 @@ test "the first rule that matches the mask kind, sequence length and grid select
         .qhead_per_kvhead = 1,
         .window_size_left = -1,
         .window_size_right = 0,
-        .cu_seqlens = 0,
-        .cu_seqlens_other = 0,
     };
     try std.testing.expectEqual(@as(u32, 16), Scheduler.create(causal).l2_minor);
     try std.testing.expectEqual(.descending, Scheduler.create(causal).block_order);
@@ -770,7 +871,7 @@ test "the first rule that matches the mask kind, sequence length and grid select
     try std.testing.expectEqual(@as(u32, 1), Scheduler.create(local_left).l2_minor);
 }
 
-test "the heavy-first rules visit the key blocks of a small one-sided grid in sections of 128 tiles" {
+test "the heavy-first rules visit a small one-sided grid in sections of 128 tiles" {
     const Scheduler = SingleTileLPTScheduler(.{
         .block_m = 128,
         .row_bytes = 1024,
@@ -779,7 +880,9 @@ test "the heavy-first rules visit the key blocks of a small one-sided grid in se
         .l2_swizzle = &configurations.Sm100BwdTiling.lpt_l2_swizzle,
     });
     const windows = [_][2]i32{ .{ -1, -1 }, .{ -1, 0 }, .{ -1, 32 }, .{ 32, -1 }, .{ 32, 0 } };
-    for (windows) |window_sizes| for ([_]u32{ 1, 3, 4, 31, 32, 33 }) |num_block| for ([_]u32{ 1, 5, 16 }) |num_head| for ([_]u32{ 1, 2 }) |num_qhead_splits| for ([_]u32{ 1, 3, 8 }) |num_batch| {
+    for (windows) |window_sizes| for ([_]u32{ 1, 3, 4, 31, 32, 33 }) |num_block| for (
+        [_]u32{ 1, 5, 16 },
+    ) |num_head| for ([_]u32{ 1, 2 }) |num_qhead_splits| for ([_]u32{ 1, 3, 8 }) |num_batch| {
         const scheduler: Scheduler = .create(.{
             .num_block = num_block,
             .num_head = num_head,
@@ -789,11 +892,11 @@ test "the heavy-first rules visit the key blocks of a small one-sided grid in se
             .qhead_per_kvhead = 8,
             .window_size_left = window_sizes[0],
             .window_size_right = window_sizes[1],
-            .cu_seqlens = 0,
-            .cu_seqlens_other = 0,
         });
         const one_sided = (window_sizes[0] < 0) != (window_sizes[1] < 0);
-        if (!one_sided or num_block > 32 or num_block * num_head * num_qhead_splits * num_batch > 1024) {
+        if (!one_sided or num_block > 32 or
+            num_block * num_head * num_qhead_splits * num_batch > 1024)
+        {
             try std.testing.expectEqual(@as(u32, 1), scheduler.l2_minor);
             try std.testing.expectEqual(.ascending, scheduler.block_order);
             continue;
@@ -808,7 +911,8 @@ test "the heavy-first rules visit the key blocks of a small one-sided grid in se
             const position = offset / section_width;
             const bidhb = first_bidhb + offset % section_width;
             const tile = scheduler.sectionWork(tile_idx).?;
-            try std.testing.expectEqual(if (window_sizes[0] >= 0) num_block - 1 - position else position, tile.block);
+            try std.testing.expectEqual(if (window_sizes[0] >= 0) num_block -
+                1 - position else position, tile.block);
             try std.testing.expectEqual(bidhb % num_head, tile.head);
             try std.testing.expectEqual(bidhb / num_head, tile.batch);
         }
@@ -821,7 +925,9 @@ test "an unlimited L2 budget puts every pair in one section" {
         .row_bytes = 256,
         .pack_gqa = false,
         .block_order = .descending,
-        .l2_swizzle = &.{.{ .masks = .initOne(.causal), .size_l2 = configurations.L2SwizzleRule.unlimited }},
+        .l2_swizzle = &.{
+            .{ .masks = .initOne(.causal), .size_l2 = configurations.L2SwizzleRule.unlimited },
+        },
     });
     var args: TileSchedulerArguments = .{
         .num_block = 16,
@@ -831,8 +937,6 @@ test "an unlimited L2 budget puts every pair in one section" {
         .qhead_per_kvhead = 1,
         .window_size_left = -1,
         .window_size_right = 0,
-        .cu_seqlens = 0,
-        .cu_seqlens_other = 0,
     };
     try std.testing.expectEqual(@as(u32, 48 * 64), Scheduler.create(args).l2_minor);
     args.qhead_per_kvhead = 4;
@@ -850,7 +954,13 @@ test "the swizzle gate is open whenever the selected rule changes the order" {
     const windows = [_][2]i32{ .{ -1, -1 }, .{ -1, 0 }, .{ -1, 32 }, .{ 32, -1 }, .{ 32, 0 } };
     var open: u32 = 0;
     var total: u32 = 0;
-    for (windows) |window_sizes| for ([_]u32{ 1, 8, 32, 33 }) |num_block| for ([_]u32{ 1, 16 }) |num_head| for ([_]u32{ 1, 2 }) |num_qhead_splits| for ([_]u32{ 1, 8, 64 }) |num_batch| for ([_]u32{ 512, 2048, 4096 }) |seqlen_other| {
+    for (
+        windows,
+    ) |window_sizes| for (
+        [_]u32{ 1, 8, 32, 33 },
+    ) |num_block| for ([_]u32{ 1, 16 }) |num_head| for ([_]u32{ 1, 2 }) |num_qhead_splits| for (
+        [_]u32{ 1, 8, 64 },
+    ) |num_batch| for ([_]u32{ 512, 2048, 4096 }) |seqlen_other| {
         const args: TileSchedulerArguments = .{
             .num_block = num_block,
             .num_head = num_head,
@@ -860,8 +970,6 @@ test "the swizzle gate is open whenever the selected rule changes the order" {
             .qhead_per_kvhead = 8,
             .window_size_left = window_sizes[0],
             .window_size_right = window_sizes[1],
-            .cu_seqlens = 0,
-            .cu_seqlens_other = 0,
         };
         const scheduler: Scheduler = .create(args);
         total += 1;

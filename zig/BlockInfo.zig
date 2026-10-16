@@ -52,7 +52,10 @@ pub fn nBlockMinMax(info: BlockInfo, comptime block_n: u32) struct { u32, u32 } 
     };
 }
 
-pub fn mBlockMinMax(info: BlockInfo, first_col: u32, col_count: u32, comptime block_m: u32) struct { u32, u32 } {
+pub fn mBlockMinMax(info: BlockInfo, first_col: u32, col_count: u32, comptime block_m: u32) struct {
+    u32,
+    u32,
+} {
     const seqlen_q: i32 = @intCast(info.seqlen_q);
     const row_limit_top = info.rowLimitTop(@intCast(first_col));
     const row_limit_bot = info.rowLimitBot(@intCast(first_col + col_count - 1));
@@ -82,9 +85,13 @@ pub fn needsMask(
         end_col > @as(i32, @intCast(info.seqlen_k));
 }
 
-pub fn unmaskedBlocks(info: BlockInfo, bounds: ColLimitBounds, comptime block_n: u32) struct { u32, u32 } {
+pub fn unmaskedBlocks(info: BlockInfo, bounds: ColLimitBounds, comptime block_n: u32) struct {
+    u32,
+    u32,
+} {
     const left: u32 = @intCast(@max(0, bounds.col_limit_left_max));
-    const right: u32 = @intCast(@max(0, @min(bounds.col_limit_right_min, @as(i32, @intCast(info.seqlen_k)))));
+    const right: u32 =
+        @intCast(@max(0, @min(bounds.col_limit_right_min, @as(i32, @intCast(info.seqlen_k)))));
     return .{ (left + block_n - 1) / block_n, right / block_n };
 }
 

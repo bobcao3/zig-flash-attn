@@ -34,7 +34,12 @@ pub fn NBlockWork(comptime block_m: u32, comptime block_n: u32) type {
 
         const Work = @This();
 
-        pub fn init(params: BackwardParams, tile: tile_scheduler.WorkTileInfo, split_idx: u32, num_qhead_splits: u32) Work {
+        pub fn init(
+            params: BackwardParams,
+            tile: tile_scheduler.WorkTileInfo,
+            split_idx: u32,
+            num_qhead_splits: u32,
+        ) Work {
             const sequence = params.sequence(tile.batch);
             const first_key = tile.block * block_n;
             const key_count = @min(block_n, sequence.seqlen_k - first_key);
@@ -81,11 +86,14 @@ pub fn NBlockWork(comptime block_m: u32, comptime block_n: u32) type {
         pub fn unmaskedBlocks(work: *const Work) struct { u32, u32 } {
             const limits = work.unmaskedRowLimits();
             const first: i32 = @divFloor(limits.top + (block_m - 1), block_m);
-            const end: i32 = if (limits.bot > 0) @divFloor(limits.bot + (block_m - 1), block_m) else 0;
+            const end: i32 =
+                if (limits.bot > 0) @divFloor(limits.bot + (block_m - 1), block_m) else 0;
             const m_block_min: i32 = @intCast(work.m_block_min);
             const m_block_count: i32 = @intCast(work.m_block_count);
             const begin = std.math.clamp(first - m_block_min, 0, m_block_count);
-            return .{ @intCast(begin), @intCast(std.math.clamp(end - m_block_min, begin, m_block_count)) };
+            return .{ @intCast(begin), @intCast(
+                std.math.clamp(end - m_block_min, begin, m_block_count),
+            ) };
         }
         pub fn iterations(work: *const Work) u32 {
             return work.m_block_count * work.qhead_per_kvhead;

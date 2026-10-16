@@ -1,8 +1,7 @@
 const std = @import("std");
 const configurations = @import("configurations.zig");
-const fragments = @import("fragments.zig");
 
-pub const Chunk = fragments.Chunk;
+pub const Chunk = @import("fragments.zig").Chunk;
 pub const alignment = 1024;
 
 pub fn swizzledColumn(comptime swizzle_bytes: u32, column: u32, row: u32) u32 {
@@ -14,6 +13,22 @@ pub fn swizzledColumn(comptime swizzle_bytes: u32, column: u32, row: u32) u32 {
     };
 }
 
+pub fn copyStagedRows(
+    comptime rows: u32,
+    comptime chunks_per_row: u32,
+    comptime participants: u32,
+    participant: anytype,
+    copier: anytype,
+) void {
+    const chunks = rows * chunks_per_row;
+    inline for (0..(chunks + participants - 1) / participants) |pass| {
+        const index: u32 = @as(u32, pass) * participants +
+            if (@typeInfo(@TypeOf(participant)) == .@"fn") participant() else participant;
+        if ((pass + 1) * participants <=
+            chunks or index < chunks) copier.copy(index / chunks_per_row, index % chunks_per_row);
+    }
+}
+
 pub fn TileAddresses(comptime TileLayout: type, comptime rows: comptime_int) type {
     const swizzle_columns = TileLayout.swizzle_columns;
     return struct {
@@ -22,7 +37,8 @@ pub fn TileAddresses(comptime TileLayout: type, comptime rows: comptime_int) typ
         pub fn init(row: u32, column: u32) @This() {
             var addresses: @This() = undefined;
             inline for (&addresses.offsets, 0..) |*offset, key| {
-                offset.* = TileLayout.chunkIndex(rows, row, column + @as(u32, key)) * @sizeOf(Chunk);
+                offset.* =
+                    TileLayout.chunkIndex(rows, row, column + @as(u32, key)) * @sizeOf(Chunk);
             }
             return addresses;
         }
@@ -34,9 +50,13 @@ pub fn TileAddresses(comptime TileLayout: type, comptime rows: comptime_int) typ
             comptime column: u32,
         ) *addrspace(.shared) Chunk {
             comptime std.debug.assert(row % 8 == 0);
-            const offset = comptime TileLayout.chunkIndex(rows, row, column - column % swizzle_columns) * @sizeOf(Chunk);
+            const offset =
+                comptime TileLayout.chunkIndex(rows, row, column - column % swizzle_columns) *
+                @sizeOf(Chunk);
             const bytes: [*]addrspace(.shared) u8 = @ptrCast(tile);
-            return @ptrCast(@alignCast(bytes + addresses.offsets[column % swizzle_columns] + offset));
+            return @ptrCast(@alignCast(
+                bytes + addresses.offsets[column % swizzle_columns] + offset,
+            ));
         }
     };
 }
@@ -59,12 +79,16 @@ pub fn Layout(comptime row_chunks: comptime_int) type {
             return row * row_pitch + swizzledColumn(swizzle_bytes, column, row);
         }
 
-        pub fn chunkIndex(comptime rows: comptime_int, row: u32, column: u32) u32 {
-            _ = rows;
+        pub fn chunkIndex(comptime _: comptime_int, row: u32, column: u32) u32 {
             return slot(row, column);
         }
 
-        pub fn chunk(tile: anytype, row: u32, column: u32, swizzle_key: u32) *addrspace(.shared) Chunk {
+        pub fn chunk(
+            tile: anytype,
+            row: u32,
+            column: u32,
+            swizzle_key: u32,
+        ) *addrspace(.shared) Chunk {
             return &tile[row * row_pitch + swizzledColumn(swizzle_bytes, column, swizzle_key)];
         }
 

@@ -8,7 +8,12 @@ pub const Swizzle = enum(u2) {
     bytes_32 = 3,
 };
 
-pub fn descriptor(start: u32, leading_byte_offset: u32, stride_byte_offset: u32, swizzle: Swizzle) u64 {
+pub fn descriptor(
+    start: u32,
+    leading_byte_offset: u32,
+    stride_byte_offset: u32,
+    swizzle: Swizzle,
+) u64 {
     return encode(start) |
         encode(leading_byte_offset) << 16 |
         encode(stride_byte_offset) << 32 |
@@ -39,6 +44,29 @@ pub fn Operands(comptime swizzle_bytes: u32) type {
         pub fn mnMajor(base: u32, comptime rows: u32) u64 {
             return descriptor(base, rows * swizzle_bytes, 8 * swizzle_bytes, swizzle);
         }
+
+        pub fn mmaKSteps(
+            comptime n: comptime_int,
+            accumulator: *Accumulator(n),
+            comptime k_steps: u32,
+            a: u64,
+            comptime a_rows: u32,
+            b: u64,
+            comptime b_rows: u32,
+        ) void {
+            inline for (0..k_steps) |k_step| {
+                const a_step = advance(a, kStepOffset(a_rows, k_step));
+                mmaShared(
+                    n,
+                    accumulator,
+                    a_step,
+                    advance(b, kStepOffset(b_rows, k_step)),
+                    k_step != 0,
+                    false,
+                    false,
+                );
+            }
+        }
     };
 }
 
@@ -51,20 +79,9 @@ fn encode(bytes: u32) u64 {
     return (bytes & 0x3ffff) >> 4;
 }
 
-pub fn fence() void {
-    asm volatile ("wgmma.fence.sync.aligned;" ::: .{ .memory = true });
-}
-
-pub fn commit() void {
-    asm volatile ("wgmma.commit_group.sync.aligned;" ::: .{ .memory = true });
-}
-
-pub fn wait(comptime pending: u32) void {
-    asm volatile ("wgmma.wait_group.sync.aligned %[pending];"
-        :
-        : [pending] "n" (pending),
-        : .{ .memory = true });
-}
+pub const fence = nvptx.wgmma.fenceSyncAligned;
+pub const commit = nvptx.wgmma.commitGroupSyncAligned;
+pub const wait = nvptx.wgmma.waitGroupSyncAligned;
 
 pub fn fenceOperand(accumulator: anytype) void {
     var value = accumulator.*;
@@ -94,7 +111,8 @@ pub fn packPairs(comptime n: u32, accumulator: Accumulator(n)) [n / 16]@Vector(4
 }
 
 pub fn storeMatrices(comptime transposed: bool, destination: u32, fragment: @Vector(4, u32)) void {
-    asm volatile ("stmatrix.sync.aligned.m8n8.x4" ++ (if (transposed) ".trans" else "") ++ ".shared.b16 [%[destination]], %[fragment];"
+    asm volatile ("stmatrix.sync.aligned.m8n8.x4" ++
+            (if (transposed) ".trans" else "") ++ ".shared.b16 [%[destination]], %[fragment];"
         :
         : [destination] "r" (destination),
           [fragment] "r" (fragment),
@@ -116,7 +134,8 @@ fn instruction(
 ) []const u8 {
     return std.fmt.comptimePrint(
         "{{\n.reg .pred p;\nsetp.ne.b32 p, {d}, 0;\n" ++
-            "wgmma.mma_async.sync.aligned.m64n{d}k16.f32.bf16.bf16 %[d], %[a], %[b], p, 1, 1, {s}{d};\n}}",
+            "wgmma.mma_async.sync.aligned.m64n{d}k16.f32.bf16.bf16 " ++
+            "%[d], %[a], %[b], p, 1, 1, {s}{d};\n}}",
         .{
             @intFromBool(accumulate),
             n,

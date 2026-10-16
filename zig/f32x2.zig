@@ -1,5 +1,5 @@
-const std = @import("std");
-const nvptx = std.nvptx;
+const nvptx = @import("std").nvptx;
+const maskR2p = @import("mask.zig").maskR2p;
 
 pub const Pair = @Vector(2, f32);
 
@@ -8,40 +8,19 @@ pub fn splat(value: f32) Pair {
 }
 
 pub fn fma(a: Pair, b: Pair, c: Pair) Pair {
-    return asm ("{\n.reg .b64 a, b, c, d;\nmov.b64 a, %[a];\nmov.b64 b, %[b];\nmov.b64 c, %[c];\n" ++
-            "fma.rn.ftz.f32x2 d, a, b, c;\nmov.b64 %[d], d;\n}"
-        : [d] "=f" (-> Pair),
-        : [a] "f" (a),
-          [b] "f" (b),
-          [c] "f" (c),
-    );
+    return nvptx.math.fmaF32x2(.nearest_even, true, a, b, c);
 }
 
 pub fn add(a: Pair, b: Pair) Pair {
-    return asm ("{\n.reg .b64 a, b, d;\nmov.b64 a, %[a];\nmov.b64 b, %[b];\n" ++
-            "add.rn.ftz.f32x2 d, a, b;\nmov.b64 %[d], d;\n}"
-        : [d] "=f" (-> Pair),
-        : [a] "f" (a),
-          [b] "f" (b),
-    );
+    return nvptx.math.addF32x2(.nearest_even, true, a, b);
 }
 
 pub fn mul(a: Pair, b: Pair) Pair {
-    return asm ("{\n.reg .b64 a, b, d;\nmov.b64 a, %[a];\nmov.b64 b, %[b];\n" ++
-            "mul.rn.ftz.f32x2 d, a, b;\nmov.b64 %[d], d;\n}"
-        : [d] "=f" (-> Pair),
-        : [a] "f" (a),
-          [b] "f" (b),
-    );
+    return nvptx.math.mulF32x2(.nearest_even, true, a, b);
 }
 
 pub fn max3(a: f32, b: f32, c: f32) f32 {
-    return asm ("max.f32 %[d], %[a], %[b], %[c];"
-        : [d] "=f" (-> f32),
-        : [a] "f" (a),
-          [b] "f" (b),
-          [c] "f" (c),
-    );
+    return nvptx.math.max3F32(.{}, a, b, c);
 }
 
 pub fn exp2f(x: Pair) Pair {
@@ -81,4 +60,62 @@ pub fn ex2Emulation(x: Pair) Pair {
         : [d] "=f" (-> Pair),
         : [x] "f" (x),
     );
+}
+
+pub fn exponentiate(scores: anytype, offsets: anytype, scale_log2: f32) @TypeOf(scores) {
+    const count = @typeInfo(@TypeOf(scores)).vector.len;
+    const scale = splat(scale_log2);
+    var probabilities: @TypeOf(scores) = undefined;
+    inline for (0..count / 4) |quad| {
+        const scalar = @TypeOf(offsets) == f32;
+        const offset: @Vector(4, f32) = if (scalar) @splat(offsets) else @bitCast(offsets[quad]);
+        inline for (0..2) |pair| {
+            const column = quad * 4 + pair * 2;
+            const exponent = fma(
+                .{ scores[column], scores[column + 1] },
+                scale,
+                .{ offset[pair * 2], offset[pair * 2 + 1] },
+            );
+            const value = exp2f(exponent);
+            inline for (0..2) |element| probabilities[column + element] = value[element];
+        }
+    }
+    return probabilities;
+}
+
+pub fn dsPiece(
+    comptime piece: u32,
+    probabilities: anytype,
+    dp: anytype,
+    dpsum_negated: anytype,
+    interior: bool,
+    lower: i32,
+    upper: i32,
+) @Vector(16, u32) {
+    var ds: @Vector(32, f32) = undefined;
+    inline for (0..8) |quad| {
+        const scalar = @TypeOf(dpsum_negated) == f32;
+        const sums: [2]Pair = if (scalar) @splat(splat(dpsum_negated)) else sums: {
+            const sum: @Vector(4, f32) = @bitCast(dpsum_negated[piece * 8 + quad]);
+            break :sums .{ .{ sum[0], sum[1] }, .{ sum[2], sum[3] } };
+        };
+        inline for (0..2) |pair| {
+            const column = quad * 4 + pair * 2;
+            const value = mul(
+                .{ probabilities[piece * 32 + column], probabilities[piece * 32 + column + 1] },
+                add(.{ dp[piece][column], dp[piece][column + 1] }, sums[pair]),
+            );
+            inline for (0..2) |element| ds[column + element] = value[element];
+        }
+    }
+    if (!interior) maskR2p(&ds, lower - @as(i32, piece * 32), upper - @as(i32, piece * 32), 0);
+    return @import("fragments.zig").packBf16(32, ds);
+}
+
+pub fn quadAt(
+    values: anytype,
+    comptime index: u32,
+) @Vector(4, @typeInfo(@TypeOf(values)).vector.child) {
+    const first = index * 4;
+    return .{ values[first], values[first + 1], values[first + 2], values[first + 3] };
 }

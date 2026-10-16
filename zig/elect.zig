@@ -1,5 +1,4 @@
-const std = @import("std");
-const nvptx = std.nvptx;
+const nvptx = @import("std").nvptx;
 const thread = @import("thread.zig");
 
 pub fn oneSync() bool {

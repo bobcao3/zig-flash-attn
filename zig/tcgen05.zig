@@ -26,7 +26,12 @@ pub fn sharedAddress(pointer: anytype) u32 {
     return @intCast(@intFromPtr(pointer));
 }
 
-pub fn sharedDescriptor(start: u32, leading_byte_offset: u32, stride_byte_offset: u32, swizzle: Swizzle) u64 {
+pub fn sharedDescriptor(
+    start: u32,
+    leading_byte_offset: u32,
+    stride_byte_offset: u32,
+    swizzle: Swizzle,
+) u64 {
     return encode(start) |
         encode(leading_byte_offset) << 16 |
         encode(stride_byte_offset) << 32 |
@@ -39,10 +44,19 @@ fn encode(bytes: u32) u64 {
 }
 
 pub fn kMajorDescriptor(start: u32, comptime swizzle_bytes: u32) u64 {
-    return sharedDescriptor(start, 16, 8 * swizzle_bytes, comptime Swizzle.fromBytes(swizzle_bytes));
+    return sharedDescriptor(
+        start,
+        16,
+        8 * swizzle_bytes,
+        comptime Swizzle.fromBytes(swizzle_bytes),
+    );
 }
 
-pub fn kMajorOffsets(comptime steps: u32, comptime rows: u32, comptime swizzle_bytes: u32) [steps]u32 {
+pub fn kMajorOffsets(
+    comptime steps: u32,
+    comptime rows: u32,
+    comptime swizzle_bytes: u32,
+) [steps]u32 {
     const steps_per_box = swizzle_bytes / 32;
     var offsets: [steps]u32 = undefined;
     for (&offsets, 0..) |*offset, step| {
@@ -77,6 +91,10 @@ pub fn address(lane: u32, column: u32) u32 {
     return lane << 16 | column;
 }
 
+pub fn datapathRow() u32 {
+    return thread.warp() % 4 * 32 + thread.lane();
+}
+
 pub fn warpAddress(base: u32, column: u32) u32 {
     return base + address(thread.warp() % 4 * 32, column);
 }
@@ -93,14 +111,20 @@ pub fn allocate(slot: *addrspace(.shared) u32, comptime columns: u32) void {
 }
 
 pub fn deallocate(base: u32, comptime columns: u32) void {
-    asm volatile (std.fmt.comptimePrint("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %[base], {d};", .{columns})
+    asm volatile (std.fmt.comptimePrint(
+            "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %[base], {d};",
+            .{columns},
+        )
         :
         : [base] "r" (base),
         : .{ .memory = true });
 }
 
 pub fn load(comptime count: u32, tensor_address: u32) @Vector(count, f32) {
-    return asm volatile (std.fmt.comptimePrint("tcgen05.ld.sync.aligned.32x32b.x{d}.b32 %[d], [%[a]];", .{count})
+    return asm volatile (std.fmt.comptimePrint(
+            "tcgen05.ld.sync.aligned.32x32b.x{d}.b32 %[d], [%[a]];",
+            .{count},
+        )
         : [d] "=f" (-> @Vector(count, f32)),
         : [a] "r" (tensor_address),
         : .{ .memory = true });
@@ -108,7 +132,8 @@ pub fn load(comptime count: u32, tensor_address: u32) @Vector(count, f32) {
 
 pub fn store(tensor_address: u32, values: anytype) void {
     const count = @typeInfo(@TypeOf(values)).vector.len;
-    const text = std.fmt.comptimePrint("tcgen05.st.sync.aligned.32x32b.x{d}.b32 [%[a]], %[v];", .{count});
+    const text =
+        std.fmt.comptimePrint("tcgen05.st.sync.aligned.32x32b.x{d}.b32 [%[a]], %[v];", .{count});
     switch (@typeInfo(@TypeOf(values)).vector.child) {
         f32 => asm volatile (text
             :
@@ -131,9 +156,19 @@ pub fn loadColumns(comptime count: u32, tensor_address: u32) @Vector(count, f32)
     inline for (0..count / piece_columns) |piece_index| {
         const piece: u32 = piece_index;
         const part = load(piece_columns, tensor_address + piece * piece_columns);
-        inline for (0..piece_columns) |column| values[piece * piece_columns + column] = part[column];
+        inline for (0..piece_columns) |column| values[piece * piece_columns + column] =
+            part[column];
     }
     return values;
+}
+
+pub fn loadPieces(comptime count: u32, tensor_address: u32) [count]@Vector(piece_columns, f32) {
+    var pieces: [count]@Vector(piece_columns, f32) = undefined;
+    inline for (&pieces, 0..) |*piece, piece_index| {
+        const index: u32 = piece_index;
+        piece.* = load(piece_columns, tensor_address + index * piece_columns);
+    }
+    return pieces;
 }
 
 pub fn storeColumns(tensor_address: u32, values: anytype) void {
@@ -151,19 +186,19 @@ pub fn storeColumns(tensor_address: u32, values: anytype) void {
 }
 
 pub fn waitLoad() void {
-    asm volatile ("tcgen05.wait::ld.sync.aligned;" ::: .{ .memory = true });
+    nvptx.tcgen05.waitSyncAligned(.ld);
 }
 
 pub fn waitStore() void {
-    asm volatile ("tcgen05.wait::st.sync.aligned;" ::: .{ .memory = true });
+    nvptx.tcgen05.waitSyncAligned(.st);
 }
 
 pub fn fenceBeforeSync() void {
-    asm volatile ("tcgen05.fence::before_thread_sync;" ::: .{ .memory = true });
+    nvptx.tcgen05.fence(.before_thread_sync);
 }
 
 pub fn fenceAfterSync() void {
-    asm volatile ("tcgen05.fence::after_thread_sync;" ::: .{ .memory = true });
+    nvptx.tcgen05.fence(.after_thread_sync);
 }
 
 fn mmaStepsText(
@@ -172,22 +207,29 @@ fn mmaStepsText(
     comptime a_offsets: []const u32,
     comptime b_offsets: []const u32,
 ) []const u8 {
-    comptime var text: []const u8 = "{\n.reg .pred leader, accumulate;\n.reg .b32 a_low, a_high, b_low, b_high, a_step, b_step;\n" ++
+    comptime var text: []const u8 =
+        "{\n.reg .pred leader, accumulate;\n" ++
+        ".reg .b32 a_low, a_high, b_low, b_high, a_step, b_step;\n" ++
         ".reg .b64 a, b;\nelect.sync _|leader, -1;\nsetp.ne.b32 accumulate, %[accumulate], 0;\n" ++
         "mov.b64 {b_low, b_high}, %[b];\n";
     if (!tensor_a) text = text ++ "mov.b64 {a_low, a_high}, %[a];\n";
     inline for (a_offsets, b_offsets, 0..) |a_offset, b_offset, step| {
         const enable = if (step == 0) "accumulate" else "1";
-        text = text ++ std.fmt.comptimePrint("add.u32 b_step, b_low, {d};\nmov.b64 b, {{b_step, b_high}};\n", .{b_offset});
+        text = text ++ std.fmt.comptimePrint(
+            "add.u32 b_step, b_low, {d};\nmov.b64 b, {{b_step, b_high}};\n",
+            .{b_offset},
+        );
         if (tensor_a) {
             text = text ++ std.fmt.comptimePrint(
-                "@leader tcgen05.mma.cta_group::{d}.kind::f16 [%[d]], [%[a] + {d}], b, %[instruction], {s};\n",
+                "@leader tcgen05.mma.cta_group::{d}.kind::f16 " ++
+                    "[%[d]], [%[a] + {d}], b, %[instruction], {s};\n",
                 .{ cta_group, a_offset, enable },
             );
         } else {
             text = text ++ std.fmt.comptimePrint(
                 "add.u32 a_step, a_low, {d};\nmov.b64 a, {{a_step, a_high}};\n" ++
-                    "@leader tcgen05.mma.cta_group::{d}.kind::f16 [%[d]], a, b, %[instruction], {s};\n",
+                    "@leader tcgen05.mma.cta_group::{d}.kind::f16 " ++
+                    "[%[d]], a, b, %[instruction], {s};\n",
                 .{ a_offset, cta_group, enable },
             );
         }
@@ -195,42 +237,45 @@ fn mmaStepsText(
     return text ++ "}";
 }
 
-pub fn mmaSsSteps(
-    comptime a_offsets: []const u32,
-    comptime b_offsets: []const u32,
-    d: u32,
-    a: u64,
-    b: u64,
-    instruction: u32,
-    accumulate: bool,
-) void {
-    asm volatile (mmaStepsText(1, false, a_offsets, b_offsets)
-        :
-        : [d] "r" (d),
-          [a] "l" (a),
-          [b] "l" (b),
-          [instruction] "r" (instruction),
-          [accumulate] "r" (@as(u32, @intFromBool(accumulate))),
-        : .{ .memory = true });
-}
+pub const mmaSsSteps = MmaSteps(1, u64).issue;
+pub const mmaTsSteps = MmaSteps(1, u32).issue;
+pub const mmaSsSteps2Sm = MmaSteps(2, u64).issue;
+pub const mmaTsSteps2Sm = MmaSteps(2, u32).issue;
 
-pub fn mmaTsSteps(
-    comptime a_offsets: []const u32,
-    comptime b_offsets: []const u32,
-    d: u32,
-    a: u32,
-    b: u64,
-    instruction: u32,
-    accumulate: bool,
-) void {
-    asm volatile (mmaStepsText(1, true, a_offsets, b_offsets)
-        :
-        : [d] "r" (d),
-          [a] "r" (a),
-          [b] "l" (b),
-          [instruction] "r" (instruction),
-          [accumulate] "r" (@as(u32, @intFromBool(accumulate))),
-        : .{ .memory = true });
+fn MmaSteps(comptime cta_group: u32, comptime A: type) type {
+    return struct {
+        fn issue(
+            comptime a_offsets: []const u32,
+            comptime b_offsets: []const u32,
+            d: u32,
+            a: A,
+            b: u64,
+            instruction: u32,
+            accumulate: bool,
+        ) void {
+            const text = comptime mmaStepsText(cta_group, A == u32, a_offsets, b_offsets);
+            const enable: u32 = @intFromBool(accumulate);
+            if (A == u32) {
+                asm volatile (text
+                    :
+                    : [d] "r" (d),
+                      [a] "r" (a),
+                      [b] "l" (b),
+                      [instruction] "r" (instruction),
+                      [accumulate] "r" (enable),
+                    : .{ .memory = true });
+            } else {
+                asm volatile (text
+                    :
+                    : [d] "r" (d),
+                      [a] "l" (a),
+                      [b] "l" (b),
+                      [instruction] "r" (instruction),
+                      [accumulate] "r" (enable),
+                    : .{ .memory = true });
+            }
+        }
+    };
 }
 
 pub fn mmaSs(d: u32, a: u64, b: u64, instruction: u32, accumulate: bool) void {
@@ -247,7 +292,8 @@ pub fn mmaSs(d: u32, a: u64, b: u64, instruction: u32, accumulate: bool) void {
 
 pub fn mmaTs(d: u32, a: u32, b: u64, instruction: u32, accumulate: bool) void {
     asm volatile ("{\n.reg .pred accumulate;\nsetp.ne.b32 accumulate, %[accumulate], 0;\n" ++
-            "tcgen05.mma.cta_group::1.kind::f16 [%[d]], [%[a]], %[b], %[instruction], accumulate;\n}"
+            "tcgen05.mma.cta_group::1.kind::f16 " ++
+            "[%[d]], [%[a]], %[b], %[instruction], accumulate;\n}"
         :
         : [d] "r" (d),
           [a] "r" (a),
@@ -269,48 +315,36 @@ pub fn allocate2Sm(slot: *addrspace(.shared) u32, comptime columns: u32) void {
 }
 
 pub fn deallocate2Sm(base: u32, comptime columns: u32) void {
-    asm volatile (std.fmt.comptimePrint("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %[base], {d};", .{columns})
+    asm volatile (std.fmt.comptimePrint(
+            "tcgen05.dealloc.cta_group::2.sync.aligned.b32 %[base], {d};",
+            .{columns},
+        )
         :
         : [base] "r" (base),
         : .{ .memory = true });
 }
 
-pub fn mmaSsSteps2Sm(
-    comptime a_offsets: []const u32,
-    comptime b_offsets: []const u32,
+pub fn mmaKMajor(
+    comptime cta_group: u32,
+    comptime k_columns: u32,
+    comptime a_rows: u32,
+    comptime b_rows: u32,
     d: u32,
-    a: u64,
-    b: u64,
-    instruction: u32,
-    accumulate: bool,
+    a: anytype,
+    b: anytype,
 ) void {
-    asm volatile (mmaStepsText(2, false, a_offsets, b_offsets)
-        :
-        : [d] "r" (d),
-          [a] "l" (a),
-          [b] "l" (b),
-          [instruction] "r" (instruction),
-          [accumulate] "r" (@as(u32, @intFromBool(accumulate))),
-        : .{ .memory = true });
-}
-
-pub fn mmaTsSteps2Sm(
-    comptime a_offsets: []const u32,
-    comptime b_offsets: []const u32,
-    d: u32,
-    a: u32,
-    b: u64,
-    instruction: u32,
-    accumulate: bool,
-) void {
-    asm volatile (mmaStepsText(2, true, a_offsets, b_offsets)
-        :
-        : [d] "r" (d),
-          [a] "r" (a),
-          [b] "l" (b),
-          [instruction] "r" (instruction),
-          [accumulate] "r" (@as(u32, @intFromBool(accumulate))),
-        : .{ .memory = true });
+    const swizzle_bytes = comptime @import("configurations.zig").wgmmaSwizzleBytes(k_columns);
+    const k_steps = k_columns / 16;
+    const mma = if (cta_group == 2) mmaSsSteps2Sm else mmaSsSteps;
+    mma(
+        &comptime kMajorOffsets(k_steps, a_rows, swizzle_bytes),
+        &comptime kMajorOffsets(k_steps, b_rows, swizzle_bytes),
+        d,
+        kMajorDescriptor(sharedAddress(a), swizzle_bytes),
+        kMajorDescriptor(sharedAddress(b), swizzle_bytes),
+        comptime instructionDescriptor(cta_group * a_rows, cta_group * b_rows, .k, .k),
+        false,
+    );
 }
 
 const both_ctas = 0b11;
@@ -320,13 +354,16 @@ pub const Commit = enum { cta_group_1, cta_group_2 };
 pub fn commit(comptime group: Commit, barrier: *addrspace(.shared) nvptx.Mbarrier) void {
     switch (group) {
         .cta_group_1 => asm volatile ("{\n.reg .pred leader;\nelect.sync _|leader, -1;\n" ++
-                "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%[barrier]];\n}"
+                "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one" ++
+                ".shared::cluster.b64 [%[barrier]];\n}"
             :
             : [barrier] "r" (barrier),
             : .{ .memory = true }),
         .cta_group_2 => asm volatile (std.fmt.comptimePrint(
-                "{{\n.reg .pred leader;\n.reg .b16 mask;\nmov.b16 mask, {d};\nelect.sync _|leader, -1;\n" ++
-                    "@leader tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%[barrier]], mask;\n}}",
+                "{{\n.reg .pred leader;\n.reg .b16 mask;\nmov.b16 mask, {d};\n" ++
+                    "elect.sync _|leader, -1;\n" ++
+                    "@leader tcgen05.commit.cta_group::2.mbarrier::arrive::one" ++
+                    ".shared::cluster.multicast::cluster.b64 [%[barrier]], mask;\n}}",
                 .{both_ctas},
             )
             :

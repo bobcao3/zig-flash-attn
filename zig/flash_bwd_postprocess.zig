@@ -2,7 +2,6 @@ const nvptx = @import("std").nvptx;
 const configurations = @import("configurations.zig");
 const fragments = @import("fragments.zig");
 const thread = @import("thread.zig");
-const grid_dependency = @import("grid_dependency.zig");
 const flash_bwd_preprocess = @import("flash_bwd_preprocess.zig");
 
 const Chunk = fragments.Chunk;
@@ -30,12 +29,23 @@ pub fn FlashAttnBwdPostprocessConvertDq(comptime options: flash_bwd_preprocess.O
         ) callconv(.{ .nvptx_kernel = .{
             .required_work_group_size = .{ .x = auxiliary_threads },
         } }) void {
-            const tile = flash_bwd_preprocess.rowTile(postprocess_rows, options.varlen_as_one_sequence, cu_seqlens_q, num_batch) orelse return;
+            const tile = flash_bwd_preprocess.rowTile(
+                postprocess_rows,
+                options.varlen_as_one_sequence,
+                cu_seqlens_q,
+                num_batch,
+            ) orelse return;
             const batch = tile.batch;
             const block = tile.block;
             const head = tile.head;
-            const sequence = flash_bwd_preprocess.rowSequence(options.varlen_as_one_sequence, cu_seqlens_q, num_batch, seqlen_q, batch);
-            if (options.pdl) grid_dependency.wait();
+            const sequence = flash_bwd_preprocess.rowSequence(
+                options.varlen_as_one_sequence,
+                cu_seqlens_q,
+                num_batch,
+                seqlen_q,
+                batch,
+            );
+            if (options.pdl) nvptx.griddepcontrol(.wait);
             const input: [*]addrspace(.global) const fragments.Accumulator = @ptrFromInt(dq_accum);
             const output: [*]addrspace(.global) Chunk = @ptrFromInt(dq);
             var item: u32 = thread.id();
@@ -43,15 +53,18 @@ pub fn FlashAttnBwdPostprocessConvertDq(comptime options: flash_bwd_preprocess.O
                 const row = block * postprocess_rows + item / row_chunks;
                 const column = item % row_chunks;
                 if (row < sequence.seqlen_q) {
-                    const source = (batch * dq_accum_batch_stride + (sequence.offset_q + row) * dq_accum_row_stride +
-                        head * dq_accum_head_stride) / accumulator_elements + column * (chunk_elements / accumulator_elements);
+                    const source = (batch * dq_accum_batch_stride +
+                        (sequence.offset_q + row) * dq_accum_row_stride +
+                        head * dq_accum_head_stride) / accumulator_elements +
+                        column * (chunk_elements / accumulator_elements);
                     const low = input[source];
                     const high = input[source + 1];
                     const scale: fragments.Accumulator = @splat(softmax_scale);
                     const first = low * scale;
                     const second = high * scale;
-                    const destination = (batch * dq_batch_stride + (sequence.offset_q + row) * dq_row_stride +
-                        head * dq_head_stride) / chunk_elements + column;
+                    const destination =
+                        (batch * dq_batch_stride + (sequence.offset_q + row) * dq_row_stride +
+                            head * dq_head_stride) / chunk_elements + column;
                     output[destination] = .{
                         @backingInt(nvptx.Bf16x2.fromF32(first[0], first[1])),
                         @backingInt(nvptx.Bf16x2.fromF32(first[2], first[3])),

@@ -1,5 +1,4 @@
-const std = @import("std");
-const nvptx = std.nvptx;
+const nvptx = @import("std").nvptx;
 
 pub fn id() u32 {
     return @workItemId(0);
