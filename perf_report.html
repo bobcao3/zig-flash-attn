@@ -1,0 +1,2525 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>[hidden]{display:none!important}</style>
+<title>Kernel Schedule Atlas</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f2f4f6;
+  --surface: #ffffff;
+  --surface-2: #e8edf1;
+  --ink: #101c27;
+  --muted: #566676;
+  --line: #d3dae1;
+  --accent: #0b66a3;
+  --on-accent: #ffffff;
+  --sm80: #6a58d6; --sm120: #b8407c;
+  --sm90: #1b8467;
+  --sm100: #c75d12;
+  --ref: #5d6b78;
+  --fa4: #3d7fb5;
+  --ok: #17724c;
+  --ok-bg: #d6efe2;
+  --good-bg: #e4f2d3;
+  --warn: #8f5a00;
+  --warn-bg: #fae8c0;
+  --bad: #a02525;
+  --bad-bg: #f6d8d8;
+  --r-load: #2f86c9;
+  --r-mma: #8a5bd0;
+  --r-compute: #d08a1e;
+  --r-reduce: #1d9a8a;
+  --r-gather: #c4508a;
+  --r-idle: #c3ccd5;
+  --k-mma: #f5d86e;
+  --k-elt: #cfe3f7;
+  --k-mem: #bfe6c3;
+  --k-tmem: #f6cdd5;
+  --k-red: #f8cc9a;
+  --k-load: #d9d6f6;
+  --k-store: #bfe6e1;
+  --k-edge: #2a3a49;
+  --ph0: #fbf3d6;
+  --ph1: #e6f0fa;
+  --ph2: #fbe8e8;
+  --c0: #f5d86e;
+  --c1: #b9d9f3;
+  --c2: #cdebc9;
+  --c3: #f6cdd5;
+  --c4: #f8cc9a;
+  --rk0: #f5d86e; --rk1: #b9d9f3; --rk2: #cdebc9; --rk3: #f6cdd5; --rk4: #f8cc9a; --rk5: #d9d6f6; --rk6: #bfe6e1; --rk7: #e2e2e2;
+  --font-display: "Bricolage Grotesque", "Avenir Next", "Segoe UI", sans-serif;
+  --font-body: "Instrument Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0c131a; --surface: #131c25; --surface-2: #1b2732; --ink: #e5edf4; --muted: #92a3b2; --line: #263544;
+    --accent: #5db0ec; --on-accent: #06202f; --sm80: #a193ff; --sm120: #ec7fb4; --sm90: #4cc79f; --sm100: #f19050; --ref: #9aa8b5; --fa4: #6ea8dd;
+    --ok: #53c995; --ok-bg: #123b2b; --good-bg: #25391a; --warn: #f0b84f; --warn-bg: #3d2f0e; --bad: #f08080; --bad-bg: #451b1b;
+    --r-load: #4fa3e0; --r-mma: #a982ea; --r-compute: #e6a23c; --r-reduce: #36b9a8; --r-gather: #e070a6; --r-idle: #33414f;
+    --k-mma: #8a6d12; --k-elt: #1f4163; --k-mem: #1f5133; --k-tmem: #62283a; --k-red: #6f410d; --k-load: #35326d; --k-store: #17554e; --k-edge: #b8c6d3;
+    --ph0: #26230f; --ph1: #12243a; --ph2: #321a1c;
+    --c0: #8a6d12; --c1: #1f4163; --c2: #1f5133; --c3: #62283a; --c4: #6f410d;
+    --rk0: #8a6d12; --rk1: #1f4163; --rk2: #1f5133; --rk3: #62283a; --rk4: #6f410d; --rk5: #35326d; --rk6: #17554e; --rk7: #3a4652;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0c131a; --surface: #131c25; --surface-2: #1b2732; --ink: #e5edf4; --muted: #92a3b2; --line: #263544;
+  --accent: #5db0ec; --on-accent: #06202f; --sm80: #a193ff; --sm120: #ec7fb4; --sm90: #4cc79f; --sm100: #f19050; --ref: #9aa8b5; --fa4: #6ea8dd;
+  --ok: #53c995; --ok-bg: #123b2b; --good-bg: #25391a; --warn: #f0b84f; --warn-bg: #3d2f0e; --bad: #f08080; --bad-bg: #451b1b;
+  --r-load: #4fa3e0; --r-mma: #a982ea; --r-compute: #e6a23c; --r-reduce: #36b9a8; --r-gather: #e070a6; --r-idle: #33414f;
+  --k-mma: #8a6d12; --k-elt: #1f4163; --k-mem: #1f5133; --k-tmem: #62283a; --k-red: #6f410d; --k-load: #35326d; --k-store: #17554e; --k-edge: #b8c6d3;
+  --ph0: #26230f; --ph1: #12243a; --ph2: #321a1c;
+  --c0: #8a6d12; --c1: #1f4163; --c2: #1f5133; --c3: #62283a; --c4: #6f410d;
+  --rk0: #8a6d12; --rk1: #1f4163; --rk2: #1f5133; --rk3: #62283a; --rk4: #6f410d; --rk5: #35326d; --rk6: #17554e; --rk7: #3a4652;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  padding-inline: 16px;
+  padding-block: 0 64px;
+}
+.wrap { max-width: 1180px; margin-inline: auto; }
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; line-height: 1.15; margin: 0; }
+h1 { font-size: clamp(2rem, 5vw, 3rem); font-weight: 700; letter-spacing: -0.02em; }
+h2 { font-size: 1.7rem; font-weight: 700; letter-spacing: -0.01em; }
+h3 { font-size: 1.08rem; font-weight: 600; }
+p { margin: 0; }
+code { font-family: var(--font-mono); font-size: 0.86em; }
+.eyebrow { font-family: var(--font-mono); font-size: 0.76rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+nav.index {
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line);
+  margin-inline: -16px; padding: 8px 16px; display: flex; gap: 4px 18px; flex-wrap: wrap; font-size: 0.86rem;
+}
+nav.index a { color: var(--muted); text-decoration: none; padding: 2px 0; }
+nav.index a:hover { color: var(--ink); text-decoration: underline; }
+header.top { padding-block: 36px 22px; display: grid; gap: 10px; }
+section { padding-block: 34px 6px; scroll-margin-top: 52px; display: grid; gap: 18px; }
+.sub { display: grid; gap: 12px; }
+section > *, .sub > *, .chartcard > * { min-width: 0; }
+.sub > h3 { padding-top: 10px; }
+.frame { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chiprow { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
+.chiplabel { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); min-width: 4.6rem; }
+button.chip {
+  font: inherit; font-size: 0.84rem; border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+  border-radius: 999px; padding: 4px 12px; cursor: pointer;
+}
+button.chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+button.chip:focus-visible, .cell:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chipx { margin-left: 6px; font-family: var(--font-mono); font-size: 0.72rem; opacity: 0.8; }
+.note, .figfoot { font-size: 0.84rem; color: var(--muted); max-width: 100ch; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.8rem; color: var(--muted); align-items: center; }
+.sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 5px; border: 1px solid transparent; }
+.sw.zig.a-sm80 { background: var(--sm80); } .sw.zig.a-sm120 { background: var(--sm120); } .sw.zig.a-sm90 { background: var(--sm90); } .sw.zig.a-sm100 { background: var(--sm100); }
+.sw.zig-old.a-sm80 { background: var(--sm80); opacity: 0.42; } .sw.zig-old.a-sm90 { background: var(--sm90); opacity: 0.42; } .sw.zig-old.a-sm100 { background: var(--sm100); opacity: 0.42; }
+.sw.ref { background: var(--ref); opacity: 0.6; }
+.sw.fa4 { background: var(--fa4); }
+.pillkey { margin-left: auto; font-family: var(--font-mono); font-size: 0.74rem; }
+
+.chartcard { display: grid; gap: 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px 12px; }
+.controls { display: grid; gap: 8px; }
+.plotholder { min-width: 0; }
+.summaryline { font-size: 0.86rem; color: var(--muted); }
+svg.chart { display: block; overflow: visible; }
+svg.chart text { font-family: var(--font-body); fill: var(--muted); }
+svg.chart .ct { font-family: var(--font-display); font-size: 15px; font-weight: 600; fill: var(--ink); }
+svg.chart .tick { font-size: 11.5px; font-family: var(--font-mono); }
+svg.chart .axtitle { font-size: 12px; }
+svg.chart .grid { stroke: var(--line); stroke-width: 1; stroke-dasharray: 2 3; }
+svg.chart .axis { stroke: var(--muted); stroke-width: 1.5; }
+svg.chart .val { font-family: var(--font-mono); font-size: 10.5px; fill: var(--ink); }
+svg.chart .nodata { font-size: 12px; }
+svg.chart .bar.zig.a-sm80 { fill: var(--sm80); } svg.chart .bar.zig.a-sm120 { fill: var(--sm120); } svg.chart .bar.zig.a-sm90 { fill: var(--sm90); } svg.chart .bar.zig.a-sm100 { fill: var(--sm100); }
+svg.chart .bar.zig-old.a-sm80 { fill: var(--sm80); opacity: 0.42; } svg.chart .bar.zig-old.a-sm90 { fill: var(--sm90); opacity: 0.42; } svg.chart .bar.zig-old.a-sm100 { fill: var(--sm100); opacity: 0.42; }
+svg.chart .bar.ref { fill: var(--ref); opacity: 0.6; }
+svg.chart .bar.fa4 { fill: var(--fa4); }
+svg.chart .pill rect { stroke: none; }
+svg.chart .pill text { font-family: var(--font-display); font-weight: 700; font-size: 11.5px; }
+svg.chart .pill.great rect { fill: var(--ok-bg); } svg.chart .pill.great text { fill: var(--ok); }
+svg.chart .pill.good rect { fill: var(--good-bg); } svg.chart .pill.good text { fill: var(--ok); }
+svg.chart .pill.warn rect { fill: var(--warn-bg); } svg.chart .pill.warn text { fill: var(--warn); }
+svg.chart .pill.bad rect { fill: var(--bad-bg); } svg.chart .pill.bad text { fill: var(--bad); }
+
+.roles { display: grid; gap: 10px; }
+.role-row { display: grid; grid-template-columns: minmax(170px, 230px) 1fr; gap: 6px 18px; align-items: center; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px; }
+.role-row h3 { font-size: 0.96rem; }
+.role-row small { color: var(--muted); display: block; font-weight: 400; font-size: 0.78rem; font-family: var(--font-body); margin-top: 2px; }
+.strip { display: flex; gap: 3px; flex-wrap: wrap; }
+.warp { width: 20px; height: 26px; border-radius: 3px; }
+.group { display: grid; gap: 4px; align-content: start; }
+.group .cap { font-size: 0.72rem; color: var(--muted); font-family: var(--font-mono); line-height: 1.3; max-width: 190px; }
+.group .cap b { color: var(--ink); font-weight: 500; display: block; }
+.groups { display: flex; flex-wrap: wrap; gap: 8px 14px; }
+.sw.r-load, .warp.r-load { background: var(--r-load); } .sw.r-mma, .warp.r-mma { background: var(--r-mma); }
+.sw.r-compute, .warp.r-compute { background: var(--r-compute); } .sw.r-reduce, .warp.r-reduce { background: var(--r-reduce); }
+.sw.r-gather, .warp.r-gather { background: var(--r-gather); } .sw.r-idle, .warp.r-idle { background: var(--r-idle); }
+
+.pipeframe { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px; }
+.pipeframe svg { display: block; max-width: none; height: auto; }
+.pipeframe.a-sm80 { border-top: 3px solid var(--sm80); } .pipeframe.a-sm90 { border-top: 3px solid var(--sm90); } .pipeframe.a-sm100 { border-top: 3px solid var(--sm100); }
+svg text { font-family: var(--font-body); }
+svg.pipe .phase.p0 { fill: var(--ph0); } svg.pipe .phase.p1 { fill: var(--ph1); } svg.pipe .phase.p2 { fill: var(--ph2); }
+svg.pipe .phasetitle { font-family: var(--font-display); font-size: 13px; font-weight: 600; fill: var(--ink); }
+svg.pipe .laneline { stroke: var(--line); stroke-width: 1; }
+svg.pipe .lanelabel { font-size: 12.5px; font-weight: 600; fill: var(--ink); }
+svg.pipe .lanesub { font-size: 11px; fill: var(--muted); }
+svg.pipe .edge { fill: none; stroke: var(--k-edge); stroke-width: 1.1; stroke-dasharray: 2 3; opacity: 0.8; }
+svg.pipe .edge.barrier, svg .edge.barrier { stroke: var(--accent); stroke-dasharray: 5 3; opacity: 1; }
+svg .edge.thick { stroke-width: 2; }
+svg .arrowhead { fill: var(--k-edge); }
+svg .arrowhead.barrier { fill: var(--accent); }
+svg .edgelabel { font-family: var(--font-mono); font-size: 10.5px; fill: var(--accent); }
+svg .edgelabel.big { font-size: 11.5px; }
+svg.pipe .edgelabelbg { fill: var(--surface); stroke: var(--accent); stroke-width: 0.6; opacity: 0.95; }
+svg.pipe .nlabel { fill: var(--ink); }
+svg.pipe .node rect, svg.pipe .node circle { stroke: var(--k-edge); stroke-width: 1; }
+svg.pipe .n-mma rect { fill: var(--k-mma); } svg.pipe .n-elt rect { fill: var(--k-elt); } svg.pipe .n-mem rect, svg.pipe .n-mem circle { fill: var(--k-mem); }
+svg.pipe .n-tmem rect { fill: var(--k-tmem); } svg.pipe .n-red rect { fill: var(--k-red); } svg.pipe .n-load rect { fill: var(--k-load); } svg.pipe .n-store rect { fill: var(--k-store); }
+svg.pipe .node.pending rect, .sw.dashed { stroke-dasharray: 4 3; stroke-width: 1.6; }
+.sw.n-mma { background: var(--k-mma); border-color: var(--k-edge); } .sw.n-elt { background: var(--k-elt); border-color: var(--k-edge); }
+.sw.n-mem { background: var(--k-mem); border-color: var(--k-edge); border-radius: 50%; } .sw.n-tmem { background: var(--k-tmem); border-color: var(--k-edge); }
+.sw.n-red { background: var(--k-red); border-color: var(--k-edge); } .sw.n-load { background: var(--k-load); border-color: var(--k-edge); } .sw.n-store { background: var(--k-store); border-color: var(--k-edge); }
+.sw.dashed { border: 1.5px dashed var(--k-edge); }
+
+svg.tiles { display: block; }
+svg.tiles .cta { stroke: var(--k-edge); stroke-width: 1; stroke-dasharray: 4 3; }
+svg.tiles .cta.c0 { fill: var(--c0); } svg.tiles .cta.c1 { fill: var(--c1); } svg.tiles .cta.c2 { fill: var(--c2); } svg.tiles .cta.c3 { fill: var(--c3); } svg.tiles .cta.c4 { fill: var(--c4); }
+svg.tiles .cta.faint { opacity: 0.55; }
+svg.tiles .cta.rank.r0 { fill: var(--rk0); } svg.tiles .cta.rank.r1 { fill: var(--rk1); } svg.tiles .cta.rank.r2 { fill: var(--rk2); } svg.tiles .cta.rank.r3 { fill: var(--rk3); }
+svg.tiles .cta.rank.r4 { fill: var(--rk4); } svg.tiles .cta.rank.r5 { fill: var(--rk5); } svg.tiles .cta.rank.r6 { fill: var(--rk6); } svg.tiles .cta.rank.r7 { fill: var(--rk7); }
+svg.tiles .ctabox { fill: none; stroke: var(--line); stroke-width: 1.5; }
+svg.tiles .nbox { stroke: var(--k-edge); }
+svg.tiles .n-store { fill: var(--k-store); }
+svg.tiles text { fill: var(--ink); }
+svg.tiles .ctalabel { font-size: 12px; } svg.tiles .ctalabel.strong { font-weight: 600; }
+svg.tiles .dimlabel { font-family: var(--font-mono); font-size: 11px; fill: var(--muted); }
+svg.tiles .tilename { font-family: var(--font-display); font-size: 14px; font-weight: 600; }
+svg.tiles .srclabel { font-size: 11px; fill: var(--muted); }
+svg.tiles .gemmname { font-family: var(--font-display); font-size: 15px; font-weight: 600; }
+svg.tiles .shape { font-family: var(--font-mono); font-size: 11px; fill: var(--muted); }
+svg.tiles .op { font-size: 18px; fill: var(--muted); }
+svg.tiles .stepdot { fill: var(--accent); }
+svg.tiles .stepdot + text { fill: var(--on-accent); }
+svg.tiles .figstep { font-size: 13px; }
+.tiles-frame svg { min-width: 640px; }
+
+.matrix { min-width: 820px; border-collapse: collapse; width: 100%; }
+.matrix th, .matrix td { padding: 4px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.matrix th { font-weight: 600; font-size: 0.74rem; color: var(--muted); background: var(--surface-2); text-align: center; }
+.matrix td.name { min-width: 230px; font-size: 0.9rem; padding-inline: 10px; text-align: left; }
+.matrix tr.group-row td { background: var(--surface-2); font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); padding: 5px 10px; }
+.matrix tr:last-child td { border-bottom: 0; }
+.cell { width: 34px; height: 28px; border-radius: 5px; border: 1px solid transparent; display: grid; place-items: center; margin-inline: auto; font-family: var(--font-mono); font-size: 0.82rem; cursor: pointer; background: transparent; color: var(--ink); padding: 0; }
+i.cell { cursor: default; font-style: normal; display: inline-grid; width: 24px; height: 22px; vertical-align: middle; margin-inline: 0 6px; font-size: 0.74rem; }
+.cell[data-s="U"] { background: var(--ok-bg); color: var(--ok); }
+.cell[data-s="A"] { border: 1.5px solid var(--warn); color: var(--warn); }
+.cell[data-s="X"] { border: 1.5px dashed var(--warn); color: var(--warn); }
+.cell[data-s="R"] { background: var(--bad-bg); color: var(--bad); }
+.cell[data-s="N"] { color: var(--muted); opacity: 0.5; cursor: default; }
+.cell[data-s="Q"] { color: var(--muted); border: 1px dotted var(--line); }
+.cell[data-s="S"] { background: var(--ok-bg); color: var(--ok); }
+.cell[data-s="I"] { border: 1.5px solid var(--warn); color: var(--warn); }
+.cell[aria-pressed="true"] { outline: 2px solid var(--accent); outline-offset: 1px; }
+.glyphs { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 0.8rem; color: var(--muted); align-items: center; }
+.tier { display: inline-grid; place-items: center; min-width: 24px; height: 22px; border-radius: 999px; font-style: normal; font-family: var(--font-display); font-weight: 700; font-size: 0.78rem; margin-right: 6px; padding-inline: 6px; }
+.matrix .tier { margin-right: 0; }
+.tier.t-A { background: var(--bad-bg); color: var(--bad); } .tier.t-B { background: var(--warn-bg); color: var(--warn); }
+.tier.t-C { background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); } .tier.t-done { background: var(--ok-bg); color: var(--ok); }
+.dstate { color: var(--muted); font-size: 0.84rem; }
+footer { margin-top: 36px; color: var(--muted); font-size: 0.82rem; max-width: 100ch; }
+@media (max-width: 560px) {
+  .role-row { grid-template-columns: 1fr; }
+  h2 { font-size: 1.45rem; }
+  .pillkey { margin-left: 0; }
+  .chiplabel { min-width: 0; width: 100%; }
+}
+svg.chart .stripe-ground { opacity: 0.28; }
+svg.chart .pill .pillmark { fill: currentColor; stroke: none; }
+svg.chart .pill.great .pillmark, svg.chart .pill.good .pillmark { fill: var(--ok); } svg.chart .pill.warn .pillmark { fill: var(--warn); } svg.chart .pill.bad .pillmark { fill: var(--bad); }
+svg.chart .pill .pillmark.causal { fill-opacity: 0.35; stroke-width: 1.2; }
+svg.chart .pill.great .pillmark.causal, svg.chart .pill.good .pillmark.causal { stroke: var(--ok); } svg.chart .pill.warn .pillmark.causal { stroke: var(--warn); } svg.chart .pill.bad .pillmark.causal { stroke: var(--bad); }
+.sw.maskkey.dense { background: var(--muted); }
+.sw.maskkey.causal { background: repeating-linear-gradient(45deg, var(--muted) 0 2px, transparent 2px 4px); border-color: var(--muted); }
+.cell[data-s="O"] { color: var(--muted); border: 1px solid var(--line); }
+.islede { max-width: 100ch; }
+.iskernels { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); align-items: start; }
+details.iscard { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; min-width: 0; }
+details.iscard.a-sm80 { border-top: 3px solid var(--sm80); } details.iscard.a-sm90 { border-top: 3px solid var(--sm90); } details.iscard.a-sm100 { border-top: 3px solid var(--sm100); } details.iscard.a-sm120 { border-top: 3px solid var(--sm120); }
+details.iscard summary { cursor: pointer; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+details.iscard summary b { font-family: var(--font-display); font-weight: 600; }
+.ishd { font-family: var(--font-mono); font-size: 0.74rem; color: var(--muted); }
+.isfields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 14px; margin: 12px 0 2px; font-size: 0.9rem; }
+.isfields dt { font-family: var(--font-mono); font-size: 0.7rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); padding-top: 3px; }
+.isfields dd { margin: 0; min-width: 0; }
+.isfields dd ul { margin: 0; padding-left: 1.1em; display: grid; gap: 4px; }
+.isfields .gap { color: var(--warn); }
+.isfields dd.gap { color: inherit; border-left: 2px solid var(--warn); padding-left: 8px; }
+.isorder { margin: 0; padding-left: 1.4em; display: grid; gap: 6px; max-width: 100ch; }
+@media (max-width: 560px) { .isfields { grid-template-columns: minmax(0, 1fr); gap: 2px; } .isfields dt { padding-top: 8px; } }
+.isbadge { margin-left: 6px; font-family: var(--font-mono); font-size: 0.62rem; letter-spacing: 0.04em; padding: 1px 4px; border-radius: 3px; border: 1px solid var(--sm120); color: var(--sm120); vertical-align: 1px; }
+
+.isgallery { display: grid; gap: 26px 20px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 540px), 1fr)); align-items: start; }
+figure.isfig { margin: 0; display: grid; gap: 8px; align-content: start; min-width: 0; }
+figure.isfig .pipeframe svg { margin-inline: auto; }
+svg.isdiagram .is-s0 { fill: var(--c0); } svg.isdiagram .is-s1 { fill: var(--c1); } svg.isdiagram .is-s2 { fill: var(--c2); }
+svg.isdiagram .is-s3 { fill: var(--c3); } svg.isdiagram .is-s4 { fill: var(--c4); }
+svg.isdiagram .is-h0 { fill: var(--r-load); fill-opacity: 0.5; } svg.isdiagram .is-h1 { fill: var(--r-mma); fill-opacity: 0.5; }
+svg.isdiagram .is-h2 { fill: var(--r-compute); fill-opacity: 0.5; } svg.isdiagram .is-h3 { fill: var(--r-reduce); fill-opacity: 0.5; }
+svg.isdiagram .is-solid { fill-opacity: 0.85; }
+svg.isdiagram .is-kv { fill: var(--k-load); stroke: var(--k-edge); stroke-width: 1; }
+svg.isdiagram .is-reg { fill: var(--k-elt); stroke: var(--k-edge); stroke-width: 1; }
+svg.isdiagram .is-red { fill: var(--k-red); stroke: var(--k-edge); stroke-width: 1; }
+svg.isdiagram .is-qv { fill: var(--k-mem); stroke: var(--k-edge); stroke-width: 1; }
+svg.isdiagram .is-outline { fill: none; stroke: var(--k-edge); stroke-width: 1; }
+svg.isdiagram .is-empty { fill: var(--surface); stroke: var(--line); stroke-width: 1; }
+svg.isdiagram .is-sep { stroke: var(--surface); stroke-width: 1.5; }
+svg.isdiagram .is-hatch-bg { fill: var(--surface-2); }
+svg.isdiagram .is-hatch-line { stroke: var(--muted); stroke-width: 1.3; opacity: 0.7; }
+svg.isdiagram .is-focus { fill: none; stroke: var(--accent); stroke-width: 2; }
+svg.isdiagram .is-arrow { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+svg.isdiagram .is-guide { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+svg.isdiagram .is-endline { fill: none; stroke: var(--accent); stroke-width: 2; stroke-dasharray: 5 3; }
+svg.isdiagram .is-funnel { fill-opacity: 0.45; }
+svg.isdiagram .is-dot { fill: var(--accent); }
+svg.isdiagram .is-chip { fill: var(--surface); }
+svg.isdiagram .is-dim { fill: var(--muted); }
+svg.isdiagram .is-note { font-family: var(--font-mono); font-size: 11.5px; fill: var(--accent); }
+.sw.is-s0 { background: var(--c0); } .sw.is-s1 { background: var(--c1); } .sw.is-s2 { background: var(--c2); } .sw.is-s3 { background: var(--c3); } .sw.is-s4 { background: var(--c4); }
+.sw.is-pad { background: repeating-linear-gradient(45deg, var(--muted) 0 1px, var(--surface-2) 1px 4px); border-color: var(--line); }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="index" aria-label="Sections">
+  <a href="#stand">Where each kernel stands</a><a href="#pipes">Warp roles and pipelines</a><a href="#tricks">Tricks and shared code</a><a href="#interseq">Inter-sequence kernels</a>
+</nav>
+
+<header class="top">
+  <div class="eyebrow">zigfa · six attention kernel families · master 2acf8571 · 2026-10-16</div>
+  <h1>Kernel Schedule Atlas</h1>
+</header>
+
+<section id="stand">
+  <h2>Where each kernel stands</h2>
+  <div class="sub"><h3>Forward</h3><div id="fwdChart"></div></div>
+  <div class="sub"><h3>Backward</h3><div id="bwdChart"></div></div>
+  <p class="note">bf16, 2048 model dimension, 16384 tokens per point, best of two runs; dense bars solid, causal striped. Varlen draws lengths between ½× and 1½× the mean; sliding window runs one 16384-token sequence. Each percentage divides Zig by the faster of FA4 and the reference (cuDNN where it runs the shape, PyTorch otherwise). GB10 shows its SM80 and SM120 kernel families.</p>
+</section>
+
+<section id="pipes">
+  <h2>Warp roles inside one CTA</h2>
+  <div id="roles"></div>
+  <div class="sub"><h3>Pipeline schedules</h3><div id="pipelines"></div></div>
+  <div class="sub"><h3>Two-CTA tile shapes</h3><div id="tiles"></div></div>
+  <div class="sub"><h3>Head split through distributed shared memory</h3><div id="exchange"></div></div>
+</section>
+
+<section id="tricks">
+  <h2>Trick matrix and shared code</h2>
+  <div id="matrix"></div>
+  <p class="note">The Inter-seq column describes inter-sequence attention kernels built on FA4, which beat cuDNN and FA4 by a wide margin on short-sequence varlen batches. Rows marked IS come from those kernels.</p>
+</section>
+
+<section id="interseq">
+  <h2>Inter-sequence attention kernels</h2>
+  <p class="islede">Inter-sequence attention kernels pack many short sequences of different lengths end to end on one token axis, and a visibility rule lets each query sequence attend across sequence boundaries to the keys of every sequence it may see. On short-sequence varlen batches they beat cuDNN and FA4 by a wide margin; each figure below shows one technique behind that.</p>
+</section>
+</div>
+
+<script>
+const DATA = {"seqs":[512,1024,2048,4096,8192],"heads":[64,72,96,128,256],"shapes":["mha","gqa","varlen","sliding"],"perf":{"mha":{"fwd":{"sm100":{"zig":{"dense/64":[653.8,774.9,871.6,928.8,956.6],"dense/72":[546.6,724.0,822.5,875.7,899.9],"dense/96":[817.7,978.6,1082.4,1144.8,1174.4],"dense/128":[980.7,1186.2,1310.6,1395.9,1450.5],"dense/256":[1031.0,1276.2,1450.1,1570.4,1650.9],"causal/64":[376.8,540.0,691.2,796.9,877.8],"causal/72":[295.4,485.5,637.1,761.5,832.5],"causal/96":[461.7,684.1,883.4,1017.4,1105.1],"causal/128":[546.5,802.7,1021.6,1196.3,1306.9],"causal/256":[551.6,869.8,1143.0,1359.6,1501.8]},"ref":{"dense/64":[691.5,821.9,906.4,928.4,881.1],"dense/72":[628.2,730.8,799.0,837.7,777.8],"dense/96":[795.0,945.1,1039.6,1088.7,961.7],"dense/128":[998.4,1222.3,1360.7,1443.9,1379.7],"dense/256":[1012.4,1291.6,1497.5,1617.8,1624.0],"causal/64":[347.5,521.5,689.9,823.9,874.2],"causal/72":[339.5,507.9,648.6,748.5,810.6],"causal/96":[440.3,646.2,831.8,968.8,1059.0],"causal/128":[537.5,798.6,1029.0,1227.0,1361.3],"causal/256":[551.3,849.2,1127.3,1366.8,1556.0]},"refName":"cuDNN","fa4":{"dense/64":[666.9,798.8,880.3,931.4,952.2],"dense/72":[551.9,749.0,832.7,874.7,896.2],"dense/96":[823.5,999.8,1106.0,1167.8,1191.8],"dense/128":[971.4,1197.7,1333.5,1417.4,1471.7],"dense/256":[866.2,1166.0,1388.6,1537.2,1632.9],"causal/64":[268.4,419.1,578.1,720.9,828.5],"causal/72":[258.9,420.4,591.7,747.8,854.8],"causal/96":[356.9,566.7,812.3,1005.7,1129.6],"causal/128":[426.0,687.2,955.9,1169.2,1327.3],"causal/256":[412.5,703.8,1026.3,1271.2,1473.4]}},"sm90":{"zig":{"dense/64":[354.2,416.5,500.4,531.0,574.0],"dense/72":[297.4,365.0,440.9,471.8,500.8],"dense/96":[382.2,482.0,596.8,644.9,671.3],"dense/128":[476.6,597.9,667.7,706.2,724.0],"dense/256":[492.6,631.9,732.7,782.2,818.0],"causal/64":[208.2,319.9,423.4,492.8,545.1],"causal/72":[185.4,278.1,359.5,424.8,463.1],"causal/96":[201.9,364.9,472.0,558.9,604.7],"causal/128":[300.1,446.0,564.9,646.4,699.7],"causal/256":[306.2,469.0,611.6,707.0,775.7]},"ref":{"dense/64":[389.7,438.0,469.3,457.0,474.7],"dense/72":[294.4,341.6,372.2,386.2,363.4],"dense/96":[414.1,471.7,499.6,503.9,496.3],"dense/128":[526.8,609.5,633.7,620.7,631.1],"dense/256":[513.3,626.0,699.4,733.0,739.6],"causal/64":[262.0,343.2,404.0,437.3,443.7],"causal/72":[197.8,264.2,313.7,349.4,364.9],"causal/96":[274.4,354.7,417.3,457.2,446.4],"causal/128":[336.3,448.2,529.3,578.0,574.1],"causal/256":[322.0,457.5,546.0,600.2,612.2]},"refName":"cuDNN","fa4":{"dense/64":[319.5,410.2,508.0,542.2,594.4],"dense/72":[256.2,307.2,376.7,417.3,458.0],"dense/96":[359.0,445.0,586.1,641.7,678.5],"dense/128":[453.2,585.4,664.9,709.1,739.3],"dense/256":[488.8,640.8,726.9,774.1,808.8],"causal/64":[175.9,256.2,384.9,465.7,538.3],"causal/72":[147.8,205.3,302.5,356.7,404.3],"causal/96":[201.5,289.3,452.2,543.1,623.4],"causal/128":[236.1,386.9,535.7,630.8,686.9],"causal/256":[259.4,433.7,586.4,694.3,763.6]}},"h200":{"zig":{"dense/64":[357.7,420.4,504.0,536.2,573.4],"dense/72":[314.8,394.4,473.7,512.3,524.4],"dense/96":[392.2,491.5,605.4,652.2,671.8],"dense/128":[499.5,611.6,677.8,716.6,734.0],"dense/256":[532.0,659.8,750.1,793.6,821.7],"causal/64":[225.9,324.1,426.2,495.4,540.5],"causal/72":[195.8,300.7,393.8,468.5,507.9],"causal/96":[219.8,373.4,478.6,567.2,611.5],"causal/128":[318.0,463.5,576.8,659.2,710.9],"causal/256":[337.1,498.8,630.8,724.3,786.6]},"ref":{"dense/64":[390.4,437.9,466.2,450.7,458.6],"dense/72":[313.8,351.4,375.6,385.4,364.3],"dense/96":[420.3,475.6,490.1,494.6,502.5],"dense/128":[539.0,616.2,654.5,625.0,625.6],"dense/256":[537.4,642.3,701.1,723.6,732.6],"causal/64":[263.1,339.4,396.5,432.3,455.4],"causal/72":[209.1,272.4,320.1,348.7,367.5],"causal/96":[276.8,356.6,417.9,455.9,471.8],"causal/128":[350.9,453.6,530.8,585.0,588.0],"causal/256":[355.0,468.1,553.4,588.1,610.3]},"refName":"cuDNN","fa4":{"dense/64":[320.9,408.3,505.5,543.5,580.3],"dense/72":[264.3,334.3,431.9,481.3,523.0],"dense/96":[354.6,442.9,588.8,645.7,685.0],"dense/128":[462.9,589.7,670.9,715.4,738.8],"dense/256":[506.8,651.8,733.0,777.4,810.3],"causal/64":[179.9,262.3,388.5,466.6,538.4],"causal/72":[155.0,224.4,332.0,401.1,460.2],"causal/96":[217.2,313.1,460.6,546.3,626.8],"causal/128":[270.8,417.8,551.8,645.8,699.9],"causal/256":[307.6,468.4,607.0,705.7,770.4]}},"gb10":{"zig":{"dense/64":[53.3,93.5,95.3,96.9,94.3],"dense/72":[46.9,81.8,89.3,92.9,91.0],"dense/96":[52.9,79.1,93.1,95.5,94.8],"dense/128":[53.8,89.2,92.9,98.0,96.8],"dense/256":[49.7,67.7,70.0,71.2,71.6],"causal/64":[26.8,52.1,87.3,91.3,94.1],"causal/72":[23.1,45.1,84.0,88.6,91.5],"causal/96":[25.8,52.2,86.2,90.8,93.6],"causal/128":[27.7,54.9,85.6,92.3,96.8],"causal/256":[27.9,53.9,66.5,68.8,71.5]},"ref":{"dense/64":[51.7,80.7,86.9,90.7,91.0],"dense/72":[39.6,54.3,63.1,67.4,67.1],"dense/96":[50.4,75.9,85.5,92.3,93.5],"dense/128":[50.6,65.9,73.8,82.9,85.0],"dense/256":[51.7,66.4,77.8,82.8,83.9],"causal/64":[25.9,50.3,79.7,82.7,86.1],"causal/72":[18.7,36.9,58.1,62.9,65.7],"causal/96":[25.1,49.0,81.1,84.3,88.4],"causal/128":[27.7,54.0,76.0,80.7,84.4],"causal/256":[28.0,54.3,74.0,78.0,80.5]},"refName":"PyTorch SDPA","zig80":{"dense/64":[52.5,85.0,90.1,92.8,90.5],"dense/72":[42.6,76.2,81.4,82.9,81.2],"dense/96":[46.9,70.7,82.2,87.7,85.6],"dense/128":[55.8,79.6,89.9,92.2,91.0],"dense/256":[51.1,64.5,70.0,76.0,75.8],"causal/64":[26.6,51.1,84.4,89.0,88.8],"causal/72":[21.0,41.2,75.0,79.5,79.4],"causal/96":[23.0,47.2,74.7,82.7,84.2],"causal/128":[27.9,54.3,84.0,85.0,87.7],"causal/256":[28.0,52.7,70.6,75.3,77.4]},"fa4":{"dense/64":[54.0,80.1,89.0,93.9,92.6],"dense/72":[40.4,60.9,71.6,76.3,76.8],"dense/96":[55.4,80.1,89.6,97.9,97.2],"dense/128":[53.7,71.2,79.8,89.0,90.2],"dense/256":[null,null,null,null,null],"causal/64":[27.0,51.9,71.3,73.4,74.9],"causal/72":[18.4,36.5,64.4,70.1,71.6],"causal/96":[27.3,53.2,84.9,89.9,93.1],"causal/128":[29.3,57.5,73.5,77.8,80.3],"causal/256":[null,null,null,null,null]}}},"bwd":{"sm100":{"zig":{"dense/64":[439.3,613.3,768.8,863.4,873.4],"dense/72":[394.5,535.8,650.9,697.8,680.8],"dense/96":[517.0,746.1,933.6,1045.5,1043.3],"dense/128":[603.2,852.2,1073.3,1220.8,1266.2],"dense/256":[454.3,625.9,766.5,875.6,902.7],"causal/64":[264.7,420.7,599.8,757.9,863.9],"causal/72":[237.1,367.9,503.6,619.7,691.3],"causal/96":[315.5,511.3,731.6,904.0,1023.2],"causal/128":[329.5,543.9,791.1,1005.0,1163.1],"causal/256":[280.8,437.6,611.4,755.4,864.3]},"ref":{"dense/64":[522.8,685.2,786.6,782.2,817.2],"dense/72":[437.6,574.8,671.2,647.2,698.0],"dense/96":[557.6,743.4,880.7,888.6,924.8],"dense/128":[664.0,900.0,1067.1,1099.9,1104.4],"dense/256":[545.8,724.2,848.2,834.3,861.9],"causal/64":[306.6,483.9,656.2,788.7,787.4],"causal/72":[265.8,408.8,555.1,660.6,635.3],"causal/96":[316.5,508.9,709.1,859.1,881.5],"causal/128":[386.3,622.3,860.2,1046.6,1089.1],"causal/256":[312.1,493.4,662.1,802.9,823.6]},"refName":"cuDNN","fa4":{"dense/64":[447.7,611.7,752.2,834.7,840.2],"dense/72":[389.3,530.4,643.6,714.8,685.1],"dense/96":[527.2,758.6,938.4,1047.4,1056.2],"dense/128":[596.9,872.8,1087.4,1235.8,1308.3],"dense/256":[379.5,556.4,725.0,859.2,893.0],"causal/64":[270.7,419.1,576.6,710.4,807.2],"causal/72":[232.7,362.2,496.1,610.2,689.3],"causal/96":[311.6,501.4,708.2,872.4,984.9],"causal/128":[330.7,548.1,787.0,990.9,1139.9],"causal/256":[206.3,339.9,499.2,654.6,783.2]}},"sm90":{"zig":{"dense/64":[295.8,397.7,472.5,498.4,517.1],"dense/72":[247.6,326.5,381.9,410.3,415.3],"dense/96":[290.7,402.0,495.9,536.1,526.3],"dense/128":[320.2,449.8,542.9,602.9,588.4],"dense/256":[21.3,309.0,351.4,379.5,379.1],"causal/64":[173.1,273.7,373.6,453.5,499.0],"causal/72":[155.6,238.7,316.2,377.6,399.8],"causal/96":[174.3,283.6,392.3,478.8,502.3],"causal/128":[179.4,305.0,424.9,516.0,565.4],"causal/256":[155.1,234.1,296.1,344.5,373.0]},"ref":{"dense/64":[245.6,341.1,416.3,424.9,454.5],"dense/72":[205.1,263.0,292.1,304.1,329.3],"dense/96":[252.1,338.5,372.2,406.9,431.9],"dense/128":[295.5,412.8,485.3,509.8,542.5],"dense/256":[219.0,293.4,336.9,336.3,360.9],"causal/64":[148.3,231.4,312.3,366.9,394.1],"causal/72":[132.9,191.2,238.7,273.8,288.5],"causal/96":[160.2,241.1,319.2,365.6,377.0],"causal/128":[170.2,285.2,391.4,436.4,475.3],"causal/256":[147.1,222.7,289.9,334.2,357.8]},"refName":"cuDNN","fa4":{"dense/64":[304.2,417.5,496.7,523.4,532.4],"dense/72":[240.8,324.3,391.2,411.9,434.9],"dense/96":[303.7,421.6,507.8,562.1,534.2],"dense/128":[306.4,463.4,560.4,607.7,617.8],"dense/256":[216.7,263.4,296.9,310.5,318.9],"causal/64":[181.4,294.8,400.1,479.4,519.5],"causal/72":[148.2,232.6,321.6,392.8,424.4],"causal/96":[180.4,302.8,412.2,491.7,534.6],"causal/128":[183.6,316.4,446.4,536.9,588.9],"causal/256":[144.4,211.0,265.4,300.2,321.0]}},"h200":{"zig":{"dense/64":[325.8,422.0,489.4,511.7,517.0],"dense/72":[273.4,346.3,401.0,421.4,423.9],"dense/96":[333.4,436.8,519.7,533.1,541.9],"dense/128":[374.4,489.3,569.5,588.3,585.3],"dense/256":[30.2,328.5,364.0,377.4,383.7],"causal/64":[200.5,299.7,395.6,469.8,500.9],"causal/72":[175.5,262.4,342.8,404.9,409.2],"causal/96":[210.5,313.6,420.4,493.6,541.4],"causal/128":[233.3,347.4,455.9,539.2,572.8],"causal/256":[189.3,256.7,310.6,350.0,374.7]},"ref":{"dense/64":[279.4,373.7,414.1,440.5,449.7],"dense/72":[218.4,266.9,288.8,309.8,326.7],"dense/96":[277.4,360.6,397.6,412.2,428.0],"dense/128":[345.3,443.2,480.0,514.0,539.6],"dense/256":[243.1,304.5,351.8,358.0,358.0],"causal/64":[166.9,244.9,323.6,377.4,408.5],"causal/72":[144.6,200.0,245.4,279.5,292.6],"causal/96":[171.1,260.4,325.7,362.4,384.5],"causal/128":[213.2,319.2,416.0,468.5,488.4],"causal/256":[163.8,237.2,296.6,337.2,368.9]},"refName":"cuDNN","fa4":{"dense/64":[344.9,448.0,518.1,546.6,532.2],"dense/72":[265.7,346.3,404.2,420.1,429.7],"dense/96":[345.7,451.6,526.9,539.0,538.6],"dense/128":[360.5,495.8,581.8,626.0,603.5],"dense/256":[251.9,301.2,342.6,356.8,364.4],"causal/64":[216.0,324.1,422.9,493.9,519.3],"causal/72":[172.2,259.0,344.7,399.4,419.8],"causal/96":[228.0,338.3,437.8,512.4,518.6],"causal/128":[242.7,363.5,470.6,552.3,609.8],"causal/256":[177.7,247.9,301.8,337.4,360.2]}},"gb10":{"zig":{"dense/64":[29.7,43.7,54.2,66.2,70.7],"dense/72":[25.0,36.0,44.5,49.9,52.8],"dense/96":[27.5,41.8,54.7,62.1,64.7],"dense/128":[28.3,42.8,57.2,66.1,69.6],"dense/256":[25.4,35.7,42.5,46.6,48.5],"causal/64":[15.0,28.9,46.9,58.1,66.1],"causal/72":[13.7,25.6,37.2,44.2,49.0],"causal/96":[15.1,28.2,45.3,54.6,61.4],"causal/128":[15.7,29.2,48.9,58.2,66.3],"causal/256":[15.2,25.9,35.6,42.4,46.5]},"ref":{"dense/64":[29.0,45.9,62.1,74.7,82.0],"dense/72":[21.2,34.0,42.5,52.8,56.8],"dense/96":[27.9,43.4,57.4,70.9,78.1],"dense/128":[28.5,45.4,62.1,72.7,78.2],"dense/256":[25.3,35.5,42.0,46.3,46.8],"causal/64":[14.9,29.1,51.2,65.7,74.7],"causal/72":[10.8,21.3,37.7,48.3,56.1],"causal/96":[14.6,28.1,48.3,62.7,71.7],"causal/128":[15.3,28.7,51.0,65.5,73.6],"causal/256":[14.4,25.1,34.7,41.4,45.2]},"refName":"PyTorch SDPA","zig80":{"dense/64":[27.4,41.3,50.1,56.5,60.1],"dense/72":[18.9,23.4,27.1,29.1,30.4],"dense/96":[20.4,25.1,29.5,31.6,32.5],"dense/128":[23.9,31.2,35.8,37.9,39.6],"dense/256":[15.6,18.0,19.5,20.3,20.6],"causal/64":[14.1,26.3,39.9,47.7,54.8],"causal/72":[12.7,19.3,23.7,27.2,29.1],"causal/96":[13.4,20.7,26.2,29.4,31.4],"causal/128":[13.9,23.1,30.1,33.0,37.6],"causal/256":[11.8,15.6,17.9,19.5,20.4]},"fa4":{"dense/64":[30.3,47.3,60.2,67.9,71.0],"dense/72":[21.6,32.3,41.7,48.8,52.1],"dense/96":[27.7,41.0,56.3,65.8,70.1],"dense/128":[28.1,39.0,47.3,51.9,54.0],"dense/256":[null,null,null,null,null],"causal/64":[16.1,30.7,48.9,58.9,66.6],"causal/72":[12.4,24.0,35.7,44.6,50.8],"causal/96":[16.1,30.4,49.0,61.2,69.5],"causal/128":[16.2,29.4,42.4,50.9,56.9],"causal/256":[null,null,null,null,null]}}}},"gqa":{"fwd":{"sm100":{"zig":{"dense/64":[654.4,773.8,873.6,930.3,958.2],"dense/72":[577.8,722.1,828.5,881.2,903.0],"dense/96":[842.8,1020.0,1127.9,1185.0,1219.8],"dense/128":[1016.3,1217.6,1338.3,1413.3,1459.7],"dense/256":[1075.5,1328.8,1495.6,1600.4,1672.3],"causal/64":[413.1,583.9,739.7,856.0,929.0],"causal/72":[348.9,518.8,694.3,825.5,891.9],"causal/96":[467.6,709.1,937.7,1085.3,1168.7],"causal/128":[574.4,880.2,1120.2,1273.9,1370.0],"causal/256":[592.5,793.0,1186.9,1404.5,1529.2]},"ref":{"dense/64":[699.2,819.2,907.2,933.6,890.0],"dense/72":[654.1,750.3,813.2,823.6,772.4],"dense/96":[864.9,1000.2,1081.7,1131.5,1025.5],"dense/128":[1074.8,1275.3,1392.9,1476.8,1400.7],"dense/256":[1102.0,1371.6,1545.2,1662.2,1623.8],"causal/64":[351.3,523.6,689.7,825.5,918.0],"causal/72":[351.8,526.5,663.8,763.4,816.7],"causal/96":[452.1,679.3,862.6,1001.0,1093.9],"causal/128":[565.6,847.7,1074.8,1263.5,1378.8],"causal/256":[589.7,897.3,1175.6,1400.4,1555.7]},"refName":"cuDNN","fa4":{"dense/64":[666.1,787.8,873.5,925.3,947.1],"dense/72":[619.0,741.8,829.2,877.8,896.9],"dense/96":[872.1,1047.1,1148.4,1199.7,1232.8],"dense/128":[1031.7,1252.0,1376.1,1444.1,1488.9],"dense/256":[864.6,1192.3,1428.4,1571.5,1656.3],"causal/64":[305.0,458.2,616.5,751.8,844.9],"causal/72":[294.0,453.3,627.3,793.4,903.9],"causal/96":[395.1,611.3,839.2,1050.1,1172.2],"causal/128":[483.6,750.7,1041.0,1264.1,1389.4],"causal/256":[447.0,742.9,1080.3,1375.9,1537.1]}},"sm90":{"zig":{"dense/64":[354.9,450.2,517.3,550.4,573.9],"dense/72":[311.0,387.9,463.8,497.2,514.1],"dense/96":[388.4,516.7,583.0,625.9,685.0],"dense/128":[497.8,606.3,672.0,710.0,729.1],"dense/256":[525.3,657.7,741.9,789.6,823.3],"causal/64":[214.8,341.8,431.8,498.2,544.5],"causal/72":[191.3,293.6,385.0,454.8,496.8],"causal/96":[282.7,408.9,530.9,604.5,653.3],"causal/128":[313.5,465.2,579.5,660.6,711.5],"causal/256":[337.7,503.4,646.4,730.5,792.1]},"ref":{"dense/64":[390.7,440.4,468.7,452.5,464.6],"dense/72":[315.0,358.1,375.3,391.2,355.8],"dense/96":[422.0,475.9,486.4,509.4,494.1],"dense/128":[544.5,620.1,654.0,617.6,639.9],"dense/256":[516.8,639.3,703.6,709.6,704.1],"causal/64":[261.2,341.8,401.5,442.6,448.0],"causal/72":[208.4,273.0,323.2,353.3,370.9],"causal/96":[275.6,356.8,419.5,452.7,465.6],"causal/128":[353.4,454.9,534.0,584.3,576.1],"causal/256":[357.7,472.1,555.4,604.0,597.4]},"refName":"cuDNN","fa4":{"dense/64":[351.1,444.0,529.8,565.5,583.6],"dense/72":[276.7,347.9,419.5,468.7,505.5],"dense/96":[386.1,482.0,579.5,630.4,697.1],"dense/128":[455.5,584.3,664.1,712.1,736.5],"dense/256":[497.3,646.3,729.4,776.4,804.6],"causal/64":[206.9,301.6,414.2,496.0,550.1],"causal/72":[171.4,242.3,329.2,391.0,439.1],"causal/96":[239.2,352.0,482.5,576.7,643.4],"causal/128":[253.4,399.1,535.9,629.8,695.2],"causal/256":[293.3,458.3,608.6,714.1,775.5]}},"h200":{"zig":{"dense/64":[354.0,449.6,520.1,551.4,569.3],"dense/72":[318.2,399.9,480.9,515.6,534.9],"dense/96":[399.1,523.8,587.8,630.7,687.1],"dense/128":[513.3,618.1,682.1,717.1,734.2],"dense/256":[553.9,678.5,755.4,793.6,821.7],"causal/64":[231.8,349.1,441.8,507.0,550.3],"causal/72":[198.4,308.6,401.7,475.8,512.4],"causal/96":[291.7,417.9,536.7,608.5,658.0],"causal/128":[325.5,477.9,591.8,669.6,717.4],"causal/256":[356.9,539.9,676.0,746.2,798.6]},"ref":{"dense/64":[389.4,433.7,459.1,459.9,455.7],"dense/72":[313.8,357.6,380.5,394.4,369.8],"dense/96":[423.4,476.6,494.3,494.0,488.7],"dense/128":[554.2,622.8,655.4,628.9,630.3],"dense/256":[553.0,656.7,708.3,720.6,747.0],"causal/64":[263.0,312.2,398.6,436.2,450.5],"causal/72":[208.2,270.4,321.4,348.1,360.5],"causal/96":[278.0,355.0,417.2,455.1,465.7],"causal/128":[356.8,458.1,534.6,588.1,579.8],"causal/256":[371.8,474.7,556.0,594.3,617.6]},"refName":"cuDNN","fa4":{"dense/64":[348.6,440.2,526.4,562.6,586.8],"dense/72":[280.5,364.1,451.1,500.7,539.0],"dense/96":[381.9,477.4,575.2,628.7,699.4],"dense/128":[462.1,586.4,672.2,714.6,740.2],"dense/256":[514.0,659.6,736.3,780.1,803.8],"causal/64":[212.3,308.0,417.9,495.8,547.1],"causal/72":[178.2,258.3,354.3,428.6,483.5],"causal/96":[249.7,364.9,493.1,584.9,649.0],"causal/128":[278.4,416.2,547.5,641.1,706.9],"causal/256":[341.9,491.8,633.6,734.3,792.0]}},"gb10":{"zig":{"dense/64":[82.9,91.4,94.6,95.9,92.6],"dense/72":[73.2,88.2,91.5,93.6,90.0],"dense/96":[58.5,82.9,94.0,96.2,94.4],"dense/128":[74.1,90.2,94.9,98.1,96.7],"dense/256":[51.2,67.1,69.4,71.2,71.5],"causal/64":[42.1,78.1,88.4,91.7,94.2],"causal/72":[38.1,74.0,85.1,88.8,91.6],"causal/96":[43.3,78.3,87.4,91.1,94.4],"causal/128":[43.3,75.0,86.6,92.9,97.3],"causal/256":[37.9,61.9,66.1,69.3,71.4]},"ref":{"dense/64":[71.5,88.4,87.1,88.4,89.1],"dense/72":[47.6,57.6,63.4,66.9,67.5],"dense/96":[60.7,76.9,84.2,91.4,92.6],"dense/128":[55.1,66.9,73.4,82.8,85.3],"dense/256":[50.6,66.3,78.0,82.4,83.9],"causal/64":[39.3,65.1,83.0,83.2,85.9],"causal/72":[29.1,49.5,59.5,63.6,66.0],"causal/96":[37.7,66.0,82.9,85.6,88.6],"causal/128":[38.4,64.9,77.6,81.1,84.3],"causal/256":[29.5,59.4,75.1,78.8,81.0]},"refName":"PyTorch SDPA","zig80":{"dense/64":[71.7,89.2,91.8,91.8,83.0],"dense/72":[65.6,80.4,82.2,75.0,74.8],"dense/96":[53.5,71.9,83.2,85.9,84.7],"dense/128":[60.9,87.3,91.2,90.2,87.2],"dense/256":[51.6,66.7,74.4,76.5,76.5],"causal/64":[42.0,73.8,83.7,89.0,91.2],"causal/72":[34.9,64.7,74.8,79.8,80.7],"causal/96":[38.6,64.0,77.9,82.5,86.2],"causal/128":[43.2,73.0,83.8,89.7,91.4],"causal/256":[37.9,64.6,72.0,76.2,78.3]},"fa4":{"dense/64":[65.5,88.1,93.2,94.7,92.8],"dense/72":[52.1,71.7,76.8,78.7,78.2],"dense/96":[60.4,87.9,96.4,98.9,97.8],"dense/128":[54.4,77.6,86.6,92.6,91.6],"dense/256":[null,null,null,null,null],"causal/64":[41.1,67.3,74.7,78.4,80.3],"causal/72":[33.1,62.0,68.1,70.6,72.2],"causal/96":[45.2,77.3,88.2,90.5,93.5],"causal/128":[44.5,68.0,76.3,80.7,82.6],"causal/256":[null,null,null,null,null]}}},"bwd":{"sm100":{"zig":{"dense/64":[575.8,729.5,839.8,892.1,883.3],"dense/72":[467.4,569.0,638.6,657.2,657.6],"dense/96":[638.0,812.1,926.8,997.4,1006.9],"dense/128":[655.9,886.8,1044.6,1206.0,1268.2],"dense/256":[542.0,682.8,784.0,867.0,836.2],"causal/64":[356.0,532.5,695.5,808.6,821.7],"causal/72":[322.3,451.6,549.4,620.1,656.2],"causal/96":[410.7,605.6,760.1,851.9,935.4],"causal/128":[379.7,606.9,836.1,1016.0,1096.3],"causal/256":[348.5,504.0,646.9,761.3,872.2]},"ref":{"dense/64":[481.0,645.8,768.1,771.8,807.5],"dense/72":[399.9,545.6,652.9,645.0,689.4],"dense/96":[503.2,698.8,852.6,891.2,925.1],"dense/128":[598.7,838.1,1028.4,1027.9,1087.9],"dense/256":[514.8,701.9,845.2,843.2,879.8],"causal/64":[281.4,28.3,619.5,758.4,778.7],"causal/72":[240.3,378.2,529.7,611.0,626.0],"causal/96":[289.4,468.9,670.6,825.1,904.8],"causal/128":[339.9,561.7,807.5,1005.1,1089.0],"causal/256":[289.4,467.3,650.7,798.3,829.1]},"refName":"cuDNN","fa4":{"dense/64":[395.4,577.3,769.0,902.4,919.1],"dense/72":[338.9,479.1,603.3,688.3,675.3],"dense/96":[450.4,672.4,882.8,1017.3,1065.7],"dense/128":[485.8,743.5,990.8,1164.0,1227.7],"dense/256":[465.4,621.4,749.2,850.2,840.1],"causal/64":[230.7,376.9,553.6,726.5,858.2],"causal/72":[199.3,317.9,452.5,573.9,654.6],"causal/96":[258.1,425.3,631.2,820.6,954.9],"causal/128":[265.5,452.3,692.9,916.7,1091.0],"causal/256":[261.5,398.4,536.0,661.5,799.9]}},"sm90":{"zig":{"dense/64":[334.9,427.2,493.3,523.6,522.4],"dense/72":[280.9,348.2,389.7,400.5,407.6],"dense/96":[334.4,436.4,517.0,545.9,535.8],"dense/128":[366.7,483.6,566.3,605.1,578.4],"dense/256":[21.5,328.3,358.8,368.8,378.6],"causal/64":[178.3,272.7,366.5,454.1,495.3],"causal/72":[162.4,242.5,319.4,378.8,402.9],"causal/96":[182.0,280.7,384.1,471.3,536.8],"causal/128":[196.1,306.0,413.3,505.4,574.0],"causal/256":[161.4,228.2,287.7,354.5,377.2]},"ref":{"dense/64":[230.9,324.7,396.3,421.7,451.1],"dense/72":[198.3,248.3,282.9,303.0,325.3],"dense/96":[239.0,325.9,369.0,412.7,428.7],"dense/128":[276.3,396.6,486.0,496.0,540.1],"dense/256":[204.4,279.1,333.2,350.4,356.1],"causal/64":[135.1,214.3,296.2,359.6,388.4],"causal/72":[120.8,178.1,229.9,264.1,284.7],"causal/96":[145.1,223.1,299.4,350.2,371.6],"causal/128":[158.2,263.1,367.6,439.3,467.7],"causal/256":[135.1,207.4,279.2,318.3,351.1]},"refName":"cuDNN","fa4":{"dense/64":[261.8,382.2,471.1,507.4,521.9],"dense/72":[209.5,295.7,371.6,408.6,428.6],"dense/96":[258.8,374.2,475.5,524.6,527.7],"dense/128":[257.7,406.0,517.3,567.4,591.3],"dense/256":[189.3,239.2,277.9,293.9,303.9],"causal/64":[151.8,251.8,361.0,452.6,490.3],"causal/72":[124.6,204.1,294.3,372.9,417.4],"causal/96":[149.8,255.3,369.9,461.6,505.5],"causal/128":[153.5,266.6,396.2,499.6,561.5],"causal/256":[120.8,183.9,240.2,275.6,291.8]}},"h200":{"zig":{"dense/64":[372.7,456.3,511.6,532.4,522.9],"dense/72":[314.1,372.9,404.5,423.5,417.1],"dense/96":[382.4,469.4,540.7,557.4,543.7],"dense/128":[424.3,524.9,594.0,630.5,593.9],"dense/256":[30.9,346.0,372.7,386.5,383.8],"causal/64":[204.8,300.6,393.5,465.0,515.5],"causal/72":[184.7,265.1,342.0,398.3,426.4],"causal/96":[212.7,307.9,409.6,489.6,566.1],"causal/128":[233.8,342.0,444.3,527.6,587.2],"causal/256":[186.5,247.9,299.9,367.2,381.9]},"ref":{"dense/64":[259.4,353.7,413.1,429.0,450.0],"dense/72":[211.7,259.0,287.1,307.7,325.7],"dense/96":[262.4,347.7,392.5,409.7,427.6],"dense/128":[321.7,426.9,495.6,509.7,532.4],"dense/256":[226.3,291.8,335.6,373.6,356.3],"causal/64":[150.9,234.6,310.7,367.1,401.5],"causal/72":[131.8,188.6,237.4,265.1,296.5],"causal/96":[161.0,242.6,309.8,356.4,382.4],"causal/128":[186.6,289.9,386.3,438.9,482.7],"causal/256":[153.8,221.3,287.8,333.9,363.7]},"refName":"cuDNN","fa4":{"dense/64":[289.5,395.3,484.1,522.4,527.0],"dense/72":[234.0,316.7,383.7,414.2,430.2],"dense/96":[290.8,399.1,486.5,532.8,530.2],"dense/128":[301.2,438.5,551.5,594.8,593.8],"dense/256":[216.1,271.6,325.2,353.6,361.4],"causal/64":[179.6,280.4,386.1,475.2,519.4],"causal/72":[147.9,230.7,318.8,394.6,432.9],"causal/96":[183.5,283.1,391.7,476.6,508.9],"causal/128":[193.5,309.8,424.8,516.1,559.2],"causal/256":[146.5,217.0,281.6,326.6,357.0]}},"gb10":{"zig":{"dense/64":[34.3,46.3,57.2,63.3,66.1],"dense/72":[27.5,37.2,44.3,49.0,52.1],"dense/96":[32.5,46.4,55.1,61.2,62.9],"dense/128":[33.9,47.3,57.8,63.8,66.9],"dense/256":[28.0,36.1,41.7,45.0,47.0],"causal/64":[17.7,32.9,46.8,57.7,65.9],"causal/72":[16.4,27.3,37.2,44.1,49.0],"causal/96":[17.6,32.3,46.5,55.2,61.7],"causal/128":[18.2,33.6,48.8,58.7,66.1],"causal/256":[17.2,27.6,36.7,42.4,46.1]},"ref":{"dense/64":[26.5,42.6,58.0,71.5,78.8],"dense/72":[19.1,31.4,40.5,50.6,55.3],"dense/96":[25.0,39.6,53.5,68.3,74.6],"dense/128":[25.7,40.5,57.4,69.9,76.5],"dense/256":[22.1,33.2,39.9,44.8,46.2],"causal/64":[13.7,26.7,45.6,60.8,71.5],"causal/72":[9.9,19.2,34.7,45.8,54.2],"causal/96":[13.0,25.1,43.2,58.9,69.3],"causal/128":[13.5,25.6,44.2,60.4,70.6],"causal/256":[13.0,22.0,32.2,39.6,44.5]},"refName":"PyTorch SDPA","zig80":{"dense/64":[31.4,42.5,49.7,55.4,55.1],"dense/72":[18.9,23.4,26.6,28.2,29.0],"dense/96":[20.9,25.8,29.9,31.2,32.2],"dense/128":[25.7,31.3,35.0,37.3,38.5],"dense/256":[16.1,18.1,18.8,19.6,20.0],"causal/64":[16.8,29.1,40.5,48.7,55.4],"causal/72":[13.7,19.7,23.6,27.0,28.8],"causal/96":[14.5,21.2,25.8,29.5,31.4],"causal/128":[15.7,24.3,31.0,35.1,37.4],"causal/256":[12.4,15.8,17.9,19.5,20.3]},"fa4":{"dense/64":[27.8,42.8,54.8,63.2,67.7],"dense/72":[19.9,29.3,39.4,46.6,51.2],"dense/96":[25.6,38.3,52.7,64.2,68.5],"dense/128":[28.5,42.6,54.2,62.3,66.1],"dense/256":[null,null,null,null,null],"causal/64":[15.0,28.0,42.6,54.3,62.5],"causal/72":[11.6,20.5,32.3,41.3,48.1],"causal/96":[14.7,27.2,43.0,56.1,65.7],"causal/128":[15.1,28.0,43.4,54.9,64.8],"causal/256":[null,null,null,null,null]}}}},"varlen":{"fwd":{"sm100":{"zig":{"dense/64":[444.1,653.6,539.2,844.7,915.6],"dense/72":[395.9,634.1,749.4,856.9,900.2],"dense/96":[538.4,795.6,941.2,1032.7,1175.4],"dense/128":[526.9,923.0,1079.1,1264.0,1382.0],"dense/256":[740.6,1081.8,1203.2,1442.0,1598.9],"causal/64":[261.6,469.5,608.0,792.2,884.4],"causal/72":[214.3,430.1,589.8,757.5,824.9],"causal/96":[290.0,595.2,778.5,990.6,1095.1],"causal/128":[379.4,699.5,883.0,1132.9,1300.9],"causal/256":[427.6,788.5,1000.7,1311.3,1498.8]},"ref":{"dense/64":[407.2,638.3,765.1,819.2,844.3],"dense/72":[396.2,624.2,713.8,737.0,776.8],"dense/96":[481.0,789.2,905.7,974.2,977.7],"dense/128":[586.3,978.1,1143.7,1269.2,1261.5],"dense/256":[407.4,616.9,709.2,802.8,826.0],"causal/64":[167.3,341.2,467.3,636.8,770.9],"causal/72":[163.3,337.6,462.5,612.1,714.8],"causal/96":[203.5,421.0,572.0,762.5,900.4],"causal/128":[251.5,524.4,693.0,941.7,1126.7],"causal/256":[186.5,362.0,462.8,579.8,666.8]},"refName":"cuDNN","fa4":{"dense/64":[345.3,571.8,697.1,823.7,879.2],"dense/72":[333.5,562.3,696.3,843.5,911.1],"dense/96":[456.7,774.2,946.6,1106.1,1209.0],"dense/128":[556.2,904.6,1123.5,1319.5,1437.5],"dense/256":[570.7,996.0,1244.3,1477.0,1613.2],"causal/64":[183.7,366.3,507.0,696.2,838.2],"causal/72":[171.9,342.3,490.8,693.8,854.2],"causal/96":[246.4,482.0,647.8,897.8,1118.9],"causal/128":[301.8,604.4,836.3,1129.5,1338.7],"causal/256":[304.2,639.2,909.8,1259.6,1500.9]}},"sm90":{"zig":{"dense/64":[294.1,421.9,480.9,534.7,563.9],"dense/72":[266.7,374.0,429.8,486.8,495.6],"dense/96":[360.7,506.5,564.6,630.6,632.6],"dense/128":[358.7,538.9,623.8,681.7,711.7],"dense/256":[407.2,619.1,692.0,759.2,808.3],"causal/64":[166.3,314.8,390.4,477.0,541.6],"causal/72":[179.5,271.6,352.3,429.7,477.4],"causal/96":[225.7,373.8,457.4,557.2,633.7],"causal/128":[206.8,413.3,510.9,605.7,675.6],"causal/256":[260.9,436.2,529.3,648.6,750.5]},"ref":{"dense/64":[253.9,344.9,380.6,413.7,425.4],"dense/72":[214.4,294.0,325.9,337.0,341.6],"dense/96":[275.3,386.2,413.9,443.5,451.1],"dense/128":[349.6,489.1,528.6,548.0,574.6],"dense/256":[367.3,524.7,589.1,653.9,663.1],"causal/64":[162.7,261.8,313.6,380.0,419.4],"causal/72":[142.4,228.5,275.2,321.8,348.8],"causal/96":[179.9,290.1,353.3,414.0,459.0],"causal/128":[223.0,369.0,439.2,527.8,586.4],"causal/256":[233.4,395.2,476.8,566.3,628.2]},"refName":"cuDNN","fa4":{"dense/64":[254.2,396.2,470.2,529.4,568.8],"dense/72":[217.9,323.2,366.4,431.6,463.1],"dense/96":[316.2,486.0,554.7,619.1,659.8],"dense/128":[349.1,525.3,609.7,683.0,725.2],"dense/256":[430.5,590.7,677.3,753.7,767.0],"causal/64":[142.0,261.0,354.7,472.6,539.5],"causal/72":[125.7,220.9,286.1,371.1,419.1],"causal/96":[175.0,317.9,409.1,537.8,634.5],"causal/128":[211.2,371.0,490.2,613.0,689.7],"causal/256":[248.7,430.0,539.7,676.3,762.2]}},"h200":{"zig":{"dense/64":[303.0,426.0,482.7,540.5,545.5],"dense/72":[289.3,406.1,463.4,506.9,511.6],"dense/96":[368.5,515.1,572.2,636.4,645.5],"dense/128":[380.8,549.7,635.8,693.3,706.8],"dense/256":[451.2,633.2,706.2,771.5,787.9],"causal/64":[193.9,318.3,396.1,477.4,538.4],"causal/72":[191.6,305.0,381.0,455.4,505.5],"causal/96":[233.4,380.4,462.6,562.8,641.4],"causal/128":[259.9,423.4,519.6,615.6,690.6],"causal/256":[281.5,449.6,541.1,660.0,759.4]},"ref":{"dense/64":[256.0,341.4,379.2,399.1,422.1],"dense/72":[216.4,294.3,324.8,346.9,333.5],"dense/96":[280.9,384.2,420.7,437.5,449.8],"dense/128":[359.1,494.1,549.9,551.6,566.1],"dense/256":[386.5,536.5,599.7,638.3,641.1],"causal/64":[163.7,260.9,316.6,371.0,409.3],"causal/72":[143.5,225.7,270.3,317.4,343.9],"causal/96":[182.5,292.1,346.1,413.0,452.6],"causal/128":[229.0,370.7,446.1,526.3,587.9],"causal/256":[242.2,400.7,479.3,567.4,626.5]},"refName":"cuDNN","fa4":{"dense/64":[258.0,396.0,471.3,534.1,558.7],"dense/72":[225.3,351.6,412.0,481.5,511.1],"dense/96":[320.1,489.3,559.0,620.2,667.9],"dense/128":[355.8,521.7,605.0,667.5,700.2],"dense/256":[453.4,602.2,689.1,759.5,768.9],"causal/64":[145.9,263.5,357.1,475.6,546.1],"causal/72":[128.3,232.2,311.4,412.0,466.9],"causal/96":[178.3,320.2,411.2,539.9,627.6],"causal/128":[219.7,385.7,500.2,625.8,696.6],"causal/256":[267.9,449.3,558.3,689.6,765.8]}},"gb10":{"zig":{"dense/64":[50.9,81.6,89.7,92.0,90.4],"dense/72":[45.9,79.7,86.9,89.8,87.7],"dense/96":[49.6,81.8,90.8,93.0,92.1],"dense/128":[52.3,78.0,89.8,88.6,91.9],"dense/256":[48.9,64.9,62.2,71.2,71.3],"causal/64":[25.9,58.1,80.5,88.0,89.3],"causal/72":[22.9,49.6,78.8,86.4,86.9],"causal/96":[25.6,56.1,79.2,88.0,91.4],"causal/128":[26.6,59.2,79.4,90.3,93.3],"causal/256":[26.6,55.5,63.2,67.4,71.1]},"ref":{"dense/64":[50.9,81.4,83.5,88.0,89.5],"dense/72":[37.8,58.0,62.4,65.5,66.6],"dense/96":[51.5,78.5,84.2,89.4,89.4],"dense/128":[47.6,72.3,79.0,77.7,87.5],"dense/256":[51.7,70.4,75.0,80.9,82.0],"causal/64":[25.7,55.9,74.3,82.0,86.7],"causal/72":[18.8,40.9,55.0,62.2,65.3],"causal/96":[25.0,55.0,74.5,82.9,88.1],"causal/128":[27.2,56.0,67.9,76.3,81.5],"causal/256":[28.0,58.7,72.9,77.6,81.1]},"refName":"PyTorch varlen_attn","zig80":{"dense/64":[49.4,78.5,87.7,88.4,86.6],"dense/72":[41.8,73.1,78.8,79.5,78.3],"dense/96":[44.8,74.8,82.6,84.3,84.6],"dense/128":[50.8,75.0,86.7,88.2,87.0],"dense/256":[49.7,69.1,74.5,76.4,77.7],"causal/64":[25.2,57.9,79.4,86.4,83.6],"causal/72":[21.2,44.3,71.0,77.5,77.4],"causal/96":[22.4,51.9,72.5,80.6,82.4],"causal/128":[27.2,59.9,79.4,86.0,86.1],"causal/256":[28.0,56.6,66.6,73.5,76.2]},"fa4":{"dense/64":[53.5,83.5,89.3,93.7,92.8],"dense/72":[40.3,65.0,73.1,74.7,75.4],"dense/96":[55.0,87.0,93.7,97.5,96.3],"dense/128":[51.3,74.8,83.0,87.6,89.2],"dense/256":[null,null,null,null,null],"causal/64":[26.9,55.0,68.7,74.5,75.4],"causal/72":[18.5,40.9,59.4,67.6,69.9],"causal/96":[28.1,58.9,78.5,86.1,88.1],"causal/128":[28.8,59.1,70.9,77.6,81.2],"causal/256":[null,null,null,null,null]}}},"bwd":{"sm100":{"zig":{"dense/64":[362.0,579.4,722.8,833.5,847.2],"dense/72":[325.0,499.1,605.8,682.0,676.2],"dense/96":[441.2,716.5,874.8,1013.4,1019.1],"dense/128":[503.4,786.7,949.4,1139.2,1169.0],"dense/256":[363.6,570.8,689.1,835.3,817.3],"causal/64":[219.8,407.2,559.0,745.8,823.9],"causal/72":[198.4,352.0,467.5,606.0,650.7],"causal/96":[262.4,494.9,679.8,884.9,1002.8],"causal/128":[281.6,537.3,731.9,993.6,1180.1],"causal/256":[220.7,410.0,551.3,730.8,785.8]},"ref":{"dense/64":[410.9,616.5,713.0,812.8,797.2],"dense/72":[343.1,527.8,618.2,707.4,689.1],"dense/96":[437.7,683.2,818.8,929.1,942.5],"dense/128":[518.0,824.9,969.3,1104.5,1150.5],"dense/256":[null,null,null,null,null],"causal/64":[209.0,370.0,482.6,616.6,709.4],"causal/72":[192.5,348.6,454.0,571.9,625.5],"causal/96":[239.3,440.9,569.6,718.0,804.8],"causal/128":[283.1,533.9,690.9,881.0,1026.4],"causal/256":[null,null,null,null,null]},"refName":"cuDNN","fa4":{"dense/64":[343.5,553.4,677.0,806.4,831.7],"dense/72":[311.8,487.6,593.5,670.1,686.8],"dense/96":[419.3,706.2,882.1,1037.4,1013.5],"dense/128":[411.8,750.2,969.8,1182.1,1184.7],"dense/256":[325.5,542.9,683.8,821.6,822.2],"causal/64":[204.1,375.6,508.7,677.5,778.7],"causal/72":[188.4,340.7,454.6,596.2,646.3],"causal/96":[242.9,459.6,639.1,861.2,954.8],"causal/128":[234.4,481.7,694.4,968.2,1142.1],"causal/256":[171.2,330.2,456.7,648.2,754.3]}},"sm90":{"zig":{"dense/64":[233.1,359.9,434.9,486.5,516.8],"dense/72":[213.3,309.5,364.7,385.4,422.1],"dense/96":[260.7,393.3,472.4,505.8,547.1],"dense/128":[287.3,434.7,522.0,206.7,576.4],"dense/256":[220.1,302.1,339.5,363.4,393.8],"causal/64":[144.5,261.0,343.5,440.5,496.9],"causal/72":[138.9,233.7,305.0,375.3,403.4],"causal/96":[156.6,281.5,375.3,468.9,517.1],"causal/128":[171.9,315.3,412.2,514.4,549.4],"causal/256":[144.4,231.8,285.3,339.9,373.9]},"ref":{"dense/64":[210.3,305.1,364.5,426.3,430.0],"dense/72":[175.6,246.8,280.8,303.2,306.7],"dense/96":[221.7,327.3,377.4,418.6,418.1],"dense/128":[257.6,401.5,474.1,513.2,520.0],"dense/256":[208.5,292.3,348.3,361.3,372.1],"causal/64":[138.0,226.2,281.3,345.3,387.3],"causal/72":[113.6,180.0,222.4,260.7,294.2],"causal/96":[142.3,236.9,294.1,365.9,394.5],"causal/128":[156.0,285.5,366.4,457.0,495.5],"causal/256":[141.7,236.6,296.3,362.8,379.0]},"refName":"cuDNN","fa4":{"dense/64":[251.6,395.9,472.6,515.1,535.8],"dense/72":[206.9,307.0,366.5,410.1,435.6],"dense/96":[268.0,411.3,485.3,521.8,559.1],"dense/128":[291.8,449.7,534.5,594.7,604.3],"dense/256":[198.0,253.6,277.8,296.8,308.6],"causal/64":[153.9,285.5,375.6,478.1,501.7],"causal/72":[132.9,229.5,304.1,377.3,419.6],"causal/96":[165.2,303.5,396.3,497.4,522.5],"causal/128":[171.8,322.8,422.6,517.6,552.2],"causal/256":[134.1,210.2,255.5,295.4,320.2]}},"h200":{"zig":{"dense/64":[254.6,377.3,448.5,489.3,514.2],"dense/72":[232.1,327.3,382.7,397.5,425.2],"dense/96":[289.7,420.3,494.5,558.4,541.4],"dense/128":[326.0,463.7,546.5,279.2,581.8],"dense/256":[239.4,314.5,347.4,368.8,396.7],"causal/64":[164.4,280.5,364.0,451.8,494.1],"causal/72":[152.2,255.3,327.6,387.0,415.2],"causal/96":[183.1,308.5,400.1,495.6,516.6],"causal/128":[212.0,347.9,440.7,530.5,560.7],"causal/256":[165.4,249.2,297.7,346.8,371.0]},"ref":{"dense/64":[232.1,325.8,381.5,424.4,424.7],"dense/72":[188.9,254.4,287.5,307.3,315.7],"dense/96":[246.2,349.3,384.1,425.1,423.0],"dense/128":[297.9,432.5,497.3,533.4,530.5],"dense/256":[229.2,310.0,353.2,373.3,368.7],"causal/64":[152.2,240.2,295.3,348.5,384.9],"causal/72":[123.2,188.6,227.2,266.2,293.0],"causal/96":[158.5,252.0,306.9,369.5,396.6],"causal/128":[189.4,312.3,392.3,475.3,520.8],"causal/256":[160.0,254.4,313.4,370.4,384.3]},"refName":"cuDNN","fa4":{"dense/64":[278.9,412.4,482.4,530.5,527.8],"dense/72":[226.8,323.4,378.6,401.1,432.9],"dense/96":[302.7,438.6,502.5,533.5,542.5],"dense/128":[333.3,482.9,561.7,602.2,608.0],"dense/256":[227.9,296.8,327.2,347.7,365.4],"causal/64":[177.8,306.5,394.6,488.0,506.5],"causal/72":[150.9,252.3,327.0,403.3,424.8],"causal/96":[200.0,330.9,419.4,499.3,521.7],"causal/128":[217.2,358.4,448.9,537.9,550.6],"causal/256":[161.3,242.3,290.2,333.2,357.3]}},"gb10":{"zig":{"dense/64":[26.9,43.7,55.3,57.4,69.2],"dense/72":[23.4,36.5,42.6,48.3,51.8],"dense/96":[26.5,43.1,51.4,59.5,62.9],"dense/128":[27.0,44.7,53.8,59.6,67.3],"dense/256":[24.1,32.0,38.0,43.7,43.6],"causal/64":[15.3,31.5,45.1,56.4,65.2],"causal/72":[13.6,26.1,34.9,43.6,49.3],"causal/96":[14.9,30.8,42.1,52.8,60.5],"causal/128":[15.4,31.4,43.9,56.5,65.3],"causal/256":[14.7,26.4,33.6,41.6,45.8]},"ref":{"dense/64":[27.6,49.1,63.3,74.6,80.3],"dense/72":[20.2,35.4,44.0,53.6,57.8],"dense/96":[26.8,46.9,60.0,72.8,76.7],"dense/128":[27.1,49.2,61.1,70.2,78.9],"dense/256":[23.8,34.4,38.4,44.5,44.1],"causal/64":[14.3,31.3,48.3,64.8,76.2],"causal/72":[10.5,23.0,36.5,48.5,57.2],"causal/96":[14.1,30.7,47.9,64.1,74.7],"causal/128":[14.5,31.0,48.7,65.9,77.8],"causal/256":[13.8,25.4,33.6,41.7,46.3]},"refName":"PyTorch varlen_attn","zig80":{"dense/64":[25.1,39.1,47.5,54.1,58.8],"dense/72":[17.5,23.1,26.4,29.0,30.3],"dense/96":[19.2,24.8,28.5,31.1,32.5],"dense/128":[20.8,27.2,32.1,35.0,36.4],"dense/256":[13.9,16.5,17.6,18.7,18.6],"causal/64":[13.8,28.5,38.0,47.9,55.0],"causal/72":[11.8,20.4,23.6,27.1,29.5],"causal/96":[13.2,21.7,25.5,29.2,31.8],"causal/128":[13.4,23.0,28.3,33.0,35.7],"causal/256":[11.4,14.9,16.6,18.1,18.9]},"fa4":{"dense/64":[23.4,37.3,48.2,55.6,60.4],"dense/72":[20.3,32.8,41.7,48.5,52.6],"dense/96":[25.9,43.0,55.7,65.1,70.5],"dense/128":[25.2,38.8,45.6,51.0,53.9],"dense/256":[null,null,null,null,null],"causal/64":[15.3,32.7,44.5,53.7,57.3],"causal/72":[12.0,24.8,34.4,43.4,47.8],"causal/96":[15.2,32.3,46.5,58.6,64.7],"causal/128":[15.6,31.0,40.1,49.2,54.6],"causal/256":[null,null,null,null,null]}}}},"sliding":{"fwd":{"sm100":{"zig":{"dense/64":[628.7,782.4,888.9,938.9,941.0],"dense/72":[595.9,736.9,833.5,890.3,906.7],"dense/96":[794.6,976.6,1096.8,1173.8,1190.4],"dense/128":[944.0,1138.0,1292.2,1385.7,1430.1],"dense/256":[1053.2,1296.2,1477.7,1599.4,1650.0],"causal/64":[456.2,627.3,767.0,877.3,923.8],"causal/72":[425.6,22.4,732.0,819.3,860.3],"causal/96":[519.6,800.0,968.7,1081.9,1152.2],"causal/128":[689.4,930.5,1119.9,1281.8,1344.7],"causal/256":[756.6,1037.0,1267.8,1464.6,1546.2]},"ref":{"dense/64":[162.7,183.1,189.5,201.0,208.5],"dense/72":[175.2,193.2,195.5,205.5,211.8],"dense/96":[238.8,266.8,254.1,253.5,278.4],"dense/128":[240.7,266.8,274.4,266.4,289.9],"dense/256":[331.9,353.4,337.3,330.2,356.6],"causal/64":[138.2,160.2,181.4,188.6,197.4],"causal/72":[143.1,174.6,188.6,191.4,200.4],"causal/96":[199.0,238.9,262.9,255.0,241.4],"causal/128":[193.1,238.9,269.6,247.3,237.1],"causal/256":[288.1,326.8,343.7,317.4,319.6]},"refName":"PyTorch varlen_attn","fa4":{"dense/64":[511.4,657.0,774.0,843.9,881.5],"dense/72":[513.8,688.5,819.1,897.3,918.8],"dense/96":[702.7,928.9,1081.5,1166.9,1182.2],"dense/128":[864.7,1112.0,1262.6,1383.8,1472.7],"dense/256":[null,null,null,null,null],"causal/64":[355.6,508.5,646.8,752.4,829.6],"causal/72":[343.9,516.7,681.9,802.5,869.2],"causal/96":[479.9,705.4,930.7,1084.0,1149.2],"causal/128":[582.8,854.6,1093.6,1276.4,1369.8],"causal/256":[null,null,null,null,null]}},"sm90":{"zig":{"dense/64":[372.5,452.2,510.1,548.5,568.4],"dense/72":[317.5,393.5,447.6,485.3,498.6],"dense/96":[447.7,537.0,606.1,642.4,670.4],"dense/128":[525.8,619.0,677.2,707.9,720.5],"dense/256":[551.2,661.4,64.5,771.7,790.3],"causal/64":[269.3,370.5,452.8,506.2,552.7],"causal/72":[224.0,316.4,392.6,447.0,482.6],"causal/96":[315.2,444.6,533.6,585.5,638.4],"causal/128":[402.1,526.7,616.4,673.3,703.3],"causal/256":[401.2,549.2,650.7,729.9,766.7]},"ref":{"dense/64":[147.4,168.8,180.4,195.3,201.8],"dense/72":[159.3,166.3,183.7,195.4,198.1],"dense/96":[225.4,229.6,243.1,269.5,272.5],"dense/128":[236.1,245.2,255.2,284.9,294.0],"dense/256":[284.8,308.4,313.6,320.8,318.7],"causal/64":[111.5,147.9,166.2,182.8,186.3],"causal/72":[132.5,159.5,175.8,177.3,190.6],"causal/96":[187.4,224.7,249.6,236.8,250.0],"causal/128":[193.4,235.5,259.6,251.7,275.8],"causal/256":[243.7,278.0,299.7,304.8,307.1]},"refName":"PyTorch varlen_attn","fa4":{"dense/64":[355.3,452.2,511.7,551.2,562.2],"dense/72":[281.4,350.0,398.0,426.4,441.2],"dense/96":[428.9,530.4,597.9,639.5,657.3],"dense/128":[511.6,614.3,678.9,714.9,730.1],"dense/256":[538.7,642.9,706.6,736.5,752.8],"causal/64":[255.4,352.8,445.4,500.7,542.3],"causal/72":[199.4,279.5,344.9,394.8,415.0],"causal/96":[302.0,423.5,522.1,586.1,624.6],"causal/128":[380.7,510.9,607.5,665.7,693.6],"causal/256":[398.4,531.2,622.7,685.6,701.5]}},"h200":{"zig":{"dense/64":[373.3,455.9,515.6,546.0,551.2],"dense/72":[354.1,428.0,484.5,517.1,539.8],"dense/96":[457.0,547.2,614.8,650.8,678.5],"dense/128":[537.9,630.9,687.9,718.6,705.6],"dense/256":[583.7,680.1,91.0,785.5,784.1],"causal/64":[276.0,374.9,456.4,512.2,552.9],"causal/72":[250.7,355.2,423.3,483.7,518.2],"causal/96":[324.7,455.7,543.3,600.9,645.3],"causal/128":[415.5,536.6,627.3,682.7,712.8],"causal/256":[435.2,577.4,670.6,745.8,778.6]},"ref":{"dense/64":[147.6,166.0,176.5,190.4,195.6],"dense/72":[159.5,165.2,180.4,189.5,192.3],"dense/96":[224.9,237.1,244.3,259.2,266.1],"dense/128":[238.9,263.4,261.6,276.9,287.2],"dense/256":[287.5,306.2,314.7,317.6,316.1],"causal/64":[116.9,149.4,167.0,176.3,185.9],"causal/72":[133.8,154.0,162.2,177.8,184.6],"causal/96":[191.3,228.5,241.8,242.7,252.4],"causal/128":[198.6,237.2,237.2,260.6,265.3],"causal/256":[251.6,282.1,300.6,307.0,306.1]},"refName":"PyTorch varlen_attn","fa4":{"dense/64":[359.9,451.5,509.1,549.7,575.9],"dense/72":[309.4,387.8,444.4,476.5,476.9],"dense/96":[433.3,535.0,601.2,642.3,670.3],"dense/128":[524.5,623.9,686.0,717.8,733.2],"dense/256":[569.8,666.2,721.5,748.6,761.3],"causal/64":[253.9,356.9,445.8,502.2,539.6],"causal/72":[214.8,306.5,384.0,437.7,462.2],"causal/96":[304.1,428.3,527.7,589.8,629.4],"causal/128":[386.7,521.8,617.9,672.7,699.0],"causal/256":[431.9,561.1,648.3,703.5,717.2]}},"gb10":{"zig":{"dense/64":[81.7,89.2,93.4,91.8,91.1],"dense/72":[31.3,86.6,90.5,88.4,88.4],"dense/96":[79.7,88.1,92.8,93.4,92.9],"dense/128":[78.6,88.8,95.1,95.2,95.2],"dense/256":[56.0,65.8,70.0,71.2,71.3],"causal/64":[49.7,80.8,88.5,92.4,92.0],"causal/72":[40.3,76.4,85.8,90.0,88.9],"causal/96":[47.9,79.1,87.3,92.2,93.0],"causal/128":[51.3,78.5,88.9,94.2,95.6],"causal/256":[39.3,55.5,65.8,69.4,71.0]},"ref":{"dense/64":[51.0,54.8,58.6,60.3,61.2],"dense/72":[50.3,56.7,59.2,61.2,62.1],"dense/96":[68.6,76.1,80.4,82.7,83.6],"dense/128":[55.2,64.5,70.7,72.7,74.1],"dense/256":[67.2,74.7,78.4,80.5,80.9],"causal/64":[38.1,49.9,54.8,57.7,59.9],"causal/72":[34.8,49.6,55.7,58.8,60.3],"causal/96":[46.5,69.0,76.2,79.8,81.5],"causal/128":[38.3,55.4,65.2,70.1,72.6],"causal/256":[50.1,68.1,74.5,77.6,80.5]},"refName":"PyTorch varlen_attn","zig80":{"dense/64":[81.5,87.5,90.2,88.1,87.3],"dense/72":[68.1,41.0,79.8,79.4,78.8],"dense/96":[67.6,78.8,83.9,84.7,79.7],"dense/128":[76.8,85.5,90.0,88.2,89.6],"dense/256":[62.4,72.5,76.8,77.7,78.4],"causal/64":[50.1,79.4,86.8,90.4,90.2],"causal/72":[37.0,68.2,76.4,81.5,69.9],"causal/96":[43.7,67.5,78.3,84.4,85.7],"causal/128":[52.9,75.6,85.3,89.7,90.3],"causal/256":[45.2,61.3,71.1,77.2,78.2]},"fa4":{"dense/64":[9.9,18.4,31.9,50.9,71.3],"dense/72":[8.6,16.0,27.9,44.7,62.5],"dense/96":[10.6,19.9,34.1,53.9,78.2],"dense/128":[9.4,17.5,30.7,49.2,69.0],"dense/256":[null,null,null,null,null],"causal/64":[5.1,10.0,19.8,36.5,62.1],"causal/72":[4.5,8.9,17.2,31.9,53.9],"causal/96":[5.6,11.0,21.4,39.5,67.4],"causal/128":[4.9,9.7,18.6,34.6,58.8],"causal/256":[null,null,null,null,null]}}},"bwd":{"sm100":{"zig":{"dense/64":[574.4,744.1,856.2,872.4,857.7],"dense/72":[494.1,617.4,687.7,686.9,684.9],"dense/96":[702.9,891.4,1016.3,1043.9,1041.1],"dense/128":[746.9,976.9,1147.2,1235.7,1208.6],"dense/256":[602.0,766.5,870.1,863.1,866.3],"causal/64":[392.7,570.8,738.0,858.4,897.0],"causal/72":[349.9,491.0,610.8,675.7,682.0],"causal/96":[476.2,699.9,882.7,1007.2,1069.7],"causal/128":[492.3,739.6,967.7,1134.5,1224.6],"causal/256":[391.7,592.5,749.5,855.5,887.0]},"ref":{"dense/64":[245.9,283.7,307.3,321.3,327.9],"dense/72":[180.0,203.1,217.1,224.3,227.5],"dense/96":[251.9,287.5,305.9,318.9,323.6],"dense/128":[273.7,309.1,331.4,346.8,352.7],"dense/256":[247.6,268.9,284.2,297.1,305.3],"causal/64":[192.7,245.3,282.3,306.3,319.2],"causal/72":[146.0,179.1,202.1,216.5,223.1],"causal/96":[202.1,251.0,285.0,306.2,316.8],"causal/128":[218.7,270.0,306.6,331.1,344.3],"causal/256":[207.6,244.4,265.3,290.2,294.0]},"refName":"PyTorch varlen_attn","fa4":{"dense/64":[553.4,695.2,798.3,820.3,818.3],"dense/72":[477.5,601.0,690.5,692.3,690.8],"dense/96":[684.6,877.1,1001.7,1051.9,1009.8],"dense/128":[730.0,947.3,1096.0,1142.6,1137.5],"dense/256":[null,null,null,null,null],"causal/64":[388.7,549.3,689.7,791.1,839.0],"causal/72":[334.0,472.8,595.1,668.2,694.3],"causal/96":[462.2,680.6,867.8,987.3,1061.2],"causal/128":[483.8,722.4,937.9,1089.6,1147.7],"causal/256":[null,null,null,null,null]}},"sm90":{"zig":{"dense/64":[356.5,444.2,490.6,509.6,523.4],"dense/72":[285.5,364.3,400.6,408.3,430.6],"dense/96":[368.8,468.1,505.8,518.0,542.0],"dense/128":[410.2,511.5,539.3,557.4,580.3],"dense/256":[291.0,342.6,373.5,375.2,395.9],"causal/64":[249.8,354.3,442.6,498.4,497.1],"causal/72":[191.8,286.3,362.4,406.3,408.1],"causal/96":[252.7,368.4,467.6,521.6,537.9],"causal/128":[286.5,410.8,510.6,545.4,561.5],"causal/256":[223.8,292.8,342.3,367.3,379.1]},"ref":{"dense/64":[209.8,249.8,273.8,287.3,292.2],"dense/72":[152.1,174.2,194.2,202.5,205.0],"dense/96":[214.6,246.7,278.0,292.2,296.3],"dense/128":[233.6,265.3,301.1,316.3,321.4],"dense/256":[211.6,237.1,255.3,263.8,269.8],"causal/64":[160.9,209.3,246.7,270.7,283.8],"causal/72":[117.3,148.9,176.2,192.5,200.9],"causal/96":[166.0,214.0,247.5,277.5,290.3],"causal/128":[180.8,225.6,266.9,300.2,314.5],"causal/256":[171.6,210.1,233.7,250.0,267.4]},"refName":"PyTorch varlen_attn","fa4":{"dense/64":[365.0,440.0,477.8,483.3,505.3],"dense/72":[285.2,371.8,405.0,426.9,441.5],"dense/96":[390.2,487.6,529.4,537.0,558.1],"dense/128":[420.3,526.1,596.4,596.6,595.4],"dense/256":[254.3,293.7,315.6,330.4,338.7],"causal/64":[263.1,361.2,444.6,475.6,481.2],"causal/72":[190.6,286.2,362.3,396.8,412.2],"causal/96":[269.1,388.7,484.0,536.5,530.4],"causal/128":[294.9,420.0,516.6,588.4,598.3],"causal/256":[197.3,253.5,292.2,315.8,329.3]}},"h200":{"zig":{"dense/64":[375.1,461.0,502.3,514.9,524.3],"dense/72":[316.6,390.0,415.9,421.7,438.0],"dense/96":[401.6,493.6,517.6,534.3,542.2],"dense/128":[446.0,540.2,584.5,584.9,588.4],"dense/256":[308.9,351.9,377.7,374.5,393.9],"causal/64":[274.8,376.3,460.8,501.2,507.4],"causal/72":[227.6,316.9,378.0,402.0,419.2],"causal/96":[291.4,401.0,489.7,524.3,532.7],"causal/128":[327.7,444.6,533.1,576.5,584.4],"causal/256":[245.9,306.8,350.1,372.4,384.8]},"ref":{"dense/64":[212.3,244.4,268.2,280.2,287.7],"dense/72":[154.5,176.0,190.2,198.2,202.3],"dense/96":[219.2,249.3,275.3,286.0,291.5],"dense/128":[239.2,271.0,297.8,310.3,316.0],"dense/256":[214.5,238.9,251.7,259.1,263.6],"causal/64":[165.5,212.0,245.3,266.7,278.4],"causal/72":[120.9,150.4,174.8,189.2,196.1],"causal/96":[172.0,218.0,249.9,272.9,284.0],"causal/128":[188.1,238.7,270.0,295.0,308.2],"causal/256":[176.0,212.7,238.0,251.0,262.6]},"refName":"PyTorch varlen_attn","fa4":{"dense/64":[380.8,455.1,491.4,488.5,500.8],"dense/72":[310.9,387.9,399.3,419.4,434.3],"dense/96":[415.8,499.9,529.1,530.8,537.3],"dense/128":[446.8,534.1,573.5,564.2,570.4],"dense/256":[295.3,336.0,356.1,365.0,374.4],"causal/64":[282.0,378.3,453.0,482.6,483.7],"causal/72":[218.3,309.2,383.4,401.6,420.2],"causal/96":[305.9,414.5,497.0,522.7,533.0],"causal/128":[332.7,445.9,529.6,552.5,558.0],"causal/256":[234.2,295.2,334.8,353.2,367.3]}},"gb10":{"zig":{"dense/64":[44.2,56.0,63.4,69.1,71.1],"dense/72":[34.7,42.5,47.6,51.3,52.9],"dense/96":[41.3,52.6,60.2,63.7,65.5],"dense/128":[44.5,56.2,64.7,68.9,70.8],"dense/256":[34.9,42.3,45.7,47.8,48.3],"causal/64":[27.5,43.0,55.1,63.1,67.0],"causal/72":[22.7,33.0,41.6,48.0,50.6],"causal/96":[26.3,40.2,51.6,59.6,63.2],"causal/128":[28.0,43.0,54.7,63.1,67.4],"causal/256":[25.2,35.1,41.6,45.6,47.7]},"ref":{"dense/64":[47.1,60.8,69.9,76.7,79.2],"dense/72":[34.8,46.3,54.6,59.3,62.4],"dense/96":[47.4,63.4,72.0,79.2,82.9],"dense/128":[45.7,60.3,71.2,76.7,80.1],"dense/256":[33.9,41.5,46.2,48.6,46.7],"causal/64":[27.7,45.0,59.3,69.0,74.7],"causal/72":[20.0,34.2,45.5,54.2,58.0],"causal/96":[26.9,46.5,61.0,71.6,77.9],"causal/128":[27.4,43.4,57.4,70.1,75.8],"causal/256":[23.7,33.4,41.2,45.4,48.3]},"refName":"PyTorch varlen_attn","zig80":{"dense/64":[38.2,47.9,54.1,57.9,60.2],"dense/72":[23.2,26.5,28.5,29.7,30.4],"dense/96":[25.0,28.8,30.9,32.0,32.6],"dense/128":[29.0,34.0,37.2,38.6,39.7],"dense/256":[17.7,19.3,20.2,20.7,20.9],"causal/64":[25.3,37.5,46.2,53.9,57.9],"causal/72":[18.0,22.9,26.6,26.8,29.2],"causal/96":[19.7,24.8,28.7,30.9,32.5],"causal/128":[21.7,28.9,34.1,37.1,38.9],"causal/256":[15.0,17.6,19.3,20.2,20.6]},"fa4":{"dense/64":[46.2,57.5,65.3,69.2,71.4],"dense/72":[33.2,42.4,49.8,54.1,56.0],"dense/96":[44.7,58.0,66.0,72.3,75.9],"dense/128":[40.3,49.0,55.6,57.9,60.0],"dense/256":[null,null,null,null,null],"causal/64":[29.1,44.3,56.2,63.9,67.6],"causal/72":[20.3,32.4,41.0,48.9,52.6],"causal/96":[28.1,43.0,56.2,66.4,71.3],"causal/128":[27.8,39.5,48.2,54.3,57.3],"causal/256":[null,null,null,null,null]}}}}}};
+const DEVICES = {
+  sm100: { name: "B200", sub: "SM100", arch: "sm100", ref: "cuDNN" },
+  sm90: { name: "H100", sub: "SM90", arch: "sm90", ref: "cuDNN" },
+  h200: { name: "H200", sub: "SM90", arch: "sm90", ref: "cuDNN" },
+  gb10: { name: "GB10", sub: "SM120 and SM80 kernels", arch: "sm120", ref: "PyTorch SDPA" },
+};
+const SERIES = [["zig80", "Zig-SM80", "zig a-sm80"], ["zig", "Zig", "zig"], ["ref", null, "ref"], ["fa4", "FA4 (CuTe)", "fa4"]];
+const SHAPES = {
+  mha: { label: "MHA", axis: "Sequence length (batch × sequence = 16384 tokens)" },
+  gqa: { label: "GQA", axis: "Sequence length (4 query heads per KV head, 16384 tokens)" },
+  varlen: { label: "Varlen", axis: "Mean sequence length (lengths from ½× to 1½×, 16384 tokens)" },
+  sliding: { label: "Sliding window", axis: "Window size (one 16384-token sequence; causal looks left only, dense both ways)" },
+};
+const MASKS = [["dense", "Dense"], ["causal", "Causal"]];
+const SEQ_LABEL = { 512: "512", 1024: "1k", 2048: "2k", 4096: "4k", 8192: "8k" };
+const NS = "http://www.w3.org/2000/svg";
+
+function svgEl(tag, attrs, ...kids) {
+  const node = document.createElementNS(NS, tag);
+  for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
+  for (const kid of kids) if (kid != null) node.append(kid.nodeType ? kid : document.createTextNode(kid));
+  return node;
+}
+
+function el(tag, attrs, ...kids) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (key === "class") node.className = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else node.setAttribute(key, value);
+  }
+  for (const kid of kids) if (kid != null) node.append(kid.nodeType ? kid : document.createTextNode(kid));
+  return node;
+}
+
+function chipRow(label, options, current, onPick) {
+  const row = el("div", { class: "chiprow" }, el("span", { class: "chiplabel" }, label));
+  const group = el("div", { class: "chips", role: "group", "aria-label": label });
+  for (const [value, text, extra] of options) {
+    const chip = el("button", { class: "chip", type: "button", "aria-pressed": String(value === current) }, text);
+    if (extra) chip.append(el("span", { class: "chipx" }, extra));
+    chip.addEventListener("click", () => onPick(value));
+    group.append(chip);
+  }
+  row.append(group);
+  return row;
+}
+
+function perfOf(state, dir, device) {
+  return DATA.perf[state.shape][dir][device || state.device];
+}
+
+function peakBaseline(perf, key, index) {
+  const values = [perf.ref?.[key]?.[index], perf.fa4?.[key]?.[index]].filter((v) => v);
+  return values.length ? Math.max(...values) : null;
+}
+
+function baselineName(perf) {
+  return perf.fa4 ? `best of ${perf.refName}, FA4` : perf.refName;
+}
+
+function ratioStats(perf, mask, hd) {
+  const key = `${mask}/${hd}`;
+  const ratios = [];
+  perf.zig[key].forEach((value, index) => {
+    const ref = peakBaseline(perf, key, index);
+    if (value != null && ref) ratios.push(value / ref);
+  });
+  return ratios;
+}
+
+function median(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
+}
+
+function deviceMedian(state, dir, device) {
+  const perf = perfOf(state, dir, device);
+  const ratios = [];
+  for (const [mask] of MASKS) for (const hd of DATA.heads) ratios.push(...ratioStats(perf, mask, hd));
+  return median(ratios);
+}
+
+function niceCeiling(maximum) {
+  const steps = [10, 20, 25, 50, 100, 200, 250, 500];
+  for (const step of steps) {
+    if (maximum / step <= 6) return { step, top: Math.ceil(maximum / step) * step };
+  }
+  return { step: 500, top: Math.ceil(maximum / 500) * 500 };
+}
+
+function pctClass(percent) {
+  return percent >= 100 ? "great" : percent >= 90 ? "good" : percent >= 80 ? "warn" : "bad";
+}
+
+function seriesOf(perf, arch) {
+  const zigLabel = perf.zig80 ? "Zig-SM120" : "Zig";
+  return SERIES.filter(([id]) => perf[id]).map(([id, label, cls]) => [
+    id,
+    id === "zig" ? zigLabel : label || perf.refName,
+    cls === "zig" ? `zig a-${arch}` : cls,
+  ]);
+}
+
+function barClass(cls) {
+  return `bar ${cls}`;
+}
+
+function stripePatterns(dir, series) {
+  const defs = svgEl("defs", {});
+  for (const [id, , cls] of series) {
+    const pattern = svgEl("pattern", { id: `stripe-${dir}-${id}`, patternUnits: "userSpaceOnUse", width: 6, height: 6, patternTransform: "rotate(45)" });
+    pattern.append(svgEl("rect", { width: 6, height: 6, class: `${barClass(cls)} stripe-ground` }));
+    pattern.append(svgEl("rect", { width: 3.2, height: 6, class: barClass(cls) }));
+    defs.append(pattern);
+  }
+  return defs;
+}
+
+function drawChart(holder, dir, state) {
+  const width = Math.max(300, holder.clientWidth || 640);
+  const compact = width < 560;
+  const height = compact ? 350 : 380;
+  const margin = { left: 46, right: 10, top: 86, bottom: 46 };
+  const plotW = width - margin.left - margin.right;
+  const plotH = height - margin.top - margin.bottom;
+  const info = DEVICES[state.device];
+  const perf = perfOf(state, dir);
+  const series = seriesOf(perf, info.arch);
+  const keys = MASKS.map(([mask]) => `${mask}/${state.hd}`);
+  const values = series.flatMap(([id]) => keys.flatMap((key) => perf[id][key]));
+  const maximum = Math.max(1, ...values.filter((v) => v != null));
+  const { step, top } = niceCeiling(maximum * 1.08);
+  const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}`, width: "100%", height, role: "img", class: "chart" });
+  const shape = SHAPES[state.shape];
+  const title = `${dir === "fwd" ? "Forward" : "Backward"} TFLOPS · ${info.name} (${info.sub}) · ${shape.label} · head dim ${state.hd}`;
+  svg.append(svgEl("title", {}, title));
+  svg.append(stripePatterns(dir, series));
+  const lead = `${dir === "fwd" ? "Forward" : "Backward"} TFLOPS · ${info.name} (${info.sub})`;
+  const tail = `${shape.label} · head dim ${state.hd}`;
+  if (title.length * 7.6 > width - 16) {
+    svg.append(svgEl("text", { x: width / 2, y: 14, class: "ct", "text-anchor": "middle" }, lead));
+    svg.append(svgEl("text", { x: width / 2, y: 31, class: "ct", "text-anchor": "middle" }, tail));
+  } else {
+    svg.append(svgEl("text", { x: width / 2, y: 22, class: "ct", "text-anchor": "middle" }, title));
+  }
+  const y = (value) => margin.top + plotH - (value / top) * plotH;
+  for (let tick = 0; tick <= top; tick += step) {
+    svg.append(svgEl("line", { x1: margin.left, x2: width - margin.right, y1: y(tick), y2: y(tick), class: tick === 0 ? "axis" : "grid" }));
+    svg.append(svgEl("text", { x: margin.left - 6, y: y(tick) + 4, class: "tick", "text-anchor": "end" }, String(tick)));
+  }
+  svg.append(svgEl("text", { transform: `translate(12 ${margin.top + plotH / 2}) rotate(-90)`, class: "axtitle", "text-anchor": "middle" }, "TFLOPS"));
+  const count = DATA.seqs.length;
+  const groupW = plotW / count;
+  const bars = series.length * MASKS.length;
+  const pairGap = 4;
+  const barW = Math.min(22, (groupW * 0.86 - (series.length - 1) * pairGap) / bars);
+  const bandW = barW * bars + (series.length - 1) * pairGap;
+  const rotate = barW < 20;
+  DATA.seqs.forEach((seq, index) => {
+    const center = margin.left + groupW * (index + 0.5);
+    const first = center - bandW / 2;
+    series.forEach(([id, label, cls], position) => {
+      MASKS.forEach(([mask, maskLabel], half) => {
+        const value = perf[id][`${mask}/${state.hd}`][index];
+        const x = first + position * (2 * barW + pairGap) + half * barW;
+        if (value == null) {
+          svg.append(svgEl("text", { x: x + barW / 2, y: y(0) - 4, class: "nodata", "text-anchor": "middle" }, "–"));
+          return;
+        }
+        const group = svgEl("g", {});
+        group.append(svgEl("title", {}, `${label}, ${maskLabel.toLowerCase()}: ${Math.round(value)} TFLOPS at ${SEQ_LABEL[seq]}`));
+        const fill = mask === "causal" ? { style: `fill: url(#stripe-${dir}-${id})` } : {};
+        group.append(svgEl("rect", { x, y: y(value), width: barW - 1, height: Math.max(1, y(0) - y(value)), rx: 1.5, class: barClass(cls), ...fill }));
+        const text = String(Math.round(value));
+        if (rotate) {
+          group.append(svgEl("text", { transform: `translate(${x + barW / 2 + 3} ${y(value) - 4}) rotate(-90)`, class: "val" }, text));
+        } else {
+          group.append(svgEl("text", { x: x + barW / 2, y: y(value) - 4, class: "val", "text-anchor": "middle" }, text));
+        }
+        svg.append(group);
+      });
+    });
+    MASKS.forEach(([mask], row) => {
+      const zig = perf.zig[`${mask}/${state.hd}`][index];
+      const ref = peakBaseline(perf, `${mask}/${state.hd}`, index);
+      if (zig == null || !ref) return;
+      const percent = Math.round((zig / ref) * 100);
+      const pill = svgEl("g", { class: `pill ${pctClass(percent)}` });
+      const pillY = 38 + row * 21;
+      pill.append(svgEl("rect", { x: center - 25, y: pillY, width: 50, height: 18, rx: 9 }));
+      pill.append(svgEl("rect", { x: center - 19, y: pillY + 5, width: 8, height: 8, rx: 1.5, class: `pillmark ${mask}` }));
+      pill.append(svgEl("text", { x: center + 5, y: pillY + 13, "text-anchor": "middle" }, `${percent}%`));
+      svg.append(pill);
+    });
+    svg.append(svgEl("text", { x: center, y: height - margin.bottom + 17, class: "tick", "text-anchor": "middle" }, SEQ_LABEL[seq]));
+  });
+  svg.append(svgEl("text", { x: margin.left + plotW / 2, y: height - 8, class: "axtitle", "text-anchor": "middle" }, shape.axis));
+  holder.replaceChildren(svg);
+}
+
+function summaryLine(dir, state) {
+  const perf = perfOf(state, dir);
+  const parts = [];
+  for (const [mask, maskLabel] of MASKS) {
+    const ratios = ratioStats(perf, mask, state.hd);
+    if (!ratios.length) continue;
+    const percents = ratios.map((r) => Math.round(r * 100)).sort((a, b) => a - b);
+    parts.push(`${maskLabel}: ${perf.zig80 ? "Zig-SM120" : "Zig"} reaches ${percents[0]}–${percents[percents.length - 1]}% of ${perf.fa4 ? `the faster of ${perf.refName} and FA4` : perf.refName} (median ${median(percents)}%).`);
+  }
+  if (perf.zig80) {
+    const ratios = MASKS.flatMap(([mask]) => ratioStats({ ...perf, zig: perf.zig80 }, mask, state.hd));
+    if (ratios.length) parts.push(`Zig-SM80 median ${Math.round(median(ratios) * 100)}% of ${perf.fa4 ? `the faster of ${perf.refName} and FA4` : perf.refName}.`);
+  }
+  if (!parts.length) return "No reference measurement for this shape yet.";
+  if (perf.fa4) {
+    let wins = 0;
+    let total = 0;
+    for (const [mask] of MASKS) {
+      const key = `${mask}/${state.hd}`;
+      perf.fa4[key].forEach((value, index) => {
+        const zig = perf.zig[key][index];
+        if (value == null || zig == null) return;
+        total += 1;
+        if (zig >= value) wins += 1;
+      });
+    }
+    if (total) parts.push(`Zig is at or above FA4 (CuTe) at ${wins} of ${total} points.`);
+  }
+  return parts.join(" ");
+}
+
+function buildChartCard(dir) {
+  const state = { device: "sm100", hd: 128, shape: "mha" };
+  const card = el("div", { class: "chartcard" });
+  const controls = el("div", { class: "controls" });
+  const holder = el("div", { class: "plotholder" });
+  const legend = el("div", { class: "legend" });
+  const summary = el("p", { class: "summaryline" });
+  card.append(controls, holder, legend, summary);
+  function refresh() {
+    controls.replaceChildren(
+      chipRow(
+        "Device",
+        Object.entries(DEVICES).map(([id, info]) => {
+          const ratio = deviceMedian(state, dir, id);
+          return [id, `${info.name} · ${info.sub}`, ratio ? `${Math.round(ratio * 100)}%` : null];
+        }),
+        state.device,
+        (value) => { state.device = value; refresh(); },
+      ),
+      chipRow("Shape", Object.entries(SHAPES).map(([id, shape]) => [id, shape.label]), state.shape, (value) => { state.shape = value; refresh(); }),
+      chipRow("Head dim", DATA.heads.map((hd) => [hd, String(hd)]), state.hd, (value) => { state.hd = value; refresh(); }),
+    );
+    drawChart(holder, dir, state);
+    const info = DEVICES[state.device];
+    const perf = perfOf(state, dir);
+    legend.replaceChildren(
+      ...seriesOf(perf, info.arch).map(([, label, cls]) => el("span", {}, el("i", { class: `sw ${cls}` }), label)),
+      el("span", {}, el("i", { class: "sw maskkey dense" }), "dense"),
+      el("span", {}, el("i", { class: "sw maskkey causal" }), "causal"),
+      el("span", { class: "pillkey" }, `pill = ${perf.zig80 ? "Zig-SM120" : "Zig"} ÷ `, baselineName(perf)),
+    );
+    summary.textContent = summaryLine(dir, state);
+  }
+  refresh();
+  let last = holder.clientWidth;
+  new ResizeObserver(() => {
+    if (Math.abs(holder.clientWidth - last) > 4) {
+      last = holder.clientWidth;
+      drawChart(holder, dir, state);
+    }
+  }).observe(holder);
+  return card;
+}
+
+const ROLE_ROWS = [
+  { name: "SM80 / SM120 forward", sub: "256 threads, no specialisation",
+    groups: [[8, "compute", "16 query rows per warp"]] },
+  { name: "SM80 / SM120 backward", sub: "256 threads (hd256: 128)",
+    groups: [[8, "compute", "every warp: scores, dS, dK, dV, dQ"]] },
+  { name: "SM90 forward, hd128", sub: "384 threads · ping-pong",
+    groups: [[1, "load", "claims tiles · 24 regs"], [3, "idle", ""], [8, "compute", "2 warpgroups · 240 regs"]] },
+  { name: "SM90 forward, hd64–96", sub: "512 threads · 3 consumers",
+    groups: [[1, "load", "claims tiles · 32 regs"], [3, "idle", ""], [12, "compute", "3 warpgroups · 160 regs"]] },
+  { name: "SM90 backward", sub: "384 threads",
+    groups: [[1, "load", "Q, dO, LSE, D"], [1, "reduce", "dQ reduce-add"], [2, "idle", ""], [8, "compute", "2 warpgroups · 240 regs"]] },
+  { name: "SM100 forward, hd64–128", sub: "512 threads · two query tiles",
+    groups: [[8, "compute", "softmax, 2 tiles · 192 regs"], [4, "reduce", "correction, store · 80 regs"], [1, "mma", "tcgen05"], [1, "load", "TMA"], [1, "gather", "CLC"], [1, "idle", ""]] },
+  { name: "SM100 forward, hd256", sub: "384 threads · CTA pair, one query tile",
+    groups: [[4, "compute", "softmax · 256 regs"], [4, "reduce", "correction, store · 160 regs"], [1, "mma", "cta_group::2"], [1, "load", "TMA"], [1, "gather", "CLC"], [1, "idle", ""]] },
+  { name: "SM100 backward, hd64–128", sub: "512 threads",
+    groups: [[4, "reduce", "dQ reduce-add · 152 regs"], [8, "compute", "P, dS · 144 regs"], [1, "mma", ""], [1, "load", ""], [1, "gather", "LSE, D"], [1, "idle", ""]] },
+  { name: "SM100 backward, hd256", sub: "2 kernels × CTA pair · 512 threads",
+    groups: [[8, "compute", "P, dS, epilogue · 200 regs"], [4, "idle", "24 regs"], [1, "mma", "cta_group::2"], [1, "load", ""], [1, "gather", "LSE, D"], [1, "idle", ""]] },
+];
+const ROLE_LABEL = { load: "TMA / load", mma: "MMA issue", compute: "math", reduce: "reduce / store", gather: "statistics / scheduler", idle: "idle" };
+
+const LANE_H = 86;
+const LABEL_W = 132;
+const COL_W = 114;
+const TOP_PAD = 38;
+
+const K = {
+  mma: { cls: "n-mma" },
+  elt: { cls: "n-elt" },
+  mem: { cls: "n-mem" },
+  tmem: { cls: "n-tmem" },
+  red: { cls: "n-red" },
+  store: { cls: "n-store" },
+  load: { cls: "n-load" },
+  claim: { cls: "n-load" },
+};
+
+function labelLines(text) {
+  return text.split("\n");
+}
+
+function plainLength(line) {
+  return line.replace(/_\{[^}]*\}|_[A-Za-z0-9]|\^[A-Za-z0-9]/g, (m) => (m.length > 2 ? m.slice(2, -1) : m.slice(1))).length;
+}
+
+function richText(line, attrs) {
+  const text = svgEl("text", attrs);
+  const parts = line.split(/(_\{[^}]*\}|_[A-Za-z0-9]|\^[A-Za-z0-9])/).filter((p) => p !== "");
+  let shifted = 0;
+  for (const part of parts) {
+    let target = 0;
+    let content = part;
+    let small = false;
+    if (part.startsWith("_")) { target = 3; content = part.length > 2 ? part.slice(2, -1) : part.slice(1); small = true; }
+    else if (part.startsWith("^")) { target = -4; content = part.slice(1); small = true; }
+    const span = svgEl("tspan", small ? { "font-size": "0.74em" } : {}, content);
+    const dy = target - shifted;
+    if (dy !== 0) span.setAttribute("dy", String(dy));
+    shifted = target;
+    text.append(span);
+  }
+  return text;
+}
+
+function nodeSize(node) {
+  const lines = labelLines(node.label);
+  const longest = Math.max(...lines.map(plainLength));
+  if (node.kind === "mem" && lines.length === 1 && longest <= 3) return { w: 44, h: 44, circle: true, font: 12 };
+  const cap = COL_W - 8;
+  const wanted = longest * 6.1 + 14;
+  const width = Math.min(cap, Math.max(44, wanted));
+  const font = wanted > cap ? Math.max(9.5, 12 * (cap - 14) / (longest * 6.1)) : 12;
+  return { w: width, h: lines.length * 15 + 14, circle: false, font };
+}
+
+function drawPipeline(holder, spec, showBarriers) {
+  const columns = Math.max(...spec.nodes.map((n) => n.col)) + 1;
+  const width = LABEL_W + columns * COL_W + 12;
+  const height = TOP_PAD + spec.lanes.length * LANE_H + 8;
+  const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}`, width: "100%", height: "auto", class: "pipe", role: "img" });
+  svg.style.minWidth = "940px";
+  svg.style.aspectRatio = `${width} / ${height}`;
+  svg.append(svgEl("title", {}, spec.title));
+  const defs = svgEl("defs", {});
+  for (const [id, cls] of [["arrow", "arrowhead"], ["arrowb", "arrowhead barrier"]]) {
+    const marker = svgEl("marker", { id: `${spec.id}-${id}`, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" });
+    marker.append(svgEl("path", { d: "M0 1 L10 5 L0 9 z", class: cls }));
+    defs.append(marker);
+  }
+  svg.append(defs);
+  const laneIndex = Object.fromEntries(spec.lanes.map((lane, index) => [lane.id, index]));
+  spec.phases.forEach((phase, index) => {
+    const x = LABEL_W + phase.from * COL_W;
+    svg.append(svgEl("rect", { x, y: TOP_PAD - 6, width: (phase.to - phase.from + 1) * COL_W, height: spec.lanes.length * LANE_H + 6, class: `phase p${index % 3}` }));
+    svg.append(svgEl("text", { x: x + 8, y: TOP_PAD - 14, class: "phasetitle" }, phase.name));
+  });
+  spec.lanes.forEach((lane, index) => {
+    const y = TOP_PAD + index * LANE_H;
+    svg.append(svgEl("line", { x1: 0, x2: width, y1: y + LANE_H, y2: y + LANE_H, class: "laneline" }));
+    svg.append(svgEl("text", { x: 8, y: y + LANE_H / 2 - (lane.sub ? 2 : -4), class: "lanelabel" }, lane.label));
+    if (lane.sub) svg.append(svgEl("text", { x: 8, y: y + LANE_H / 2 + 13, class: "lanesub" }, lane.sub));
+  });
+  const place = {};
+  for (const node of spec.nodes) {
+    const size = nodeSize(node);
+    const cx = LABEL_W + node.col * COL_W + COL_W / 2;
+    const cy = TOP_PAD + laneIndex[node.lane] * LANE_H + LANE_H / 2;
+    place[node.id] = { ...node, ...size, cx, cy };
+  }
+  const edgeLayer = svgEl("g", {});
+  svg.append(edgeLayer);
+  for (const [from, to, label, kind] of spec.edges) {
+    const a = place[from];
+    const b = place[to];
+    if (!a || !b) throw new Error(`${spec.id}: unknown node in edge ${from} -> ${to}`);
+    if (kind === "sync" && !showBarriers) continue;
+    const barrier = showBarriers && label ? label : null;
+    const styled = Boolean(barrier) || kind === "sync";
+    let x1;
+    let y1;
+    let x2;
+    let y2;
+    if (b.cx > a.cx + 1) { x1 = a.cx + a.w / 2; y1 = a.cy; x2 = b.cx - b.w / 2; y2 = b.cy; }
+    else if (b.cx < a.cx - 1) { x1 = a.cx - a.w / 2; y1 = a.cy; x2 = b.cx + b.w / 2; y2 = b.cy; }
+    else { x1 = a.cx; x2 = b.cx; y1 = a.cy + (b.cy > a.cy ? a.h / 2 : -a.h / 2); y2 = b.cy + (b.cy > a.cy ? -b.h / 2 : b.h / 2); }
+    const dx = Math.max(18, Math.min(70, Math.abs(x2 - x1) / 2));
+    const sign = x2 >= x1 ? 1 : -1;
+    const vertical = Math.abs(x2 - x1) < 2;
+    const path = vertical
+      ? `M${x1} ${y1} L${x2} ${y2}`
+      : `M${x1} ${y1} C${x1 + sign * dx} ${y1} ${x2 - sign * dx} ${y2} ${x2} ${y2}`;
+    edgeLayer.append(svgEl("path", { d: path, class: styled ? "edge barrier" : "edge", "marker-end": `url(#${spec.id}-${styled ? "arrowb" : "arrow"})` }));
+    if (barrier) {
+      const mx = (x1 + x2) / 2;
+      const my = (y1 + y2) / 2;
+      const w = barrier.length * 5.6 + 8;
+      edgeLayer.append(svgEl("rect", { x: mx - w / 2, y: my - 7, width: w, height: 13, rx: 3, class: "edgelabelbg" }));
+      edgeLayer.append(svgEl("text", { x: mx, y: my + 3, class: "edgelabel", "text-anchor": "middle" }, barrier));
+    }
+  }
+  for (const id of Object.keys(place)) {
+    const node = place[id];
+    const group = svgEl("g", { class: `node ${K[node.kind].cls}${node.pending ? " pending" : ""}` });
+    if (node.note) group.append(svgEl("title", {}, node.note));
+    if (node.circle) group.append(svgEl("circle", { cx: node.cx, cy: node.cy, r: node.w / 2 }));
+    else group.append(svgEl("rect", { x: node.cx - node.w / 2, y: node.cy - node.h / 2, width: node.w, height: node.h, rx: node.kind === "mem" ? node.h / 2 : 6 }));
+    const lines = labelLines(node.label);
+    lines.forEach((line, index) => {
+      const y = node.cy + (index - (lines.length - 1) / 2) * 15 + 4;
+      group.append(richText(line, { x: node.cx, y, "text-anchor": "middle", class: "nlabel", "font-size": node.font }));
+    });
+    svg.append(group);
+  }
+  holder.replaceChildren(svg);
+}
+
+const PIPES = [
+  {
+    id: "sm80f", tab: "SM80 / SM120 forward", arch: "sm80",
+    title: "SM80 and SM120 forward: one warp owns 16 query rows (32 on the SM120 hd96 forward)",
+    foot: "Q, S, P and O stay in registers, so the tensor core and the exponent unit alternate inside each warp. Two CTAs share an SM for hd64 and hd72, which hides the gap. The SM120 hd96 forward runs 4 warps of 32 query rows with Q in shared memory and one K/V stage; each warp issues two m16 row tiles per K and V ldmatrix, and the empty barriers release K after the S GEMM and V after the P·V GEMM, so the next K load overlaps softmax and P·V.",
+    lanes: [
+      { id: "load", label: "Loader", sub: "cp.async · TMA on SM120" },
+      { id: "smem", label: "Shared memory" },
+      { id: "tc", label: "Tensor core", sub: "mma.sync m16n8k16" },
+      { id: "reg", label: "Registers" },
+      { id: "alu", label: "Softmax", sub: "CUDA cores" },
+      { id: "out", label: "Epilogue" },
+    ],
+    phases: [{ name: "Prologue", from: 0, to: 1 }, { name: "Main loop · key tile j", from: 2, to: 7 }, { name: "Tail", from: 8, to: 9 }],
+    nodes: [
+      { id: "ldq", lane: "load", col: 0, kind: "load", label: "Q tile" },
+      { id: "q", lane: "smem", col: 0, kind: "mem", label: "Q" },
+      { id: "qr", lane: "reg", col: 1, kind: "elt", label: "ldmatrix Q\nto registers" },
+      { id: "ldk0", lane: "load", col: 1, kind: "load", label: "K₀ V₀\nprefetch" },
+      { id: "ldk", lane: "load", col: 2, kind: "load", label: "K_{j+1} V_{j+1}\nnext stage" },
+      { id: "k", lane: "smem", col: 2, kind: "mem", label: "K_j" },
+      { id: "s", lane: "tc", col: 3, kind: "mma", label: "S_j = Q·K_j^T" },
+      { id: "sr", lane: "reg", col: 4, kind: "mem", label: "S_j" },
+      { id: "sm", lane: "alu", col: 5, kind: "elt", label: "mask (diagonal)\nmax · exp2 · sum" },
+      { id: "p", lane: "reg", col: 6, kind: "mem", label: "P_j" },
+      { id: "v", lane: "smem", col: 6, kind: "mem", label: "V_j" },
+      { id: "pv", lane: "tc", col: 7, kind: "mma", label: "O = αO + P_j·V_j" },
+      { id: "fin", lane: "alu", col: 8, kind: "elt", label: "O / l → bf16\nLSE = m + log l" },
+      { id: "st", lane: "out", col: 9, kind: "store", label: "stage in smem\n16 B stores" },
+    ],
+    edges: [
+      ["ldq", "q"], ["q", "qr"], ["qr", "s"], ["ldk0", "k", "full[stage]"], ["ldk", "k", "full[stage]"], ["ldk", "v"], ["k", "s"], ["s", "sr"],
+      ["sr", "sm"], ["sm", "p"], ["p", "pv"], ["v", "pv"], ["pv", "ldk", "empty[stage]", "sync"], ["pv", "fin"], ["fin", "st"],
+    ],
+  },
+  {
+    id: "sm80b", tab: "SM80 / SM120 backward", arch: "sm80",
+    title: "SM80 and SM120 backward: key tile resident, query tiles stream through",
+    foot: "P and dS go through shared memory once per query tile so that every warp can read them transposed. A preprocess kernel computes D = rowsum(dO·O) and a postprocess kernel converts fp32 dQ. At hd64 the SM120 kernel adds dQ with red.v4 from registers up to 1024 keys and above that uses 64x128 tiles with one query stage and the TMA bulk reduce.",
+    lanes: [
+      { id: "load", label: "Loader · store", sub: "cp.async · TMA on SM120" },
+      { id: "smem", label: "Shared memory" },
+      { id: "tc", label: "Tensor core", sub: "mma.sync" },
+      { id: "alu", label: "Math", sub: "CUDA cores" },
+      { id: "red", label: "dQ add", sub: "red.v4 · TMA reduce" },
+    ],
+    phases: [{ name: "Prologue", from: 0, to: 1 }, { name: "Main loop · query tile i", from: 2, to: 8 }, { name: "Tail", from: 9, to: 10 }],
+    nodes: [
+      { id: "ldkv", lane: "load", col: 0, kind: "load", label: "K, V tiles\n(once)" },
+      { id: "kv", lane: "smem", col: 0, kind: "mem", label: "K V" },
+      { id: "ldq0", lane: "load", col: 1, kind: "load", label: "Q₀ dO₀" },
+      { id: "ldq", lane: "load", col: 2, kind: "load", label: "Q_{i+1} dO_{i+1}\nprefetch" },
+      { id: "q", lane: "smem", col: 2, kind: "mem", label: "Q_i dO_i" },
+      { id: "s", lane: "tc", col: 3, kind: "mma", label: "S = Q_i·K^T" },
+      { id: "dp", lane: "tc", col: 4, kind: "mma", label: "dP = dO_i·V^T" },
+      { id: "ds", lane: "alu", col: 5, kind: "elt", label: "P = exp2(S·c − LSE)\ndS = P·(dP − D)" },
+      { id: "stash", lane: "smem", col: 6, kind: "mem", label: "P dS (bf16)" },
+      { id: "kvg", lane: "tc", col: 7, kind: "mma", label: "dV += P^T·dO_i\ndK += dS^T·Q_i" },
+      { id: "dq", lane: "tc", col: 8, kind: "mma", label: "dQ_i = dS·K" },
+      { id: "dqr", lane: "red", col: 8, kind: "red", label: "fp32 add\nto dQ buffer" },
+      { id: "fin", lane: "alu", col: 9, kind: "elt", label: "scale dK\nbf16 dK, dV" },
+      { id: "st", lane: "load", col: 10, kind: "store", label: "16 B stores" },
+    ],
+    edges: [
+      ["ldkv", "kv"], ["ldq0", "q"], ["ldq", "q"], ["kv", "s"], ["q", "s"], ["q", "dp"], ["kv", "dp"], ["s", "ds"], ["dp", "ds"],
+      ["ds", "stash"], ["stash", "kvg", "block barrier"], ["stash", "dq"], ["dq", "dqr"], ["kvg", "fin"], ["fin", "st"],
+    ],
+  },
+  {
+    id: "sm90f", tab: "SM90 forward", arch: "sm90",
+    title: "SM90 forward: one producer warp, two or three consumer warpgroups",
+    foot: "The producer claims whole tiles from a global counter. The consumer issues the next QK wgmma before the previous PV, so the exponentials run while the tensor core works. The key loop runs as a masked prefix, an unmasked middle and a masked suffix, and only the masked loops apply the mask; in the unmasked loop the PV wait lands after the row max and the first exponentials. Short instances keep one loop. hd64 adds a named barrier that alternates the warpgroups.",
+    lanes: [
+      { id: "prod", label: "Producer warp", sub: "TMA · tile claim" },
+      { id: "smem", label: "Shared memory" },
+      { id: "mma", label: "Consumer", sub: "wgmma, async" },
+      { id: "alu", label: "Consumer", sub: "softmax · registers" },
+      { id: "out", label: "Epilogue" },
+    ],
+    phases: [{ name: "Tile start", from: 0, to: 2 }, { name: "Main loop · key tile j", from: 3, to: 8 }, { name: "Tile end", from: 9, to: 10 }],
+    nodes: [
+      { id: "claim", lane: "prod", col: 0, kind: "claim", label: "claim tile\natomic counter" },
+      { id: "ldq", lane: "prod", col: 1, kind: "load", label: "TMA Q" },
+      { id: "q", lane: "smem", col: 1, kind: "mem", label: "Q" },
+      { id: "ldk0", lane: "prod", col: 2, kind: "load", label: "TMA K₀" },
+      { id: "ldv", lane: "prod", col: 4, kind: "load", label: "TMA V_j" },
+      { id: "ldk", lane: "prod", col: 3, kind: "load", label: "TMA K_{j+1}" },
+      { id: "k", lane: "smem", col: 3, kind: "mem", label: "K_j" },
+      { id: "v", lane: "smem", col: 5, kind: "mem", label: "V_{j-1}" },
+      { id: "s", lane: "mma", col: 4, kind: "mma", label: "S_j = Q·K_j^T" },
+      { id: "pv", lane: "mma", col: 5, kind: "mma", label: "O += P_{j-1}·V_{j-1}" },
+      { id: "sm", lane: "alu", col: 6, kind: "elt", label: "mask (R2P, masked loops)\nmax · exp2 · pack P_j" },
+      { id: "resc", lane: "alu", col: 7, kind: "elt", label: "rescale O\nby α" },
+      { id: "fin", lane: "alu", col: 9, kind: "elt", label: "O / l → bf16\nstmatrix to smem" },
+      { id: "st", lane: "out", col: 10, kind: "store", label: "16 B stores\nLSE" },
+    ],
+    edges: [
+      ["claim", "ldq", "tile_claimed"], ["ldq", "q", "q_full"], ["q", "s"], ["ldk0", "k", "k_full"], ["ldk", "k", "k_full"], ["k", "s"], ["ldv", "v", "v_full"], ["v", "pv"],
+      ["s", "sm"], ["pv", "resc"], ["sm", "resc"], ["resc", "fin"], ["fin", "st"], ["pv", "ldk", "k_empty", "sync"],
+    ],
+  },
+  {
+    id: "sm90b", tab: "SM90 backward", arch: "sm90",
+    title: "SM90 backward: key tile resident, two warpgroups of 64 keys each",
+    foot: "dQ is the only output that many CTAs add to, so one reduce warp adds it to global memory with TMA while the warpgroups compute the next tile. A preprocess kernel computes D, a postprocess kernel converts dQ. One stage barrier covers Q, dO, LSE and D, except at hd72, where Q with LSE and dO with D have separate pipelines (as FA4's pipeline_Q and pipeline_dO): the S GEMM waits only for Q and the dP GEMM waits for dO. At hd96 the query-block loop is split into a masked loop for the blocks that cross the diagonal or window and a branch-free loop for the unmasked middle, so ptxas issues several exp2 before the dP wait; the hd96 medium instance and the other head dims keep one loop.",
+    lanes: [
+      { id: "prod", label: "Producer warp", sub: "TMA · cp.async" },
+      { id: "smem", label: "Shared memory" },
+      { id: "mma", label: "Consumers", sub: "wgmma, async" },
+      { id: "alu", label: "Consumers", sub: "CUDA cores" },
+      { id: "red", label: "Reduce warp", sub: "TMA reduce-add" },
+    ],
+    phases: [{ name: "Prologue", from: 0, to: 0 }, { name: "Main loop · query tile j", from: 1, to: 8 }, { name: "Tail", from: 9, to: 10 }],
+    nodes: [
+      { id: "ldkv", lane: "prod", col: 0, kind: "load", label: "TMA K, V\n(once)" },
+      { id: "kv", lane: "smem", col: 0, kind: "mem", label: "K V" },
+      { id: "ldq", lane: "prod", col: 1, kind: "load", label: "TMA Q_j dO_j\nLSE_j D_j" },
+      { id: "q", lane: "smem", col: 1, kind: "mem", label: "Q_j dO_j" },
+      { id: "s", lane: "mma", col: 2, kind: "mma", label: "S_j^T = K·Q_j^T" },
+      { id: "dp", lane: "mma", col: 3, kind: "mma", label: "dP_j^T = V·dO_j^T" },
+      { id: "p", lane: "alu", col: 3, kind: "elt", label: "P = exp2(S·c − LSE)\nmask on diagonal" },
+      { id: "dv", lane: "mma", col: 4, kind: "mma", label: "dV += P·dO_j" },
+      { id: "dsn", lane: "alu", col: 4, kind: "elt", label: "dS = P·(dP − D)\nstmatrix" },
+      { id: "ds", lane: "smem", col: 5, kind: "mem", label: "dS_j" },
+      { id: "dq", lane: "mma", col: 5, kind: "mma", label: "dQ_j = dS·K" },
+      { id: "dk", lane: "mma", col: 6, kind: "mma", label: "dK += dS·Q_j" },
+      { id: "stg", lane: "alu", col: 7, kind: "elt", label: "fp32 to smem\n32-column boxes" },
+      { id: "rd", lane: "red", col: 8, kind: "red", label: "TMA reduce-add\nto dQ buffer" },
+      { id: "fin", lane: "alu", col: 9, kind: "elt", label: "dK, dV → bf16\n(cluster: add peers)" },
+      { id: "st", lane: "alu", col: 10, kind: "store", label: "16 B stores" },
+    ],
+    edges: [
+      ["ldkv", "kv", "kv_full"], ["ldq", "q", "stage_full"], ["kv", "s"], ["q", "s"], ["kv", "dp"], ["q", "dp"], ["s", "p"], ["p", "dv"], ["p", "dsn"],
+      ["dp", "dsn"], ["dsn", "ds"], ["ds", "dk"], ["ds", "dq"], ["dq", "stg"], ["stg", "rd", "staging_full"], ["fin", "st"],
+    ],
+  },
+  {
+    id: "sm100f", tab: "SM100 forward", arch: "sm100",
+    title: "SM100 forward: two query tiles alternate through tensor memory",
+    foot: "One warp issues every tcgen05 MMA. In the steady state the order is PV of key tile j−1 and QK of key tile j for query tile 0, then the same pair for query tile 1, so the tensor core rarely waits for a softmax group. S and P share tensor-memory columns (P is written back as bf16, per 32-column fragment at hd64 and hd96 from 513 query rows, with the exp2 emulation on the FMA pipe in the two inner fragments). Correction warps only touch O when the row maximum has grown by more than a factor 256.",
+    lanes: [
+      { id: "load", label: "Load warp", sub: "TMA" },
+      { id: "smem", label: "Shared memory" },
+      { id: "mma", label: "MMA warp", sub: "tcgen05.mma" },
+      { id: "tmem", label: "Tensor memory", sub: "S, P and O columns" },
+      { id: "sm0", label: "Softmax group 0", sub: "query tile 0" },
+      { id: "sm1", label: "Softmax group 1", sub: "query tile 1" },
+      { id: "corr", label: "Correction group", sub: "rescale · epilogue" },
+    ],
+    phases: [{ name: "Prologue", from: 0, to: 1 }, { name: "Main loop · key tile j", from: 2, to: 8 }, { name: "Tail", from: 9, to: 10 }],
+    nodes: [
+      { id: "ldq", lane: "load", col: 0, kind: "load", label: "TMA Q₀ Q₁" },
+      { id: "q", lane: "smem", col: 1, kind: "mem", label: "Q₀ Q₁" },
+      { id: "ldk", lane: "load", col: 2, kind: "load", label: "TMA K_j" },
+      { id: "kv", lane: "smem", col: 2, kind: "mem", label: "K_j" },
+      { id: "ldv", lane: "load", col: 3, kind: "load", label: "TMA V_j" },
+      { id: "v", lane: "smem", col: 3, kind: "mem", label: "V_j" },
+      { id: "s0", lane: "mma", col: 3, kind: "mma", label: "S₀ = Q₀·K_j^T" },
+      { id: "s1", lane: "mma", col: 4, kind: "mma", label: "S₁ = Q₁·K_j^T" },
+      { id: "ts0", lane: "tmem", col: 3, kind: "tmem", label: "S₀" },
+      { id: "ts1", lane: "tmem", col: 4, kind: "tmem", label: "S₁" },
+      { id: "e0", lane: "sm0", col: 4, kind: "elt", label: "mask · max\nexp2 · P₀ → TMEM\n(per fragment)" },
+      { id: "e1", lane: "sm1", col: 5, kind: "elt", label: "mask · max\nexp2 · P₁ → TMEM\n(per fragment)" },
+      { id: "c0", lane: "corr", col: 5, kind: "elt", label: "O₀ × α\nif max moved" },
+      { id: "c1", lane: "corr", col: 6, kind: "elt", label: "O₁ × α\nif max moved" },
+      { id: "pv0", lane: "mma", col: 6, kind: "mma", label: "O₀ += P₀·V_j" },
+      { id: "pv1", lane: "mma", col: 7, kind: "mma", label: "O₁ += P₁·V_j" },
+      { id: "to", lane: "tmem", col: 7, kind: "tmem", label: "O₀ O₁" },
+      { id: "fin", lane: "corr", col: 9, kind: "elt", label: "O / l → bf16\nstage in smem" },
+      { id: "st", lane: "corr", col: 10, kind: "store", label: "TMA store\nLSE" },
+    ],
+    edges: [
+      ["ldq", "q", "q_full"], ["ldk", "kv", "k_full"], ["ldv", "v", "v_full"], ["q", "s0"], ["kv", "s0"], ["kv", "s1"], ["q", "s1"], ["s0", "ts0"], ["s1", "ts1"],
+      ["ts0", "e0", "s_full"], ["ts1", "e1", "s_full"], ["e0", "c0", "scale_full"], ["e1", "c1", "scale_full"], ["e0", "pv0", "p_ready"],
+      ["e1", "pv1", "p_ready"], ["c0", "pv0"], ["c1", "pv1"], ["v", "pv0"], ["pv0", "to"], ["pv1", "to"], ["to", "fin", "o_full"], ["fin", "st"],
+    ],
+  },
+  {
+    id: "sm100b", tab: "SM100 backward", arch: "sm100",
+    title: "SM100 backward: five GEMMs per query tile, software-pipelined by one MMA warp",
+    foot: "The MMA warp issues dK and dQ of tile j−1 right after S of tile j, so the compute warps always find a finished S, dP or dS waiting in tensor memory. P and dS are written back as bf16 and used as the tensor-memory A operand of dV and dK. This diagram shows the 1-CTA kernel; hd128 MHA at 1025 rows or more uses the paired 2-CTA variant.",
+    lanes: [
+      { id: "load", label: "Load warp", sub: "TMA" },
+      { id: "vec", label: "Statistics warp", sub: "LSE, D negated" },
+      { id: "smem", label: "Shared memory" },
+      { id: "mma", label: "MMA warp", sub: "tcgen05.mma" },
+      { id: "tmem", label: "Tensor memory" },
+      { id: "cmp", label: "Compute groups", sub: "2 × 4 warps" },
+      { id: "red", label: "Reduce group", sub: "4 warps" },
+    ],
+    phases: [{ name: "Prologue (tile 0)", from: 0, to: 1 }, { name: "Main loop · query tile j", from: 2, to: 8 }, { name: "Tail", from: 9, to: 10 }],
+    nodes: [
+      { id: "ld0", lane: "load", col: 0, kind: "load", label: "TMA K V\nQ₀ dO₀" },
+      { id: "m0", lane: "smem", col: 0, kind: "mem", label: "K V Q₀ dO₀" },
+      { id: "g0", lane: "mma", col: 1, kind: "mma", label: "S₀, dP₀ GEMMs" },
+      { id: "c0", lane: "cmp", col: 1, kind: "elt", label: "P₀, dS₀" },
+      { id: "ld", lane: "load", col: 2, kind: "load", label: "TMA Q_j dO_j" },
+      { id: "vec", lane: "vec", col: 2, kind: "load", label: "LSE_j D_j\ngather" },
+      { id: "q", lane: "smem", col: 3, kind: "mem", label: "Q_j dO_j" },
+      { id: "s", lane: "mma", col: 3, kind: "mma", label: "S_j^T = K·Q_j^T" },
+      { id: "ts", lane: "tmem", col: 3, kind: "tmem", label: "S" },
+      { id: "dsp", lane: "smem", col: 4, kind: "mem", label: "dS_{j-1}" },
+      { id: "kvq", lane: "mma", col: 4, kind: "mma", label: "dK += dS_{j-1}^T·Q\ndQ = dS_{j-1}·K" },
+      { id: "dp", lane: "mma", col: 5, kind: "mma", label: "dP_j^T = V·dO_j^T" },
+      { id: "td", lane: "tmem", col: 5, kind: "tmem", label: "dP" },
+      { id: "p", lane: "cmp", col: 4, kind: "elt", label: "P = exp2(S·c − LSE)\nmask on diagonal" },
+      { id: "tp", lane: "tmem", col: 4, kind: "tmem", label: "P (bf16)" },
+      { id: "dv", lane: "mma", col: 6, kind: "mma", label: "dV += P^T·dO_j" },
+      { id: "dsn", lane: "cmp", col: 6, kind: "elt", label: "dS = P·(dP − D)" },
+      { id: "ds", lane: "smem", col: 7, kind: "mem", label: "dS_j" },
+      { id: "dqr", lane: "red", col: 6, kind: "red", label: "dQ_{j-1}: TMEM → smem\nTMA reduce-add" },
+      { id: "fin", lane: "cmp", col: 9, kind: "elt", label: "dK, dV × scale\nstage 32 rows · TMA store" },
+      { id: "tail", lane: "mma", col: 9, kind: "mma", label: "dK_B, dQ_B" },
+      { id: "dqt", lane: "red", col: 10, kind: "red", label: "dQ_B reduce-add" },
+    ],
+    edges: [
+      ["ld0", "m0", "kv_full"], ["ld", "q", "q_full"], ["m0", "g0"], ["g0", "c0"], ["q", "s"], ["q", "dp"], ["q", "dv"], ["s", "ts"], ["ts", "p", "s_full"], ["p", "tp"], ["tp", "dv", "p_ready"],
+      ["dp", "td"], ["td", "dsn", "dp_full"], ["p", "dsn"], ["vec", "p", "vectors_full"], ["dsn", "ds"], ["dsp", "kvq", "ds_ready"], ["kvq", "dqr", "dq_full"],
+      ["ds", "tail"], ["tail", "dqt"], ["tail", "fin", "dk_full"],
+    ],
+  },
+];
+
+function renderPipelineSection(root) {
+  const state = { id: PIPES[0].id, barriers: false };
+  const tabs = el("div", { class: "chiprow" }, el("span", { class: "chiplabel" }, "Kernel"));
+  const group = el("div", { class: "chips", role: "group", "aria-label": "Pipeline" });
+  tabs.append(group);
+  const holder = el("div", { class: "pipeframe" });
+  const foot = el("p", { class: "figfoot" });
+  const legend = el("div", { class: "legend dia" },
+    ...[["n-mma", "tensor-core MMA"], ["n-elt", "element-wise math"], ["n-mem", "shared memory data"], ["n-tmem", "tensor memory"], ["n-red", "atomic / reduce"], ["n-load", "TMA / load"], ["n-store", "global store"]]
+      .map(([cls, text]) => el("span", {}, el("i", { class: `sw ${cls}` }), text)),
+    null);
+  const barrierChip = el("button", { class: "chip", type: "button", "aria-pressed": "false" }, "Barrier names");
+  barrierChip.addEventListener("click", () => { state.barriers = !state.barriers; refresh(); });
+  function refresh() {
+    group.replaceChildren(
+      ...PIPES.map((pipe) => {
+        const chip = el("button", { class: "chip", type: "button", "aria-pressed": String(pipe.id === state.id) }, pipe.tab);
+        chip.addEventListener("click", () => { state.id = pipe.id; refresh(); });
+        return chip;
+      }),
+    );
+    barrierChip.setAttribute("aria-pressed", String(state.barriers));
+    const spec = PIPES.find((pipe) => pipe.id === state.id);
+    holder.className = `pipeframe a-${spec.arch}`;
+    drawPipeline(holder, spec, state.barriers);
+    foot.textContent = spec.foot;
+  }
+  root.append(tabs, el("div", { class: "chiprow" }, el("span", { class: "chiplabel" }, "Show"), el("div", { class: "chips" }, barrierChip)), holder, legend, foot);
+  refresh();
+}
+
+function renderRoles(root) {
+  const legend = el("div", { class: "legend" }, ...Object.entries(ROLE_LABEL).map(([key, text]) => el("span", {}, el("i", { class: `sw r-${key}` }), text)));
+  const list = el("div", { class: "roles" });
+  for (const row of ROLE_ROWS) {
+    const strips = el("div", { class: "groups" });
+    for (const [count, role, caption] of row.groups) {
+      const strip = el("div", { class: "strip" });
+      for (let index = 0; index < count; index += 1) strip.append(el("span", { class: `warp r-${role}` }));
+      const group = el("div", { class: "group" }, strip);
+      group.append(el("div", { class: "cap" }, el("b", {}, `${count} warp${count > 1 ? "s" : ""} · ${ROLE_LABEL[role]}`), caption));
+      strips.append(group);
+    }
+    list.append(el("div", { class: "role-row" }, el("h3", {}, row.name, el("small", {}, row.sub)), strips));
+  }
+  root.append(legend, list);
+}
+
+const TILE_SETS = [
+  {
+    id: "fwd256", tab: "SM100 forward, hd256",
+    title: "One CTA pair, 256 query rows, 128 keys per step",
+    gemms: [
+      { name: "S = Q·K^T", shape: [256, 128, 256],
+        a: { label: "Q", rows: 256, cols: 256, split: "rows", src: "smem" },
+        b: { label: "K^T", rows: 256, cols: 128, split: "cols", src: "smem" },
+        c: { label: "S", rows: 256, cols: 128, split: "rows", src: "TMEM" } },
+      { name: "O += P·V", shape: [256, 256, 128],
+        a: { label: "P", rows: 256, cols: 128, split: "rows", src: "TMEM" },
+        b: { label: "V", rows: 128, cols: 256, split: "cols", src: "smem" },
+        c: { label: "O", rows: 256, cols: 256, split: "rows", src: "TMEM" } },
+    ],
+    foot: "Each CTA loads its own 128 query rows. Keys are split by row (64 per CTA) for QK, values by column (128 of 256 head-dim columns per CTA) for PV. Rank 0 issues the MMAs for both CTAs.",
+  },
+  {
+    id: "bwdkv", tab: "SM100 backward, dK/dV kernel",
+    title: "Key-major kernel: 128 keys per pair, 128 queries per step",
+    gemms: [
+      { name: "S^T = K·Q^T", shape: [128, 128, 256],
+        a: { label: "K", rows: 128, cols: 256, split: "rows", src: "smem" },
+        b: { label: "Q^T", rows: 256, cols: 128, split: "cols", src: "smem" },
+        c: { label: "S^T", rows: 128, cols: 128, split: "rows", src: "TMEM" } },
+      { name: "dP^T = V·dO^T", shape: [128, 128, 256],
+        a: { label: "V", rows: 128, cols: 256, split: "rows", src: "smem" },
+        b: { label: "dO^T", rows: 256, cols: 128, split: "cols", src: "smem" },
+        c: { label: "dP^T", rows: 128, cols: 128, split: "rows", src: "TMEM" } },
+      { name: "dV += P^T·dO", shape: [128, 256, 128],
+        a: { label: "P^T", rows: 128, cols: 128, split: "rows", src: "smem" },
+        b: { label: "dO", rows: 128, cols: 256, split: "cols", src: "smem" },
+        c: { label: "dV", rows: 128, cols: 256, split: "rows", src: "TMEM" } },
+      { name: "dK += dS^T·Q", shape: [128, 256, 128],
+        a: { label: "dS^T", rows: 128, cols: 128, split: "rows", src: "smem" },
+        b: { label: "Q", rows: 128, cols: 256, split: "cols", src: "smem" },
+        c: { label: "dK", rows: 128, cols: 256, split: "rows", src: "TMEM" } },
+    ],
+    foot: "Each CTA keeps 64 keys and loads half of the queries as rows plus half of the head-dim columns as a second copy for the gradient GEMMs. P and dS go to shared memory as bf16.",
+  },
+  {
+    id: "bwdq", tab: "SM100 backward, dQ kernel",
+    title: "Query-major kernel: 256 queries per pair, 128 keys per step",
+    gemms: [
+      { name: "S = Q·K^T", shape: [256, 128, 256],
+        a: { label: "Q", rows: 256, cols: 256, split: "rows", src: "smem" },
+        b: { label: "K^T", rows: 256, cols: 128, split: "cols", src: "smem" },
+        c: { label: "S", rows: 256, cols: 128, split: "rows", src: "TMEM" } },
+      { name: "dP = dO·V^T", shape: [256, 128, 256],
+        a: { label: "dO", rows: 256, cols: 256, split: "rows", src: "smem" },
+        b: { label: "V^T", rows: 256, cols: 128, split: "cols", src: "smem" },
+        c: { label: "dP", rows: 256, cols: 128, split: "rows", src: "TMEM" } },
+      { name: "dQ += dS·K", shape: [256, 256, 128],
+        a: { label: "dS", rows: 256, cols: 128, split: "rows", src: "TMEM" },
+        b: { label: "K", rows: 128, cols: 256, split: "cols", src: "smem" },
+        c: { label: "dQ", rows: 256, cols: 256, split: "rows", src: "TMEM" } },
+    ],
+    foot: "dQ accumulates in tensor memory across every key tile of the row block and is written once, so this kernel needs no atomic or reduce traffic.",
+  },
+];
+
+function tileSide(dim) {
+  return 26 + dim * 0.34;
+}
+
+function tileBox(svg, x, y, spec, showRows) {
+  const w = tileSide(spec.cols);
+  const h = tileSide(spec.rows);
+  const halves = spec.split === "rows" ? [[0, 0, w, h / 2], [0, h / 2, w, h / 2]] : [[0, 0, w / 2, h], [w / 2, 0, w / 2, h]];
+  halves.forEach(([dx, dy, rw, rh], index) => {
+    svg.append(svgEl("rect", { x: x + dx, y: y + dy, width: rw, height: rh, class: `cta c${index}` }));
+    svg.append(svgEl("text", { x: x + dx + rw / 2, y: y + dy + rh / 2 + 4, class: "ctalabel", "text-anchor": "middle" }, rw >= 50 ? `CTA ${index}` : `C${index}`));
+  });
+  svg.append(svgEl("text", { x: x + w / 2, y: y - 20, class: "dimlabel", "text-anchor": "middle" }, `${spec.cols}`));
+  if (showRows) svg.append(svgEl("text", { x: x - 6, y: y + h / 2 + 4, class: "dimlabel", "text-anchor": "end" }, `${spec.rows}`));
+  svg.append(richText(spec.label, { x: x + w / 2, y: y - 6, class: "tilename", "text-anchor": "middle" }));
+  svg.append(svgEl("text", { x: x + w / 2, y: y + h + 14, class: "srclabel", "text-anchor": "middle" }, spec.src));
+  return { w, h };
+}
+
+function drawTiles(holder, set) {
+  const panelW = 520;
+  const perRow = 2;
+  const rows = Math.ceil(set.gemms.length / perRow);
+  const width = panelW * Math.min(perRow, set.gemms.length) + 20;
+  const rowH = 250;
+  const height = rows * rowH + 10;
+  const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}`, width, height, class: "tiles", role: "img" });
+  svg.append(svgEl("title", {}, set.title));
+  set.gemms.forEach((gemm, index) => {
+    const ox = (index % perRow) * panelW + 44;
+    const oy = Math.floor(index / perRow) * rowH;
+    svg.append(richText(gemm.name, { x: ox - 20, y: oy + 24, class: "gemmname" }));
+    svg.append(svgEl("text", { x: ox - 20, y: oy + 42, class: "shape" }, `(M, N, K) = (${gemm.shape.join(", ")})`));
+    const top = oy + 98;
+    const a = tileBox(svg, ox, top, gemm.a, true);
+    const bx = ox + a.w + 40;
+    const b = tileBox(svg, bx, top, gemm.b, false);
+    svg.append(svgEl("text", { x: ox + a.w + 20, y: top + 14 + a.h / 2, class: "op", "text-anchor": "middle" }, "×"));
+    const cx = bx + b.w + 40;
+    svg.append(svgEl("text", { x: bx + b.w + 20, y: top + 14 + a.h / 2, class: "op", "text-anchor": "middle" }, "="));
+    tileBox(svg, cx, top, gemm.c, false);
+  });
+  holder.replaceChildren(svg);
+}
+
+function renderTiles(root) {
+  const state = { id: TILE_SETS[0].id };
+  const tabs = el("div", { class: "chiprow" }, el("span", { class: "chiplabel" }, "Pair"));
+  const group = el("div", { class: "chips", role: "group", "aria-label": "Tile shapes" });
+  tabs.append(group);
+  const holder = el("div", { class: "pipeframe tiles-frame" });
+  const caption = el("p", { class: "figfoot" });
+  function refresh() {
+    group.replaceChildren(...TILE_SETS.map((set) => {
+      const chip = el("button", { class: "chip", type: "button", "aria-pressed": String(set.id === state.id) }, set.tab);
+      chip.addEventListener("click", () => { state.id = set.id; refresh(); });
+      return chip;
+    }));
+    const set = TILE_SETS.find((item) => item.id === state.id);
+    drawTiles(holder, set);
+    caption.textContent = `${set.title}. ${set.foot}`;
+  }
+  root.append(tabs, holder, caption);
+  refresh();
+}
+
+const EXCHANGE = [
+  { id: "sm100", tab: "SM100 backward · cluster of 2" },
+  { id: "sm90", tab: "SM90 backward · cluster of 2, 4 or 8" },
+];
+
+function drawExchange100(holder) {
+  const width = 900;
+  const height = 330;
+  const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}`, width, height, class: "tiles", role: "img" });
+  svg.append(svgEl("title", {}, "SM100 backward head split: dK and dV partial exchange through distributed shared memory"));
+  const marker = svgEl("marker", { id: "xa", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto" });
+  marker.append(svgEl("path", { d: "M0 1 L10 5 L0 9 z", class: "arrowhead barrier" }));
+  svg.append(svgEl("defs", {}, marker));
+  const box = (x, y, w, h, cls, lines) => {
+    svg.append(svgEl("rect", { x, y, width: w, height: h, rx: 6, class: cls }));
+    lines.forEach((line, index) => svg.append(svgEl("text", { x: x + w / 2, y: y + h / 2 + 4 + (index - (lines.length - 1) / 2) * 15, class: "ctalabel", "text-anchor": "middle" }, line)));
+  };
+  [0, 1].forEach((rank) => {
+    const x = rank === 0 ? 40 : 500;
+    const near = rank === 0 ? x + 184 : x + 16;
+    const owner = rank === 0 ? "dV" : "dK";
+    const other = rank === 0 ? "dK" : "dV";
+    svg.append(svgEl("rect", { x, y: 14, width: 360, height: 302, rx: 10, class: "ctabox" }));
+    svg.append(svgEl("text", { x: x + 14, y: 38, class: "gemmname" }, `CTA ${rank} · ${rank === 0 ? "first" : "second"} half of the query heads`));
+    box(x + 16, 54, 328, 36, "cta c2", ["same key tile · K, V in shared memory"]);
+    box(x + 16, 106, 156, 44, "cta c0", ["dV partial", "tensor memory"]);
+    box(x + 188, 106, 156, 44, "cta c1", ["dK partial", "tensor memory"]);
+    if (rank === 0) {
+      box(near, 176, 160, 50, "cta c4", ["dV = own + peer partial", "× 1 → bf16 TMA store"]);
+      box(near, 246, 160, 50, "cta c3", ["dK partial as fp32 chunks", "own shared memory"]);
+    } else {
+      box(near, 176, 160, 50, "cta c3", ["dV partial as fp32 chunks", "own shared memory"]);
+      box(near, 246, 160, 50, "cta c4", ["dK = own + peer partial", "× scale → bf16 TMA store"]);
+    }
+  });
+  const link = (d, label, y) => {
+    svg.append(svgEl("path", { d, class: "edge barrier thick", "marker-end": "url(#xa)" }));
+    svg.append(svgEl("text", { x: 450, y, class: "edgelabel big", "text-anchor": "middle" }, label));
+  };
+  link("M516 201 L390 201", "ld.shared::cluster", 193);
+  link("M390 271 L516 271", "ld.shared::cluster", 263);
+  svg.append(svgEl("text", { x: 450, y: 226, class: "edgelabel", "text-anchor": "middle" }, "partial_full"));
+  svg.append(svgEl("text", { x: 450, y: 296, class: "edgelabel", "text-anchor": "middle" }, "partial_empty"));
+  holder.replaceChildren(svg);
+}
+
+function drawExchange90(holder, ranks) {
+  const slots = 16;
+  const width = 900;
+  const height = 300;
+  const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}`, width, height, class: "tiles", role: "img" });
+  svg.append(svgEl("title", {}, `SM90 backward head split across ${ranks} CTAs`));
+  const shift = 4 - Math.log2(ranks);
+  const palette = 8;
+  svg.append(svgEl("text", { x: 20, y: 24, class: "gemmname" }, `${ranks} CTAs share one key tile. Each CTA holds partial dK and dV in registers.`));
+  svg.append(svgEl("text", { x: 20, y: 44, class: "shape" }, `${slots} slices = 2 tensors × 8 consumer warps. The rank printed in a slice owns it and adds the peers' partials.`));
+  const cell = 46;
+  const x0 = 70;
+  [["dV", 0], ["dK", 1]].forEach(([name, row]) => {
+    svg.append(svgEl("text", { x: 20, y: 98 + row * 66, class: "gemmname" }, name));
+    for (let warp = 0; warp < 8; warp += 1) {
+      const owner = (row * 8 + warp) >> shift;
+      svg.append(svgEl("rect", { x: x0 + warp * (cell + 6), y: 68 + row * 66, width: cell, height: 44, rx: 6, class: `cta rank r${owner % palette}` }));
+      svg.append(svgEl("text", { x: x0 + warp * (cell + 6) + cell / 2, y: 88 + row * 66, class: "ctalabel", "text-anchor": "middle" }, `warp ${warp}`));
+      svg.append(svgEl("text", { x: x0 + warp * (cell + 6) + cell / 2, y: 104 + row * 66, class: "ctalabel strong", "text-anchor": "middle" }, `rank ${owner}`));
+    }
+  });
+  const steps = [
+    ["1", "Every CTA writes its fp32 partials into its own shared memory"],
+    ["2", "Cluster barrier"],
+    ["3", "The owner reads each peer's slice with ld.shared::cluster and adds it"],
+    ["4", "Cluster barrier, then the owner stages bf16 and stores"],
+  ];
+  steps.forEach(([n, text], index) => {
+    const y = 212 + index * 22;
+    svg.append(svgEl("circle", { cx: 30, cy: y - 4, r: 9, class: "stepdot" }));
+    svg.append(svgEl("text", { x: 30, y: y - 1, class: "ctalabel strong", "text-anchor": "middle" }, n));
+    svg.append(svgEl("text", { x: 50, y, class: "figstep" }, text));
+  });
+  holder.replaceChildren(svg);
+}
+
+function renderExchange(root) {
+  const state = { id: "sm100", ranks: 2 };
+  const tabs = el("div", { class: "chiprow" }, el("span", { class: "chiplabel" }, "Kernel"));
+  const group = el("div", { class: "chips", role: "group", "aria-label": "Head split" });
+  tabs.append(group);
+  const rankRow = el("div", { class: "chiprow" }, el("span", { class: "chiplabel" }, "Cluster"));
+  const rankChips = el("div", { class: "chips", role: "group", "aria-label": "Cluster size" });
+  rankRow.append(rankChips);
+  const holder = el("div", { class: "pipeframe tiles-frame" });
+  const foot = el("p", { class: "figfoot" });
+  function refresh() {
+    group.replaceChildren(...EXCHANGE.map((item) => {
+      const chip = el("button", { class: "chip", type: "button", "aria-pressed": String(item.id === state.id) }, item.tab);
+      chip.addEventListener("click", () => { state.id = item.id; refresh(); });
+      return chip;
+    }));
+    rankRow.hidden = state.id !== "sm90";
+    rankChips.replaceChildren(...[2, 4, 8].map((n) => {
+      const chip = el("button", { class: "chip", type: "button", "aria-pressed": String(n === state.ranks) }, `${n} CTAs`);
+      chip.addEventListener("click", () => { state.ranks = n; refresh(); });
+      return chip;
+    }));
+    if (state.id === "sm100") {
+      drawExchange100(holder);
+      foot.textContent = "The query heads of one key head split across the two CTAs of a cluster. Each CTA keeps the partial it does not own in shared memory in 32-column fp32 chunks, and the owner adds it through distributed shared memory before the bf16 store.";
+    } else {
+      drawExchange90(holder, state.ranks);
+      foot.textContent = "The host picks the cluster size from the shapes only: the query-head group size and the wave efficiency of the launch grid.";
+    }
+  }
+  root.append(tabs, rankRow, holder, foot);
+  refresh();
+}
+
+const COLS = ["SM80 fwd", "SM120 fwd", "SM80 bwd", "SM120 bwd", "SM90 fwd", "SM90 bwd", "SM100 fwd", "SM100 bwd", "FA4", "Inter-seq"];
+const GLYPH = { U: "✓", A: "○", X: "◌", R: "✕", N: "–", Q: "?", S: "●", I: "◇", O: "·" };
+const STATE_TEXT = {
+  U: "in use", A: "absent, a gap", X: "untried idea", R: "rejected after measurement",
+  N: "not applicable", Q: "not checked", S: "shared module", I: "own copy in this kernel", O: "not used there",
+};
+const GROUPS = ["Scheduling", "Masking", "Softmax", "MMA issue", "Data movement", "Barriers", "Shared code"];
+const TIER_TEXT = { A: "hoist now (mechanical)", B: "hoist after an A/B run", C: "keep per chip", done: "already shared" };
+
+const INTERSEQ_ROWS = new Set(["Packed GQA query tiles", "O(1) block-to-sequence index", "Device-built visible-tile table", "Cursor walk over visible tiles", "GQA dK/dV accumulated on chip", "Infinite-LSE padding for tail rows", "Per-sequence diagonal band", "Statistics in registers before S", "Row max from tcgen05.ld.red", "Short tiles for short sequences", "Separate P and dS slots", "Swapped-operand decode tile", "First-tile load order", "TMA descriptor prefetch", "Tiles at any token", "Paged KV by page table", "Deferred barrier-init sync"]);
+const T = [
+  [0, "Heavy tiles first", [
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [0, "L2 swizzle scheduler", [
+    "R",
+    "R",
+    "R",
+    "R",
+    "U",
+    "R",
+    "U",
+    "U",
+    "U",
+    "O"]],
+  [0, "CLC", [
+    "N",
+    "R",
+    "N",
+    "R",
+    "N",
+    "N",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [0, "Dynamic persistent scheduler", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "A",
+    "N",
+    "N",
+    "Q",
+    "O"]],
+  [0, "Head split across CTAs", [
+    "N",
+    "N",
+    "U",
+    "U",
+    "N",
+    "U",
+    "N",
+    "U",
+    "Q",
+    "U"]],
+  [0, "Multiply-shift tile decode", [
+    "Q",
+    "Q",
+    "Q",
+    "Q",
+    "U",
+    "Q",
+    "U",
+    "Q",
+    "U",
+    "Q"]],
+  [0, "Larger preprocess blocks", [
+    "Q",
+    "Q",
+    "Q",
+    "Q",
+    "Q",
+    "Q",
+    "Q",
+    "R",
+    "Q",
+    "Q"]],
+  [0, "Larger postprocess blocks", [
+    "N",
+    "N",
+    "R",
+    "R",
+    "N",
+    "R",
+    "N",
+    "R",
+    "Q",
+    "Q"]],
+  [0, "Preprocess loads issued together", [
+    "N",
+    "N",
+    "U",
+    "U",
+    "N",
+    "U",
+    "N",
+    "U",
+    "Q",
+    "Q"]],
+  [0, "Programmatic dependent launch", [
+    "N",
+    "N",
+    "N",
+    "U",
+    "N",
+    "U",
+    "N",
+    "U",
+    "U",
+    "U"]],
+  [1, "Interior and masked tile split", [
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "R",
+    "U",
+    "U",
+    "U"]],
+  [1, "Visible range computed once", [
+    "N",
+    "N",
+    "A",
+    "A",
+    "N",
+    "U",
+    "N",
+    "U",
+    "Q",
+    "U"]],
+  [1, "R2P bit-mask on diagonal tiles", [
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [1, "Skip 16-key MMA groups per warp", [
+    "U",
+    "U",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "O"]],
+  [1, "Zero smem rows past the sequence end", [
+    "N",
+    "N",
+    "U",
+    "U",
+    "N",
+    "U",
+    "N",
+    "U",
+    "Q",
+    "O"]],
+  [2, "Polynomial exp2 on the FMA pipe", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "A",
+    "A",
+    "U",
+    "R",
+    "U",
+    "U"]],
+  [2, "Lazy O rescale (threshold 8)", [
+    "U",
+    "U",
+    "N",
+    "N",
+    "U",
+    "N",
+    "U",
+    "N",
+    "U",
+    "U"]],
+  [2, "Late row sum", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "N",
+    "Q",
+    "U"]],
+  [2, "Pre-negated LSE and D", [
+    "N",
+    "N",
+    "U",
+    "U",
+    "N",
+    "U",
+    "N",
+    "U",
+    "Q",
+    "U"]],
+  [2, "Statistics warp ahead of S", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "A",
+    "N",
+    "U",
+    "Q",
+    "U"]],
+  [3, "Grouped single-elect MMA issue", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [3, "Descriptors hoisted out of the k loop", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "U",
+    "U",
+    "N",
+    "U",
+    "U"]],
+  [3, "Overlap inside one warpgroup", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [3, "Ping-pong between warpgroups", [
+    "N",
+    "N",
+    "N",
+    "U",
+    "U",
+    "N",
+    "U",
+    "N",
+    "U",
+    "U"]],
+  [3, "Early key gradient", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "R",
+    "N",
+    "N",
+    "Q",
+    "O"]],
+  [3, "Larger tile per CTA", [
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [3, "2-CTA MMA pair", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [3, "Register cap for occupancy", [
+    "U",
+    "U",
+    "X",
+    "X",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "R"]],
+  [3, "setmaxnreg role budgets", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [4, "Swizzle width per head dim", [
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [4, "hd72 at MMA width 80", [
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "A",
+    "U",
+    "N"]],
+  [4, "Epilogue staged through smem", [
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [4, "Wider or bulk-copy dK/dV stores", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "R",
+    "N",
+    "N"]],
+  [4, "dQ by TMA reduce from a staged tile", [
+    "N",
+    "N",
+    "N",
+    "U",
+    "N",
+    "U",
+    "N",
+    "U",
+    "U",
+    "U"]],
+  [4, "dQ by red.v4 from registers", [
+    "N",
+    "N",
+    "N",
+    "U",
+    "N",
+    "R",
+    "N",
+    "R",
+    "N",
+    "O"]],
+  [4, "dQ by scalar red in thread order", [
+    "N",
+    "N",
+    "N",
+    "R",
+    "N",
+    "N",
+    "N",
+    "N",
+    "Q",
+    "O"]],
+  [4, "dQ without atomics", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "Q",
+    "U"]],
+  [4, "Next query tile before the dQ stage", [
+    "N",
+    "N",
+    "U",
+    "U",
+    "N",
+    "N",
+    "N",
+    "N",
+    "Q",
+    "N"]],
+  [3, "Straight-line backward loop body", [
+    "N",
+    "N",
+    "N",
+    "R",
+    "N", "N", "N", "N", "Q", "Q"]],
+  [4, "Base plus immediate ldmatrix addressing", [
+    "N",
+    "N",
+    "N",
+    "R",
+    "N", "N", "N", "N", "Q", "Q"]],
+  [3, "ptxas 13.4", [
+    "Q",
+    "R",
+    "Q", "Q", "N", "N", "N", "N", "N", "N"]],
+  [4, "Interleaved dQ staging rows", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "N",
+    "N",
+    "Q",
+    "O"]],
+  [5, "Consumer arrive policy", [
+    "U",
+    "U",
+    "N",
+    "N",
+    "R",
+    "U",
+    "U",
+    "U",
+    "Q",
+    "U"]],
+  [5, "Separate Q and dO pipelines", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "N",
+    "N",
+    "U",
+    "N"]],
+  [5, "Split P hand-off", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "N",
+    "N",
+    "U"]],
+  [5, "Nanosleep backoff on producer waits", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "N",
+    "U",
+    "N",
+    "Q",
+    "Q"]],
+  [0, "Packed GQA query tiles", [
+    "U",
+    "U",
+    "N",
+    "N",
+    "U",
+    "N",
+    "U",
+    "N",
+    "U",
+    "U"]],
+  [0, "O(1) block-to-sequence index", [
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [0, "Device-built visible-tile table", [
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "N",
+    "U"]],
+  [0, "Cursor walk over visible tiles", [
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "N",
+    "U"]],
+  [0, "GQA dK/dV accumulated on chip", [
+    "N",
+    "N",
+    "U",
+    "U",
+    "N",
+    "U",
+    "N",
+    "U",
+    "U",
+    "U"]],
+  [1, "Infinite-LSE padding for tail rows", [
+    "N",
+    "N",
+    "U",
+    "U",
+    "N",
+    "A",
+    "N",
+    "A",
+    "U",
+    "U"]],
+  [1, "Per-sequence diagonal band", [
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "A",
+    "N",
+    "U"]],
+  [2, "Statistics in registers before S", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "N",
+    "N",
+    "U",
+    "U"]],
+  [2, "Row max from tcgen05.ld.red", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "A",
+    "N",
+    "U",
+    "U"]],
+  [3, "Short tiles for short sequences", [
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "N",
+    "U",
+    "U"]],
+  [3, "Separate P and dS slots", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "R",
+    "U",
+    "U"]],
+  [3, "Swapped-operand decode tile", [
+    "N",
+    "N",
+    "N",
+    "N",
+    "X",
+    "N",
+    "X",
+    "N",
+    "N",
+    "U"]],
+  [4, "First-tile load order", [
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "R",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [4, "Separate K and V release", [
+    "N",
+    "U",
+    "N",
+    "N",
+    "Q",
+    "Q",
+    "Q",
+    "Q",
+    "Q",
+    "Q"]],
+  [4, "All-thread cp.async K/V loads with CTA barriers", [
+    "N",
+    "R",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "N",
+    "U",
+    "O"]],
+  [4, "TMA descriptor prefetch", [
+    "N",
+    "U",
+    "N",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [4, "Tiles at any token", [
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U"]],
+  [4, "Paged KV by page table", [
+    "X",
+    "X",
+    "N",
+    "N",
+    "X",
+    "N",
+    "X",
+    "N",
+    "U",
+    "U"]],
+  [5, "Deferred barrier-init sync", [
+    "A",
+    "U",
+    "N",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U",
+    "U"]],
+];
+
+const SHARED = [
+  ["Loop without roles (PipelineFwd, PipelineBwd)","SSSSNNNN","done"],
+  ["Specialized varlen and GQA instances","SSSSSSSS","done"],
+  ["Role dispatch (PipelineWs)","NNNNSSSS","done"],
+  ["Tile scheduler (tile_scheduler)","SSSSSSSS","done"],
+  ["Scheduler state interface (none, dynamic persistent, CLC)","SSSSSSSS","done"],
+  ["Visible-range arithmetic (block_info)","SSSSSSSS","done"],
+  ["Score masks (mask)","SSSSSISS","done"],
+  ["Online softmax (fragments)","SSNNSNIN","C"],
+  ["Mbarrier wait, arrive and commit (shared pipeline counter)","ISNSSISS","done"],
+  ["TMA copy loops (expect-tx, boxes)","NSNSIIII","A"],
+  ["clearRows for ragged tiles","NNNSNSNS","done"],
+  ["wgmma operand helpers","NNNNSSNN","done"],
+  ["tcgen05 and packed-f32 helpers","NNNNNNSS","done"],
+  ["Cluster and DSMEM helpers (cta_group)","NNNNNISS","A"],
+  ["LSE store (fragments.storeLse)","SSNNSNIN","B"],
+  ["Statistics gather (gatherNegated)","NNNNNNNI","A"],
+  ["Ragged row limit (rowsPastEnd)","NNNNNNNI","A"],
+  ["Epilogue stage-and-store","IIIIIIII","B"],
+  ["dQ accumulation","NNIININI","C"],
+  ["Backward preprocess and postprocess (backward_entries)","NNSSNSNS","done"],
+];
+
+
+
+function renderMatrix(root) {
+  const state = { group: -1 };
+  const filter = el("div", { class: "chips", role: "group", "aria-label": "Group" });
+  const legend = el("div", { class: "glyphs" });
+  const holder = el("div", { class: "frame" });
+  const tierLegend = el("div", { class: "glyphs" },
+    ...Object.entries(TIER_TEXT).map(([tier, text]) => el("span", {}, el("i", { class: `tier t-${tier}` }, tier === "done" ? "✓" : tier), text)));
+
+  function glyphCell(code, label) {
+    return el("span", { class: "cell", "data-s": code, title: `${label}: ${STATE_TEXT[code]}` }, GLYPH[code]);
+  }
+
+  function refresh() {
+    filter.replaceChildren(
+      ...[["All", -1], ...GROUPS.map((g, i) => [g, i])].map(([text, value]) => {
+        const chip = el("button", { class: "chip", type: "button", "aria-pressed": String(state.group === value) }, text);
+        chip.addEventListener("click", () => { state.group = value; refresh(); });
+        return chip;
+      }),
+    );
+    legend.replaceChildren(
+      ...["U", "A", "X", "R", "N", "O"].map((code) => el("span", {}, el("i", { class: "cell", "data-s": code }, GLYPH[code]), STATE_TEXT[code])),
+      ...["S", "I"].map((code) => el("span", {}, el("i", { class: "cell", "data-s": code }, GLYPH[code]), STATE_TEXT[code])),
+    );
+    const table = el("table", { class: "matrix" });
+    const head = el("tr", {}, el("th", {}, ""));
+    for (const name of COLS) head.append(el("th", { class: "col" }, name));
+    head.append(el("th", { class: "col" }, "Sharing"));
+    table.append(el("thead", {}, head));
+    const body = el("tbody", {});
+    const show = (index) => state.group === -1 || state.group === index;
+    GROUPS.slice(0, 6).forEach((group, index) => {
+      if (!show(index)) return;
+      body.append(el("tr", { class: "group-row" }, el("td", { colspan: COLS.length + 2 }, group)));
+      T.filter((row) => row[0] === index).forEach((row) => {
+        const tr = el("tr", {}, el("td", { class: "name" }, row[1], INTERSEQ_ROWS.has(row[1]) ? el("span", { class: "isbadge", title: "from the inter-sequence kernels" }, "IS") : null));
+        row[2].forEach((raw, column) => {
+          const cell = glyphCell(raw, COLS[column]);
+          tr.append(el("td", {}, cell));
+        });
+        tr.append(el("td", {}));
+        body.append(tr);
+      });
+    });
+    if (show(6)) {
+      body.append(el("tr", { class: "group-row" }, el("td", { colspan: COLS.length + 2 }, "Shared code · ● shared module, ◇ own copy")));
+      for (const [name, states, tier] of SHARED) {
+        const tr = el("tr", {}, el("td", { class: "name" }, name));
+        [...states].forEach((code, column) => {
+          const cell = glyphCell(code, COLS[column]);
+          tr.append(el("td", {}, cell));
+        });
+        tr.append(el("td", {}, el("span", { class: "dash" }, "")));
+        tr.append(el("td", {}, el("span", { class: "dash" }, "")));
+        tr.append(el("td", {}, el("i", { class: `tier t-${tier}`, title: TIER_TEXT[tier] }, tier === "done" ? "✓" : tier)));
+        body.append(tr);
+      }
+    }
+    table.append(body);
+    holder.replaceChildren(table);
+  }
+  root.append(filter, legend, holder, tierLegend);
+  refresh();
+}
+
+const IS_BATCH = {
+  names: ["A", "B", "C", "D", "E"],
+  lengths: [200, 90, 300, 150, 120],
+  visibility: [
+    [1, 0, 0, 0, 0],
+    [0, 1, 0, 0, 0],
+    [1, 0, 1, 0, 0],
+    [1, 1, 0, 1, 0],
+    [1, 1, 1, 1, 1],
+  ],
+};
+
+function isStarts() {
+  const starts = [0];
+  for (const length of IS_BATCH.lengths) starts.push(starts[starts.length - 1] + length);
+  return starts;
+}
+
+function isPrefixRow(row, tileN) {
+  const count = IS_BATCH.names.length;
+  const starts = isStarts();
+  const sees = (sequence) => IS_BATCH.visibility[row][sequence] === 1;
+  const merged = row > 0 && sees(row) && sees(row - 1) ? 1 : 0;
+  const sequences = [];
+  const offsets = [0];
+  const tokenStarts = [];
+  for (let position = 0; position < count; position += 1) {
+    let sequence = position + (position >= row ? 1 : 0);
+    if (position === count - 1) sequence = row;
+    let tiles = 0;
+    let start = starts[sequence];
+    if (sees(sequence)) {
+      if (sequence === row) start = starts[row - merged];
+      tiles = Math.ceil((starts[sequence + 1] - start) / tileN);
+      if (sequence === row - merged && sequence !== row) tiles = 0;
+    }
+    sequences.push(sequence);
+    tokenStarts.push(start);
+    offsets.push(offsets[position] + tiles);
+  }
+  return { sequences, offsets, tokenStarts };
+}
+
+function isSchedule(tiles, sms) {
+  const free = Array(sms).fill(0);
+  const placed = tiles.map((tile) => {
+    const sm = free.indexOf(Math.min(...free));
+    const start = free[sm];
+    free[sm] += tile.work;
+    return { ...tile, sm, start };
+  });
+  return { placed, free, end: Math.max(...free) };
+}
+
+function isCanvas(key, width, height, label) {
+  const svg = svgEl("svg", { viewBox: `0 0 ${width} ${height}`, width, height, class: "tiles isdiagram", role: "img", "aria-label": label });
+  const hatch = svgEl(
+    "pattern",
+    { id: `is-hatch-${key}`, patternUnits: "userSpaceOnUse", width: 6, height: 6, patternTransform: "rotate(45)" },
+    svgEl("rect", { width: 6, height: 6, class: "is-hatch-bg" }),
+    svgEl("line", { x1: 0, y1: 0, x2: 0, y2: 6, class: "is-hatch-line" }),
+  );
+  const marker = svgEl(
+    "marker",
+    { id: `is-arrow-${key}`, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto" },
+    svgEl("path", { d: "M0 1 L10 5 L0 9 z", class: "arrowhead barrier" }),
+  );
+  svg.append(svgEl("title", {}, label), svgEl("defs", {}, hatch, marker));
+  return { svg, hatch: `url(#is-hatch-${key})`, arrow: `url(#is-arrow-${key})` };
+}
+
+function isText(svg, x, y, text, cls, anchor) {
+  svg.append(svgEl("text", { x, y, class: cls, "text-anchor": anchor || "start" }, text));
+}
+
+function isRect(svg, x, y, width, height, cls, extra) {
+  svg.append(svgEl("rect", { x, y, width, height, class: cls, ...(extra || {}) }));
+}
+
+function isPath(svg, d, cls, arrow) {
+  svg.append(svgEl("path", arrow ? { d, class: cls, "marker-end": arrow } : { d, class: cls }));
+}
+
+function isFigPackedGqa() {
+  const group = 4;
+  const tokens = 32;
+  const rows = 128;
+  const rowH = 1.25;
+  const top = 64;
+  const tileH = rows * rowH;
+  const { svg, hatch, arrow } = isCanvas("gqa", 520, 256, "Packed GQA: four query heads of one KV head share one 128-row query tile and one K/V load");
+  isText(svg, 16, 18, "Unpacked: one CTA per query head", "tilename");
+  for (let head = 0; head < group; head += 1) {
+    const x = 52 + head * 52;
+    isRect(svg, x, 28, 34, 18, "is-kv");
+    isText(svg, x + 17, 41, "K, V", "ctalabel", "middle");
+    isPath(svg, `M${x + 17} 47 V${top - 2}`, "is-arrow", arrow);
+    isRect(svg, x, top, 34, tokens * rowH, `is-h${head}`);
+    isText(svg, x + 17, top + (tokens * rowH) / 2 + 4, `h${head}`, "ctalabel strong", "middle");
+    isRect(svg, x, top + tokens * rowH, 34, (rows - tokens) * rowH, "is-pad", { fill: hatch });
+    isRect(svg, x, top, 34, tileH, "is-outline");
+  }
+  isText(svg, 46, top + 4, "0", "dimlabel", "end");
+  isText(svg, 46, top + tokens * rowH + 4, "32", "dimlabel", "end");
+  isText(svg, 46, top + tileH + 4, "128", "dimlabel", "end");
+  isText(svg, 147, 248, "4 K/V loads · 32 of 128 rows used", "ctalabel", "middle");
+
+  const px = 304;
+  isText(svg, 290, 18, "Packed: one CTA per KV head", "tilename");
+  isRect(svg, px, 28, 40, 18, "is-kv");
+  isText(svg, px + 20, 41, "K, V", "ctalabel", "middle");
+  isPath(svg, `M${px + 20} 47 V${top - 2}`, "is-arrow", arrow);
+  for (let row = 0; row < rows; row += 1) isRect(svg, px, top + row * rowH, 40, rowH, `is-h${row % group} is-solid`);
+  isRect(svg, px, top, 40, tileH, "is-outline");
+  isText(svg, px - 6, top + 4, "0", "dimlabel", "end");
+  isText(svg, px - 6, top + tileH + 4, "128", "dimlabel", "end");
+  const zx = 386;
+  const zoomRows = 8;
+  const zoomH = 16;
+  isPath(svg, `M${px + 40} ${top} L${zx} ${top}`, "is-guide");
+  isPath(svg, `M${px + 40} ${top + zoomRows * rowH} L${zx} ${top + zoomRows * zoomH}`, "is-guide");
+  for (let row = 0; row < zoomRows; row += 1) {
+    const y = top + row * zoomH;
+    isRect(svg, zx, y, 126, zoomH, `is-h${row % group}`);
+    isText(svg, zx + 8, y + 12, `row ${row} · t${Math.floor(row / group)} h${row % group}`, "ctalabel");
+  }
+  isRect(svg, zx, top, 126, zoomRows * zoomH, "is-outline");
+  isText(svg, zx + 8, top + zoomRows * zoomH + 16, `… row 127 · t${tokens - 1} h${group - 1}`, "srclabel");
+  isText(svg, 408, 248, "1 K/V load · 128 of 128 rows used", "ctalabel", "middle");
+  return svg;
+}
+
+function isFigTokenAxis() {
+  const { svg, hatch } = isCanvas("axis", 520, 204, "Sequences A to E packed end to end; D's query and key tiles start at sequence boundaries and mask the next sequence's tokens");
+  const starts = isStarts();
+  const X = (token) => 116 + token * 0.45;
+  const tileN = 128;
+  isText(svg, 106, 45, "sequences", "ctalabel", "end");
+  IS_BATCH.names.forEach((name, index) => {
+    const x = X(starts[index]);
+    const width = X(starts[index + 1]) - x;
+    isRect(svg, x, 28, width, 26, `is-s${index} is-sep`);
+    isText(svg, x + width / 2, 45, `${name} ${IS_BATCH.lengths[index]}`, "ctalabel", "middle");
+  });
+  starts.forEach((token) => isText(svg, X(token), 68, String(token), "dimlabel", "middle"));
+  const tile = (start, sequence, y, label) => {
+    const stop = Math.min(start + tileN, starts[sequence + 1]);
+    isRect(svg, X(start), y, X(stop) - X(start), 22, `is-s${sequence}`);
+    if (stop < start + tileN) isRect(svg, X(stop), y, X(start + tileN) - X(stop), 22, "is-pad", { fill: hatch });
+    isRect(svg, X(start), y, X(start + tileN) - X(start), 22, "is-outline");
+    if (label) isText(svg, (X(start) + X(stop)) / 2, y + 15, label, "ctalabel strong", "middle");
+  };
+  const d = 3;
+  isText(svg, 106, 98, "D's query tiles", "ctalabel", "end");
+  tile(starts[d], d, 82, "D");
+  tile(starts[d] + tileN, d, 82, null);
+  isText(svg, X((starts[d + 1] + starts[d] + 2 * tileN) / 2), 121, "rows not stored", "srclabel", "middle");
+  isText(svg, 106, 157, "D's key tiles", "ctalabel", "end");
+  tile(0, 0, 130, "A");
+  tile(tileN, 0, 130, "A");
+  tile(starts[1], 1, 158, "B");
+  tile(starts[d], d, 130, "D");
+  tile(starts[d] + tileN, d, 130, null);
+  isText(svg, X((starts[1] + 2 * tileN) / 2), 123, "masked", "srclabel", "middle");
+  isText(svg, X((starts[2] + starts[1] + tileN) / 2), 194, "masked", "srclabel", "middle");
+  isText(svg, X((starts[d + 1] + starts[d] + 2 * tileN) / 2), 172, "masked", "srclabel", "middle");
+  return svg;
+}
+
+function isFigLookup() {
+  const { svg, arrow } = isCanvas("lookup", 520, 222, "A device-built table maps each work tile to its sequence in one load; the warp scan needs one dependent round per 32 sequences");
+  const tiles = IS_BATCH.lengths.map((length) => Math.ceil(length / 128));
+  const table = tiles.flatMap((count, sequence) => Array(count).fill(sequence));
+  const x0 = 116;
+  const w = 40;
+  const pick = 7;
+  isText(svg, 16, 18, "SM100 kernels: one table load per tile", "tilename");
+  isText(svg, x0 - 8, 45, "work tile", "ctalabel", "end");
+  isText(svg, x0 - 8, 70, "table", "ctalabel", "end");
+  table.forEach((sequence, id) => {
+    isRect(svg, x0 + id * w, 30, w, 22, "is-empty");
+    isText(svg, x0 + id * w + w / 2, 45, String(id), "ctalabel", "middle");
+    isRect(svg, x0 + id * w, 52, w, 26, `is-s${sequence} is-sep`);
+    isText(svg, x0 + id * w + w / 2, 70, IS_BATCH.names[sequence], "ctalabel strong", "middle");
+  });
+  isRect(svg, x0 + pick * w, 30, w, 48, "is-focus", { rx: 3 });
+  const cx = x0 + pick * w + w / 2;
+  isPath(svg, `M${cx} 80 V95`, "is-arrow", arrow);
+  const sequence = table[pick];
+  isText(svg, 512, 110, `tile ${pick} → sequence ${IS_BATCH.names[sequence]} in one load`, "is-note", "end");
+  isText(svg, x0, 110, "written by a device kernel", "srclabel");
+
+  isText(svg, 16, 140, "Zig kernels: a warp scan in every CTA", "tilename");
+  const nodes = [
+    [16, 140, "is-kv", "load 32 lengths"],
+    [186, 120, "is-reg", "warp prefix sum"],
+    [336, 110, "is-red", "ballot, ctz"],
+  ];
+  nodes.forEach(([x, width, cls, label], index) => {
+    isRect(svg, x, 152, width, 26, cls, { rx: 4 });
+    isText(svg, x + width / 2, 169, label, "ctalabel", "middle");
+    if (index > 0) {
+      const [px, pw] = nodes[index - 1];
+      isPath(svg, `M${px + pw + 2} 165 H${x - 2}`, "is-arrow", arrow);
+    }
+  });
+  isPath(svg, "M448 165 H474", "is-arrow", arrow);
+  isText(svg, 478, 169, "found", "ctalabel");
+  isPath(svg, "M391 180 V198 H86 V182", "is-arrow", arrow);
+  isText(svg, 238, 214, "else the next 32 sequences: up to ⌈N / 32⌉ dependent rounds", "is-note", "middle");
+  return svg;
+}
+
+function isFigVisibleTiles() {
+  const { svg, arrow } = isCanvas("prefix", 520, 206, "The visibility matrix gives query sequence D a prefix row of visible key tiles, which D's query tiles walk from its own tiles down");
+  const names = IS_BATCH.names;
+  const count = names.length;
+  const cell = 22;
+  const mx = 34;
+  const my = 42;
+  const row = 3;
+  isText(svg, 16, 18, "Visibility", "tilename");
+  names.forEach((name, i) => {
+    isText(svg, mx + i * cell + cell / 2, my - 6, name, "dimlabel", "middle");
+    isText(svg, mx - 6, my + i * cell + cell / 2 + 4, name, "dimlabel", "end");
+    names.forEach((_, j) => {
+      const seen = IS_BATCH.visibility[i][j] === 1;
+      isRect(svg, mx + j * cell, my + i * cell, cell, cell, seen ? `is-s${j} is-sep` : "is-empty");
+    });
+  });
+  isRect(svg, mx - 2, my + row * cell - 2, count * cell + 4, cell + 4, "is-focus", { rx: 3 });
+  isText(svg, 16, my + count * cell + 20, "rows: query", "dimlabel");
+  isText(svg, 16, my + count * cell + 35, "columns: key", "dimlabel");
+  isPath(svg, `M${mx + count * cell + 4} ${my + row * cell + cell / 2} C 170 ${my + row * cell + cell / 2} 168 57 192 57`, "is-arrow", arrow);
+
+  const { sequences, offsets, tokenStarts } = isPrefixRow(row, 128);
+  const px = 196;
+  const pw = 52;
+  const right = px + count * pw + 12;
+  isText(svg, px, 18, `Prefix row of ${names[row]}`, "tilename");
+  offsets.forEach((value, p) => isText(svg, px + p * pw, 36, String(value), "dimlabel", "middle"));
+  isText(svg, right, 36, "prefix", "dimlabel");
+  sequences.forEach((sequence, p) => {
+    const tiles = offsets[p + 1] - offsets[p];
+    isRect(svg, px + p * pw, 42, pw, 30, tiles ? `is-s${sequence} is-sep` : "is-empty");
+    isText(svg, px + p * pw + pw / 2, 61, `${names[sequence]} · ${tiles}`, tiles ? "ctalabel strong" : "ctalabel is-dim", "middle");
+    if (tiles) {
+      const points = [
+        [px + p * pw, 72], [px + (p + 1) * pw, 72],
+        [px + offsets[p + 1] * pw, 112], [px + offsets[p] * pw, 112],
+      ].map((point) => point.join(",")).join(" ");
+      svg.append(svgEl("polygon", { points, class: `is-s${sequence} is-funnel` }));
+    }
+  });
+  isText(svg, right, 61, "tiles", "dimlabel");
+  const total = offsets[count];
+  const entries = [];
+  for (let ordinal = 0; ordinal < total; ordinal += 1) {
+    const p = offsets.findIndex((value, index) => index < count && ordinal >= value && ordinal < offsets[index + 1]);
+    const sequence = sequences[p];
+    isRect(svg, px + ordinal * pw, 112, pw, 28, `is-s${sequence} is-sep`);
+    isText(svg, px + ordinal * pw + pw / 2, 130, String(ordinal), "ctalabel strong", "middle");
+    isText(svg, px + ordinal * pw + pw / 2, 154, String(tokenStarts[p] + (ordinal - offsets[p]) * 128), "dimlabel", "middle");
+    entries.push(p);
+  }
+  isText(svg, right, 130, "ordinal", "dimlabel");
+  isText(svg, right, 154, "token", "dimlabel");
+  isPath(svg, `M${px + total * pw - 4} 174 H${px + 4}`, "is-arrow", arrow);
+  isText(svg, right, 178, "start", "is-note");
+  isText(svg, px - 6, 178, "walk", "is-note", "end");
+  for (let ordinal = total - 1; ordinal > 0; ordinal -= 1) {
+    if (entries[ordinal - 1] === entries[ordinal]) continue;
+    svg.append(svgEl("circle", { cx: px + ordinal * pw, cy: 174, r: 4.5, class: "is-dot" }));
+    isText(svg, px + ordinal * pw, 196, "search", "is-note", "middle");
+  }
+  return svg;
+}
+
+function isFigHeavyFirst() {
+  const { svg, hatch } = isCanvas("clc", 520, 262, "Under cluster launch control, ordering query tiles heaviest first starts E at once and shortens the tail");
+  const count = IS_BATCH.names.length;
+  const work = IS_BATCH.names.map((_, row) => isPrefixRow(row, 128).offsets[count]);
+  const tilesOf = (sequence) => Array.from({ length: Math.ceil(IS_BATCH.lengths[sequence] / 256) }, () => ({ sequence, work: work[sequence] }));
+  const packing = IS_BATCH.names.flatMap((_, sequence) => tilesOf(sequence));
+  const heavy = [...IS_BATCH.names.keys()].sort((a, b) => work[b] - work[a]).flatMap(tilesOf);
+  const sms = 4;
+  const unit = 38;
+  const x0 = 66;
+  const panel = (y0, title, tiles) => {
+    const { placed, free, end } = isSchedule(tiles, sms);
+    isText(svg, 16, y0 - 10, `${title}: ${tiles.map((tile) => IS_BATCH.names[tile.sequence]).join(" ")}`, "tilename");
+    for (let sm = 0; sm < sms; sm += 1) {
+      const y = y0 + sm * 22;
+      isText(svg, x0 - 8, y + 13, `SM ${sm}`, "dimlabel", "end");
+      isRect(svg, x0, y, end * unit, 18, "is-pad", { fill: hatch });
+    }
+    for (const tile of placed) {
+      const x = x0 + tile.start * unit + 1;
+      const width = tile.work * unit - 2;
+      const y = y0 + tile.sm * 22;
+      isRect(svg, x, y, width, 18, `is-s${tile.sequence}`, { rx: 2 });
+      const name = IS_BATCH.names[tile.sequence];
+      isText(svg, x + width / 2, y + 13, width >= 70 ? `${name} · ${tile.work} tiles` : name, "ctalabel strong", "middle");
+    }
+    const longest = free.map((stop, sm) => [end - stop, sm]).sort((a, b) => b[0] - a[0])[0];
+    if (longest[0] * unit >= 48) {
+      const x = x0 + (end - longest[0] / 2) * unit;
+      const y = y0 + longest[1] * 22;
+      isRect(svg, x - 16, y + 2, 32, 14, "is-chip", { rx: 3 });
+      isText(svg, x, y + 13, "idle", "dimlabel", "middle");
+    }
+    isPath(svg, `M${x0 + end * unit} ${y0 - 4} V${y0 + sms * 22}`, "is-endline");
+    return end;
+  };
+  const packEnd = panel(34, "Packing order", packing);
+  panel(150, "Heaviest first", heavy);
+  isPath(svg, `M${x0 + packEnd * unit} 146 V${150 + sms * 22}`, "is-guide");
+  isText(svg, x0 + packEnd * unit - 6, 143, "packing order ends", "srclabel", "end");
+  isText(svg, x0, 254, "Each bar is one query tile; its length is the key tiles it sees.", "srclabel");
+  return svg;
+}
+
+function isFigShortTiles() {
+  const { svg, hatch } = isCanvas("sm120", 520, 262, "64-row query tiles cut the padding of a 144-token group from 44% to 25%, and their 32 KiB footprint lets two CTAs share an SM");
+  const group = 144;
+  const R = (row) => 116 + row * 1.15;
+  isText(svg, 16, 18, `Query rows of a ${group}-token group`, "tilename");
+  const bar = (y, tileM, label) => {
+    const tiles = Math.ceil(group / tileM);
+    const total = tiles * tileM;
+    isText(svg, 108, y + 15, label, "ctalabel", "end");
+    isRect(svg, R(0), y, R(group) - R(0), 22, "is-s1");
+    isRect(svg, R(group), y, R(total) - R(group), 22, "is-pad", { fill: hatch });
+    for (let tile = 0; tile < tiles; tile += 1) isRect(svg, R(tile * tileM), y, R(tileM) - R(0), 22, "is-outline");
+    isText(svg, R(256) + 10, y + 15, `${Math.round(((total - group) / total) * 100)}% padding`, "ctalabel strong");
+  };
+  bar(30, 128, "128-row tiles");
+  bar(62, 64, "64-row tiles");
+  [0, group, 192, 256].forEach((row) => isText(svg, R(row), 100, String(row), "dimlabel", "middle"));
+
+  isText(svg, 16, 130, "64-row tile at head dim 128", "tilename");
+  for (let warp = 0; warp < 4; warp += 1) {
+    const y = 140 + warp * 18;
+    isRect(svg, 16, y, 208, 16, "is-reg");
+    isText(svg, 120, y + 12, `warp ${warp} · rows ${warp * 16}–${warp * 16 + 15}`, "ctalabel", "middle");
+  }
+  isText(svg, 16, 230, "Q, S and O of its rows", "srclabel");
+  isText(svg, 16, 244, "stay in each warp's registers", "srclabel");
+
+  isRect(svg, 244, 136, 268, 116, "ctabox", { rx: 8 });
+  isText(svg, 256, 154, "Shared memory of one SM", "srclabel");
+  [0, 1].forEach((cta) => {
+    const y = 164 + cta * 40;
+    isText(svg, 256, y + 19, `CTA ${cta}`, "ctalabel strong");
+    isRect(svg, 302, y, 88, 28, "is-kv", { rx: 3 });
+    isText(svg, 346, y + 18, "K · 16 KiB", "ctalabel", "middle");
+    isRect(svg, 396, y, 108, 28, "is-qv", { rx: 3 });
+    isText(svg, 450, y + 18, "Q → V · 16 KiB", "ctalabel", "middle");
+  });
+  return svg;
+}
+
+function isFigure(title, svg, caption) {
+  return el(
+    "figure",
+    { class: "isfig" },
+    el("h3", {}, title),
+    el("div", { class: "pipeframe" }, svg),
+    el("figcaption", { class: "figfoot" }, caption),
+  );
+}
+
+function renderInterseq(root) {
+  const legend = el(
+    "div",
+    { class: "legend" },
+    el("span", {}, "Example batch:"),
+    ...IS_BATCH.names.map((name, index) => el("span", {}, el("i", { class: `sw is-s${index}` }), `${name} · ${IS_BATCH.lengths[index]} tokens`)),
+    el("span", {}, el("i", { class: "sw is-pad" }), "padding, masked or idle"),
+  );
+  const gallery = el(
+    "div",
+    { class: "isgallery" },
+    isFigure(
+      "Packed GQA query tile",
+      isFigPackedGqa(),
+      "Row r of a packed tile holds token ⌊r / g⌋ (t) of query head r mod g (h), so with g = 4 query heads per KV head a 32-token sequence fills all 128 rows of one tile instead of 32 rows in each of four. One CTA then loads each K/V tile once for the whole group; the SM100 forward at head dim 64 and 128 and every paged kernel pack this way.",
+    ),
+    isFigure(
+      "Sequences on one token axis",
+      isFigTokenAxis(),
+      "The kernels view K and V with the token as the TMA or cp.async coordinate, so the tiles of a sequence (here 128 tokens) start at its first token and no sequence is padded. Where a tile runs into the next sequence, the kernel masks those key columns and does not store those query rows.",
+    ),
+    isFigure(
+      "Block-to-sequence lookup",
+      isFigLookup(),
+      "A small device kernel writes the sequence of every flat work tile (here 128-token tiles), so each warp of the SM100 kernels decodes its tile with one load. The Zig kernels instead find the sequence with a warp prefix sum of the tile counts of 32 sequences at a time, in up to ⌈N / 32⌉ dependent rounds, and the persistent Zig SM90 and SM100 forwards repeat that scan in every role for every tile.",
+    ),
+    isFigure(
+      "Visible-tile prefix table and cursor walk",
+      isFigVisibleTiles(),
+      "One warp per query sequence turns the visibility bitset into a prefix row: the visible key tiles of each other sequence, then its own last. A query tile walks the row's tiles as one dense ordinal axis from the top down, so its cursor starts on its own sequence and binary-searches the row only when the walk enters another sequence.",
+    ),
+    isFigure(
+      "Heaviest sequences first under cluster launch control",
+      isFigHeavyFirst(),
+      "Under cluster launch control each CTA that finishes takes the next unstarted tile, so the tile order decides the tail. The SM100 forward sorts query sequences by the key tiles they see, heaviest first, so E, which sees every sequence, starts at once instead of last (schematic: one head, 256-row query tiles, four SMs).",
+    ),
+    isFigure(
+      "Short tiles on SM120",
+      isFigShortTiles(),
+      "A 144-token group computes 256 query rows with 128-row tiles and 192 with 64-row tiles, where each of the 4 warps owns 16 rows, so S and O stay in registers without spilling. Q moves to registers and V reuses its shared-memory buffer, so a CTA needs 32 KiB at head dim 128 and two CTAs share an SM; with 64-token key tiles, these changes raised a GB10 layout of image groups and captions from 40.8 to 69.4 TF/s.",
+    ),
+  );
+  root.append(legend, gallery);
+}
+
+
+
+function init() {
+  document.getElementById("fwdChart").append(buildChartCard("fwd"));
+  document.getElementById("bwdChart").append(buildChartCard("bwd"));
+  renderRoles(document.getElementById("roles"));
+  renderPipelineSection(document.getElementById("pipelines"));
+  renderTiles(document.getElementById("tiles"));
+  renderExchange(document.getElementById("exchange"));
+  renderMatrix(document.getElementById("matrix"));
+  renderInterseq(document.getElementById("interseq"));
+}
+init();
+
+</script>
+</body>
+</html>

@@ -1,0 +1,2 @@
+include build.zig
+recursive-include zig *.zig
