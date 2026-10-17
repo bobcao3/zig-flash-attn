@@ -309,7 +309,7 @@ def test_strided_packed_gradient_buffer_receives_the_gradients():
     cuda_seed(13)
     q, k, v = (torch.randn(2, 64, 2, HEAD_DIM, device="cuda", dtype=torch.bfloat16) for _ in range(3))
     window = (-1, -1)
-    out, lse = flash_attn_forward(q, k, v, None, None, 64, SOFTMAX_SCALE, *window)
+    out, lse = flash_attn_forward(q, k, v, None, None, 64, 64, SOFTMAX_SCALE, *window)
     dout = torch.randn_like(q)
     padded = torch.zeros(2, 64, 3, 2, HEAD_DIM + 4, device="cuda", dtype=torch.bfloat16)[..., :HEAD_DIM]
     flash_attn_backward_packed(dout, q, k, v, out, lse, None, None, 64, 64, SOFTMAX_SCALE, *window, None, padded)
@@ -409,7 +409,7 @@ def test_fake_outputs_stay_symbolic_without_guards():
     v = symbolic_inputs(fake_mode, (4, 160, 2, 64), (0, 1))
     guards_before = len(shape_env.guards)
     with fake_mode:
-        out, lse = torch.ops.zigfa.flash_attn_forward(q, k, v, None, None, q.shape[1], SOFTMAX_SCALE, -1, 0)
+        out, lse = torch.ops.zigfa.flash_attn_forward(q, k, v, None, None, q.shape[1], k.shape[1], SOFTMAX_SCALE, -1, 0)
         dq, dk, dv = torch.ops.zigfa.flash_attn_backward(
             out, q, k, v, out, lse, None, None, q.shape[1], k.shape[1], SOFTMAX_SCALE, -1, 0
         )
@@ -431,7 +431,7 @@ def test_fake_varlen_outputs_stay_symbolic_without_guards():
     cu_q = fake_mode.from_tensor(torch.zeros(5, dtype=torch.int32, device="cuda"))
     guards_before = len(shape_env.guards)
     with fake_mode:
-        out, lse = torch.ops.zigfa.flash_attn_forward(q, k, v, cu_q, cu_q, 128, SOFTMAX_SCALE, -1, 0)
+        out, lse = torch.ops.zigfa.flash_attn_forward(q, k, v, cu_q, cu_q, 128, 128, SOFTMAX_SCALE, -1, 0)
     assert isinstance(out.shape[0], torch.SymInt) and isinstance(lse.shape[1], torch.SymInt)
     assert len(shape_env.guards) == guards_before
 
@@ -449,15 +449,15 @@ def op_arguments(variant, shape=(2, 64, 96)):
 @pytest.mark.parametrize("variant", ["batched", "varlen"])
 def test_forward_op_passes_opcheck(variant):
     cuda_seed(21)
-    q, k, v, cu_q, cu_k, max_q, _ = op_arguments(variant)
-    opcheck(flash_attn_forward, (q, k, v, cu_q, cu_k, max_q, SOFTMAX_SCALE, -1, 0), test_utils=OPCHECK_TESTS)
+    q, k, v, cu_q, cu_k, max_q, max_k = op_arguments(variant)
+    opcheck(flash_attn_forward, (q, k, v, cu_q, cu_k, max_q, max_k, SOFTMAX_SCALE, -1, 0), test_utils=OPCHECK_TESTS)
 
 
 @pytest.mark.parametrize("variant", ["batched", "varlen"])
 def test_backward_ops_pass_opcheck(variant):
     cuda_seed(23)
     q, k, v, cu_q, cu_k, max_q, max_k = op_arguments(variant)
-    out, lse = flash_attn_forward(q, k, v, cu_q, cu_k, max_q, SOFTMAX_SCALE, -1, 0)
+    out, lse = flash_attn_forward(q, k, v, cu_q, cu_k, max_q, max_k, SOFTMAX_SCALE, -1, 0)
     dout = torch.randn_like(out)
     arguments = (dout, q, k, v, out, lse, cu_q, cu_k, max_q, max_k, SOFTMAX_SCALE, -1, 0)
     opcheck(flash_attn_backward, arguments, test_utils=OPCHECK_TESTS)
@@ -524,7 +524,7 @@ def test_launch_selection_never_synchronizes_through_torch(name):
 def test_backward_packed_op_with_concatenated_heads_matches_reference():
     cuda_seed(27)
     q, k, v, _, _, max_q, max_k = op_arguments("batched", (2, 64, 64))
-    out, lse = flash_attn_forward(q, k, v, None, None, max_q, SOFTMAX_SCALE, -1, 0)
+    out, lse = flash_attn_forward(q, k, v, None, None, max_q, max_k, SOFTMAX_SCALE, -1, 0)
     dout = torch.randn_like(out)
     arguments = (dout, q, k, v, out, lse, None, None, max_q, max_k, SOFTMAX_SCALE, -1, 0)
     dqkv = torch.empty_like(torch.cat((q, k, v), dim=-2))

@@ -23,7 +23,24 @@ pub const Options = struct {
     clear_dq_accum: bool = true,
     pdl: bool = false,
     varlen_as_one_sequence: bool = false,
+    fragment_ordered_dq_accum: bool = false,
 };
+
+const dq_accum_row_chunks = config.head_dim / accumulator_elements;
+
+/// Returns the index of a 16-byte chunk of `dq_accum` in the fragment order, given the float
+/// offsets of a head and of a row within the head, and the chunk within the row. The fragment order
+/// stores each group of 8 rows of a head as blocks of 8 columns. A block holds 64 floats: 4 even
+/// columns of each of its 8 rows, then 4 odd columns of each row. A lane of a matrix multiply
+/// accumulator holds one value of each column parity in one row, so a warp that adds one
+/// accumulator value covers 32 consecutive floats.
+pub fn fragmentOrderedChunk(head_offset: u64, row_offset: u64, chunk: u64) u64 {
+    const linear = row_offset / accumulator_elements + chunk;
+    const row = linear / dq_accum_row_chunks;
+    const column = linear % dq_accum_row_chunks;
+    return head_offset / accumulator_elements + (row - row % 8) * dq_accum_row_chunks +
+        column / 2 * 16 + column % 2 * 8 + row % 8;
+}
 
 pub fn rowTile(
     comptime rows: u32,
@@ -70,6 +87,32 @@ pub fn rowSequence(
         SeqlenInfoQK.flatRows(cu_seqlens_q, num_batch, seqlen_q)
     else
         SeqlenInfoQK.resolve(cu_seqlens_q, cu_seqlens_q, seqlen_q, seqlen_q, batch);
+}
+
+/// Returns the row of a fragment ordered `dq_accum` that holds the row `row` of `sequence`, which is
+/// the sequence `batch` of the batch, or all sequences in a row with `varlen_as_one_sequence`. The
+/// rows of sequence `b` of a varlen batch start at its offset rounded down to a multiple of 8, plus
+/// `8 * b`, so that no group of 8 rows holds two sequences. The accumulator then needs 8 more rows
+/// per sequence.
+pub fn accumulatorRow(
+    comptime options: Options,
+    cu_seqlens_q: u64,
+    num_batch: u32,
+    sequence: SeqlenInfoQK,
+    batch: u32,
+    row: u32,
+) u32 {
+    const flat_row = sequence.offset_q + row;
+    if (cu_seqlens_q == 0) return flat_row;
+    if (!options.varlen_as_one_sequence) return flat_row - sequence.offset_q % 8 + 8 * batch;
+    const starts: [*]addrspace(.global) const u32 = @ptrFromInt(cu_seqlens_q);
+    var first: u32 = 0;
+    var last: u32 = num_batch;
+    while (last - first > 1) {
+        const middle = (first + last) / 2;
+        if (starts[middle] <= flat_row) first = middle else last = middle;
+    }
+    return flat_row - starts[first] % 8 + 8 * first;
 }
 
 pub fn FlashAttnBwdPreprocess(comptime options: Options) type {
@@ -162,14 +205,21 @@ pub fn FlashAttnBwdPreprocess(comptime options: Options) type {
                 }
                 if (options.clear_dq_accum) {
                     const zeros: [*]addrspace(.global) Chunk = @ptrFromInt(dq_accum);
-                    const accum_base = (batch * dq_accum_batch_stride +
-                        (sequence.offset_q + row) * dq_accum_row_stride +
-                        head * dq_accum_head_stride) / accumulator_elements;
+                    const row_offset = batch * dq_accum_batch_stride +
+                        (if (options.fragment_ordered_dq_accum)
+                            accumulatorRow(options, cu_seqlens_q, num_batch, sequence, batch, row)
+                        else
+                            sequence.offset_q + row) * dq_accum_row_stride;
+                    const head_offset = head * dq_accum_head_stride;
+                    const accum_base = (row_offset + head_offset) / accumulator_elements;
                     var zero_column: u32 = lane;
-                    while (zero_column < config.head_dim /
-                        accumulator_elements) : (zero_column += preprocess_lanes)
-                    {
-                        zeros[accum_base + zero_column] = @splat(0);
+                    while (zero_column < dq_accum_row_chunks) : (zero_column += preprocess_lanes) {
+                        zeros[
+                            if (options.fragment_ordered_dq_accum)
+                                fragmentOrderedChunk(head_offset, row_offset, zero_column)
+                            else
+                                accum_base + zero_column
+                        ] = @splat(0);
                     }
                 }
             }

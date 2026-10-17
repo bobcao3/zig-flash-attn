@@ -165,6 +165,7 @@ def flash_attn_forward(
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
     max_seqlen_q: int,
+    max_seqlen_k: int,
     softmax_scale: float,
     window_size_left: int,
     window_size_right: int,
@@ -173,7 +174,7 @@ def flash_attn_forward(
     bind_current_device(q)
     q, k, v = (clone_unless_kernel_ready(tensor) for tensor in (q, k, v))
     out, softmax_lse = allocate_forward_outputs(q, cu_seqlens_q is not None)
-    hints = dict(max_seqlen_q=max_seqlen_q)
+    hints = dict(max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k)
     workspace = tuple(
         torch.empty(shape, dtype=torch.int32, device=q.device)
         for shape in forward_workspace_shapes(
@@ -206,6 +207,7 @@ def flash_attn_forward_fake(
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
+    max_seqlen_k,
     softmax_scale,
     window_size_left,
     window_size_right,
@@ -380,7 +382,9 @@ def run_forward(
     window = (window_size_left, 0 if causal else window_size_right)
     if cu_seqlens_q is None:
         max_seqlen_q, max_seqlen_k = q.shape[1], k.shape[1]
-    out, softmax_lse = flash_attn_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, softmax_scale, *window)
+    out, softmax_lse = flash_attn_forward(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, *window
+    )
     ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
     ctx.max_seqlen_q = max_seqlen_q
     ctx.max_seqlen_k = max_seqlen_k

@@ -39,10 +39,18 @@ pub fn SharedStorage(
     const warps = tiling.warps();
     const query_in_stage = tiling.shareQvSmem();
     const Rows = smem.Layout(row_chunks);
+    const query_chunks = tiling.queryChunks();
+    const QueryRows = smem.Layout(query_chunks);
     const PackGqaRows = if (specialization.pack_gqa) m_block_work.PackGqa else void;
+    // With head dimension 256, one CTA of four warps fills the shared memory of an SM, so each SM
+    // sub-partition runs a single warp, and no other warp hides address arithmetic or branches.
+    const single_warp = tiling.head_dim == 256;
 
     return struct {
         pub const Layout = Rows;
+        pub const one_warp_per_scheduler = single_warp;
+        pub const prologue_parts = if (single_warp) 2 else 1;
+        pub const QueryLayout = QueryRows;
         pub const shared_bytes = tiling.sharedBytes();
         pub const Args = struct {};
 
@@ -52,23 +60,169 @@ pub fn SharedStorage(
         };
         const Tiles = struct {
             stages: [stages]Stage,
-            q: if (query_in_stage) void else Rows.Tile(block_m),
+            q: if (query_in_stage) void else QueryRows.Tile(block_m),
         };
 
         comptime {
             std.debug.assert(@sizeOf(Tiles) == shared_bytes);
+            if (tiling.separate_v_empty != (stages == 1)) @compileError(
+                "one stage loads keys and values separately, and more stages load whole tiles",
+            );
+            if (stages > 1 and (tiling.prefetch_stages == 0 or tiling.prefetch_stages >= stages))
+                @compileError("a refill must not wait for the release of its own stage");
         }
 
         extern var shared_storage: [0]u8 align(smem.alignment) addrspace(.shared);
         const tiles: *addrspace(.shared) Tiles = @ptrCast(&shared_storage);
+        // With several stages, each warp waits only for the tiles that it reads, and a refill
+        // waits until every warp has released the stage.
         var k_full: [stages]nvptx.Mbarrier addrspace(.shared) = undefined;
         var v_full: [stages]nvptx.Mbarrier addrspace(.shared) = undefined;
         var empty: [stages]nvptx.Mbarrier addrspace(.shared) = undefined;
-        var v_empty: [if (tiling.separate_v_empty) stages else 0]nvptx.Mbarrier addrspace(.shared) =
-            undefined;
 
-        pub fn queryTile() *addrspace(.shared) Rows.Tile(block_m) {
+        /// Locates the chunks that one thread copies from the rows of a matrix in global memory.
+        /// Each group of `swizzle_columns` threads copies whole rows. The swizzle repeats every 8
+        /// rows, so the shared memory offsets of a thread differ from pass to pass by constants.
+        const RowCopy = struct {
+            first: u64,
+            row_bytes: u64,
+            rows_left: i32,
+
+            const group = Rows.swizzle_columns;
+            const pass_rows = threads / group;
+
+            /// Returns whether a `RowCopy` can copy tiles of `count` rows.
+            fn fits(count: u32) bool {
+                if (group == 1 or threads % group != 0 or row_chunks % group != 0) return false;
+                return pass_rows % 8 == 0 and count % pass_rows == 0;
+            }
+
+            fn init(source: [*]addrspace(.global) const Chunk, stride: u64, limit: u32) RowCopy {
+                const thread_row = thread.id() / group;
+                const first = source + thread_row * stride + thread.id() % group;
+                return .{
+                    .first = @intFromPtr(first),
+                    .row_bytes = stride * @sizeOf(Chunk),
+                    .rows_left = @as(i32, @intCast(limit)) - @as(i32, @intCast(thread_row)),
+                };
+            }
+
+            fn copy(
+                rows: RowCopy,
+                comptime count: u32,
+                destination: *addrspace(.shared) Rows.Tile(count),
+                first_row: u32,
+            ) void {
+                rows.copyColumns(count, destination, first_row, 0, row_chunks);
+            }
+
+            /// Copies the columns from `first_column` up to `end_column` of `count` rows from
+            /// `first_row` on and fills the rows at or past the limit with zeros. The copy reads
+            /// no bytes of those rows (PTX ISA section 9.7.10.28.3.1, `src-size`).
+            fn copyColumns(
+                rows: RowCopy,
+                comptime count: u32,
+                destination: *addrspace(.shared) Rows.Tile(count),
+                first_row: u32,
+                comptime first_column: u32,
+                comptime end_column: u32,
+            ) void {
+                comptime std.debug.assert(fits(count));
+                const thread_slot = Rows.slot(thread.id() / group, thread.id() % group);
+                const rows_left = rows.rows_left - @as(i32, @intCast(first_row));
+                const pass_bytes = pass_rows * rows.row_bytes;
+                var address = rows.first + first_row * rows.row_bytes;
+                inline for (0..count / pass_rows) |pass| {
+                    const chunk: [*]addrspace(.global) const Chunk = @ptrFromInt(address);
+                    const pass_row: u32 = pass * pass_rows;
+                    const valid = pass_row < rows_left;
+                    inline for (first_column / group..end_column / group) |column_group| {
+                        const column: u32 = column_group * group;
+                        const slot = thread_slot + comptime Rows.slot(pass_row, column);
+                        cp_async.copyZeroFill(
+                            .cache_global_level,
+                            &destination[slot],
+                            &chunk[column],
+                            if (valid) @sizeOf(Chunk) else 0,
+                        );
+                    }
+                    address += pass_bytes;
+                }
+            }
+        };
+        const copies_rows = RowCopy.fits(block_n);
+        const TileRows = if (copies_rows) RowCopy else void;
+
+        pub fn queryTile() *addrspace(.shared) QueryRows.Tile(block_m) {
             return if (query_in_stage) @ptrCast(&tiles.stages[stages - 1]) else &tiles.q;
+        }
+
+        /// Returns the tile that stages the output after the last tile of keys and values. A query
+        /// tile that holds only some columns leaves the output to the shared memory of the stages.
+        pub fn outputStaging() *addrspace(.shared) Rows.Tile(block_m) {
+            if (query_chunks == row_chunks) return @ptrCast(queryTile());
+            comptime std.debug.assert(@sizeOf(Rows.Tile(block_m)) <= @sizeOf([stages]Stage));
+            return @ptrCast(&tiles.stages);
+        }
+
+        /// Stages the output rows of each warp in the query tile, which no warp reads after the
+        /// last key multiplication, and stores one whole row per warp instruction.
+        pub fn storeRows(
+            params: ForwardParams,
+            tile: anytype,
+            finalized: anytype,
+            output: anytype,
+        ) void {
+            comptime std.debug.assert(!specialization.pack_gqa and warps * 16 == block_m);
+            const warp_row = thread.warp() * 16;
+            const lane = thread.lane();
+            const bytes: [*]addrspace(.shared) u8 = @ptrCast(queryTile());
+            const own = Rows.slot(warp_row + lane / 4, 0) * @sizeOf(Chunk) + lane % 4 * 4;
+            inline for (output, 0..) |fragment, n_tile| {
+                inline for (.{ 0, 1 }) |half| {
+                    const key = n_tile % Rows.swizzle_columns;
+                    const offset = comptime Rows.slot(half * 8, n_tile - key) * @sizeOf(Chunk);
+                    const word: *addrspace(.shared) u32 =
+                        @ptrCast(@alignCast(bytes + ((own ^ (key * @sizeOf(Chunk))) + offset)));
+                    word.* = @backingInt(nvptx.Bf16x2.fromF32(
+                        fragment[half * 2] * finalized.row_scale[half],
+                        fragment[half * 2 + 1] * finalized.row_scale[half],
+                    ));
+                }
+            }
+            nvptx.barWarpSync(.all);
+            const sequence = tile.sequence;
+            const element_bytes = Sm80FwdTiling.element_bytes;
+            const origin = tile.batch * params.o_batch_stride +
+                @as(u64, sequence.offset_q) * params.o_row_stride +
+                tile.head * params.o_head_stride;
+            const row_bytes: u32 = @truncate(params.o_row_stride * element_bytes);
+            const first_row = tile.first_row + warp_row;
+            const rows_left =
+                @as(i32, @bitCast(sequence.seqlen_q)) - @as(i32, @bitCast(first_row));
+            const first = params.o + (origin + first_row * params.o_row_stride) * element_bytes +
+                lane * @sizeOf(Chunk);
+            const staged = Rows.slot(warp_row, lane) * @sizeOf(Chunk);
+            inline for (0..16) |row| {
+                if (rows_left > row) {
+                    const key = row % Rows.swizzle_columns;
+                    const offset = @sizeOf(Rows.Tile(row));
+                    const source: *addrspace(.shared) const Chunk =
+                        @ptrCast(@alignCast(bytes + ((staged ^ (key * @sizeOf(Chunk))) + offset)));
+                    const destination: *addrspace(.global) Chunk =
+                        @ptrFromInt(first + @as(u64, row_bytes) * row);
+                    destination.* = source.*;
+                }
+            }
+            if (elect.groupLeader(4)) {
+                fragments.storeLse(
+                    params,
+                    tile,
+                    first_row + lane / 4,
+                    sequence.seqlen_q,
+                    finalized.lse,
+                );
+            }
         }
 
         pub fn kTile(stage: u32) *addrspace(.shared) Rows.Tile(block_n) {
@@ -93,6 +247,8 @@ pub fn SharedStorage(
             seqlen_k: u32,
             q_head_stride: if (specialization.pack_gqa) u64 else void,
             pack_gqa: PackGqaRows,
+            key_rows: TileRows,
+            value_rows: TileRows,
 
             pub fn init(params: ForwardParams, _: Args, work: anytype) Load {
                 const tile = work.tile;
@@ -124,6 +280,16 @@ pub fn SharedStorage(
                     .q_head_stride = if (specialization.pack_gqa) params.q_head_stride /
                         chunk_elements else {},
                     .pack_gqa = tile.pack_gqa,
+                    .key_rows = if (TileRows == void) {} else .init(
+                        k + k_origin / chunk_elements,
+                        params.k_row_stride / chunk_elements,
+                        sequence.seqlen_k,
+                    ),
+                    .value_rows = if (TileRows == void) {} else .init(
+                        v + v_origin / chunk_elements,
+                        params.v_row_stride / chunk_elements,
+                        sequence.seqlen_k,
+                    ),
                 };
             }
 
@@ -136,12 +302,28 @@ pub fn SharedStorage(
                 limit: u32,
                 packing: anytype,
             ) void {
-                const chunks = count * row_chunks;
+                const rows = .{ count, destination, source, stride, first_row, limit, packing };
+                @call(.auto, copyColumns, .{ Rows, row_chunks } ++ rows);
+            }
+
+            /// Copies `columns` chunks of each row, starting at the column of `source`.
+            fn copyColumns(
+                comptime TileLayout: type,
+                comptime columns: u32,
+                comptime count: u32,
+                destination: *addrspace(.shared) TileLayout.Tile(count),
+                source: [*]addrspace(.global) const Chunk,
+                stride: u64,
+                first_row: u32,
+                limit: u32,
+                packing: anytype,
+            ) void {
+                const chunks = count * columns;
                 inline for (0..(chunks + threads - 1) / threads) |pass| {
                     const linear: u32 = @as(u32, pass) * threads + thread.id();
                     if ((pass + 1) * threads <= chunks or linear < chunks) {
-                        const row = linear / row_chunks;
-                        const column = linear % row_chunks;
+                        const row = linear / columns;
+                        const column = linear % columns;
                         const source_row = @min(first_row + row, limit - 1);
                         const offset = if (@TypeOf(packing) == void)
                             source_row * stride
@@ -149,7 +331,7 @@ pub fn SharedStorage(
                             packing.pack_gqa.rowOffset(source_row, stride, packing.head_stride);
                         cp_async.copy(
                             .cache_global_level,
-                            &destination[Rows.slot(row, column)],
+                            &destination[TileLayout.slot(row, column)],
                             &source[offset + column],
                         );
                     }
@@ -157,6 +339,9 @@ pub fn SharedStorage(
             }
 
             fn copyKeys(load: *const Load, n_block: u32, stage: u32) void {
+                if (copies_rows) {
+                    return load.key_rows.copy(block_n, kTile(stage), n_block * block_n);
+                }
                 copyRows(
                     block_n,
                     kTile(stage),
@@ -169,6 +354,9 @@ pub fn SharedStorage(
             }
 
             fn copyValues(load: *const Load, n_block: u32, stage: u32) void {
+                if (copies_rows) {
+                    return load.value_rows.copy(block_n, vTile(stage), n_block * block_n);
+                }
                 copyRows(
                     block_n,
                     vTile(stage),
@@ -187,36 +375,65 @@ pub fn SharedStorage(
                 mbarrier.arrive(.cp_async, &v_full[stage]);
             }
 
+            /// Returns the first key of tile `index`. Past the last tile, it returns the end of
+            /// the sequence, from which a copy fills every row with zeros.
+            fn firstKey(load: *const Load, index: u32) u32 {
+                return if (index < load.tile_count)
+                    (load.first_tile + index) * block_n
+                else
+                    load.seqlen_k;
+            }
+
+            /// Waits until no copy group of this thread is in flight, then waits at a barrier. The
+            /// barrier makes the copies of all threads visible and shows that every warp has
+            /// finished reading the tile before.
+            fn synchronize() void {
+                cp_async.waitGroup(0);
+                if (single_warp) {
+                    convergedBarrier();
+                } else nvptx.barrierSyncAligned(.work_group, null);
+            }
+
+            /// Omits the `bar.warp.sync` of `nvptx.barrierSyncAligned`, after which ptxas emits a
+            /// convergence check that ends the basic block. The warps arrive converged.
+            fn convergedBarrier() void {
+                asm volatile ("barrier.sync.aligned 0;" ::: .{ .memory = true });
+            }
+
             pub fn start(load: *const Load) void {
-                if (thread.warp() == 0 and elect.oneSync()) {
+                if (single_warp) return load.startInParts();
+                if (stages > 1 and thread.warp() == 0 and elect.oneSync()) {
                     inline for (&k_full, &v_full, &empty) |*k_stage, *v_stage, *empty_stage| {
                         k_stage.init(threads);
                         v_stage.init(threads);
                         empty_stage.init(warps);
                     }
-                    inline for (&v_empty) |*v_empty_stage| v_empty_stage.init(warps);
                     mbarrier.pipelineInitFence();
                 }
-                elect.reconverge();
+                if (stages > 1) elect.reconverge();
                 if (specialization.pack_gqa) {
                     const packing = .{
                         .pack_gqa = load.pack_gqa,
                         .head_stride = load.q_head_stride,
                     };
-                    copyRows(
+                    copyColumns(
+                        QueryRows,
+                        query_chunks,
                         block_m,
                         queryTile(),
-                        load.q,
+                        load.q + (row_chunks - query_chunks),
                         load.q_stride,
                         load.first_row,
                         load.pack_gqa.end_row,
                         packing,
                     );
                 } else {
-                    copyRows(
+                    copyColumns(
+                        QueryRows,
+                        query_chunks,
                         block_m,
                         queryTile(),
-                        load.q,
+                        load.q + (row_chunks - query_chunks),
                         load.q_stride,
                         load.first_row,
                         load.seqlen_q,
@@ -224,7 +441,12 @@ pub fn SharedStorage(
                     );
                 }
                 cp_async.commitGroup();
-                comptime std.debug.assert(tiling.prefetch_stages >= 1);
+                if (stages == 1) {
+                    if (0 < load.tile_count) load.copyKeys(load.first_tile, 0);
+                    cp_async.commitGroup();
+                    synchronize();
+                    return;
+                }
                 if (0 < load.tile_count) load.copyKeys(load.first_tile, 0);
                 mbarrier.pipelineInitWait(.cta, threads, .other);
                 if (0 < load.tile_count) {
@@ -236,17 +458,48 @@ pub fn SharedStorage(
                     const first: u32 = prefetched;
                     if (first < load.tile_count) load.copyTile(load.first_tile + first, first);
                 }
-                cp_async.waitGroup(0);
-                nvptx.barrierSyncAligned(.work_group, null);
+                synchronize();
+            }
+
+            /// Copies the query and the first keys in column parts, one copy group per part.
+            fn startInParts(load: *const Load) void {
+                const query_rows: RowCopy = .init(load.q, load.q_stride, load.seqlen_q);
+                const first_key = load.firstKey(0);
+                inline for (0..prologue_parts) |part| {
+                    const first = part * row_chunks / prologue_parts;
+                    const end = (part + 1) * row_chunks / prologue_parts;
+                    query_rows.copyColumns(block_m, queryTile(), load.first_row, first, end);
+                    load.key_rows.copyColumns(block_n, kTile(0), first_key, first, end);
+                    cp_async.commitGroup();
+                }
+            }
+
+            /// Waits for column part `part`, and after the last part copies the first values.
+            pub fn awaitPart(load: *const Load, comptime part: u32) void {
+                cp_async.waitGroup(prologue_parts - 1 - part);
+                convergedBarrier();
+                if (part + 1 < prologue_parts) return;
+                load.value_rows.copy(block_n, vTile(0), load.firstKey(0));
+                cp_async.commitGroup();
+            }
+
+            pub fn drain(_: *const Load) void {
+                synchronize();
             }
 
             pub fn queryConsumed(_: *const Load) void {
-                nvptx.barrierSyncAligned(.work_group, null);
+                if (!single_warp) nvptx.barrierSyncAligned(.work_group, null);
             }
 
             pub fn acquireK(load: *const Load, index: u32) u32 {
+                if (single_warp) return 0;
+                if (stages == 1) {
+                    load.copyValues(load.first_tile + index, 0);
+                    cp_async.commitGroup();
+                    return 0;
+                }
                 const refill = index + tiling.prefetch_stages;
-                if (!tiling.separate_v_empty and refill < load.tile_count) {
+                if (refill < load.tile_count) {
                     const refill_stage = refill % stages;
                     if (refill >= stages) mbarrier.wait(
                         .cta,
@@ -261,6 +514,7 @@ pub fn SharedStorage(
             }
 
             pub fn acquireV(_: *const Load, index: u32) void {
+                if (stages == 1) return;
                 const state: mbarrier.PipelineState(stages) = .{ .count = index };
                 state.consumerWait(&v_full);
             }
@@ -270,29 +524,27 @@ pub fn SharedStorage(
                 state.consumerRelease(.warp, &empty);
             }
 
-            fn copyReleased(
-                load: *const Load,
-                index: u32,
-                released: *addrspace(.shared) [stages]nvptx.Mbarrier,
-                full: *addrspace(.shared) [stages]nvptx.Mbarrier,
-                copy: fn (*const Load, u32, u32) void,
-            ) void {
-                const state: mbarrier.PipelineState(stages) = .{ .count = index };
-                state.consumerRelease(.warp, released);
-                const next = index + stages;
-                if (next < load.tile_count) {
-                    mbarrier.wait(.cta, &released[state.index()], state.phase());
-                    copy(load, load.first_tile + next, state.index());
-                    mbarrier.arrive(.cp_async, &full[state.index()]);
-                }
-            }
-
+            /// With one stage, the values of a tile load while the warps multiply its keys, and
+            /// the keys of the next tile load while the warps multiply the values.
             pub fn releaseKeys(load: *const Load, index: u32) void {
-                load.copyReleased(index, &empty, &k_full, copyKeys);
+                synchronize();
+                if (single_warp) {
+                    load.key_rows.copy(block_n, kTile(0), load.firstKey(index + 1));
+                } else if (index + 1 < load.tile_count) {
+                    load.copyKeys(load.first_tile + index + 1, 0);
+                }
+                cp_async.commitGroup();
             }
 
+            /// With one warp per scheduler, the values of the next tile load here instead of in
+            /// `acquireK`, and past the last tile the copy writes zeros, so the loop holds no
+            /// branch for the copy.
             pub fn releaseValues(load: *const Load, index: u32) void {
-                load.copyReleased(index, &v_empty, &v_full, copyValues);
+                synchronize();
+                if (single_warp) {
+                    load.value_rows.copy(block_n, vTile(0), load.firstKey(index + 1));
+                    cp_async.commitGroup();
+                }
             }
         };
     };
@@ -312,6 +564,14 @@ pub fn FlashAttnFwdSm80(
     const mma_m_per_warp = tiling.mma_m_per_warp;
     const warp_rows = 16 * mma_m_per_warp;
     const Layout = Storage.Layout;
+    const PairAddresses =
+        if (@hasDecl(Layout, "PairAddresses")) Layout.PairAddresses else Layout.Addresses;
+    const QueryLayout = if (@hasDecl(Storage, "QueryLayout")) Storage.QueryLayout else Layout;
+    const QueryPairs = if (@hasDecl(QueryLayout, "PairAddresses"))
+        QueryLayout.PairAddresses
+    else
+        QueryLayout.Addresses;
+    const register_steps = if (!tiling.q_in_regs) 0 else tiling.q_register_steps orelse k_steps;
     const Tile =
         m_block_work.MBlockWork(block_m, block_n, .{ .pack_gqa = specialization.pack_gqa });
     const scheduler_options: tile_scheduler.Options = .{
@@ -327,6 +587,8 @@ pub fn FlashAttnFwdSm80(
     const PersistentScheduler =
         tile_scheduler.PersistentScheduler(tiling.scheduling_mode, .{ .axis = .x, .ctas = 1 });
     const Online = fragments.Softmax(block_n);
+    const single_warp =
+        @hasDecl(Storage, "one_warp_per_scheduler") and Storage.one_warp_per_scheduler;
 
     return struct {
         pub const thread_count = threads;
@@ -373,20 +635,43 @@ pub fn FlashAttnFwdSm80(
         };
 
         pub const Query = if (tiling.q_in_regs) [mma_m_per_warp]struct {
-            wide: [k_steps]@Vector(4, u32),
+            wide: [register_steps]@Vector(4, u32),
             narrow: if (narrow_step) @Vector(2, u32) else void,
         } else void;
         pub const Scores = [mma_m_per_warp]Online.Scores;
 
-        fn queryAddresses() Layout.Addresses(block_m) {
+        fn queryAddresses() QueryPairs(block_m) {
             const lane = thread.lane();
             return .init(thread.warp() * warp_rows + lane % 16, lane / 16);
         }
 
-        pub fn loadQuery() Query {
+        pub fn loadQuery(load: *const Storage.Load) Query {
             if (!tiling.q_in_regs) return;
-            const query_addresses = queryAddresses();
             var query: Query = undefined;
+            if (tiling.q_register_steps != null) {
+                comptime std.debug.assert(!narrow_step);
+                const lane = thread.lane();
+                const words: [*]addrspace(.global) const u32 = @ptrCast(load.q);
+                const row_words = load.q_stride * (@sizeOf(Chunk) / @sizeOf(u32));
+                inline for (&query, 0..) |*rows, row_tile| {
+                    const row = load.first_row + thread.warp() * warp_rows +
+                        @as(u32, row_tile) * 16 + lane / 4;
+                    inline for (&rows.wide, 0..) |*fragment, k_step| {
+                        var registers: [4]u32 = undefined;
+                        inline for (&registers, 0..) |*register, index| {
+                            const query_row = row + index % 2 * 8;
+                            const column = k_step * 8 + lane % 4 + index / 2 * 4;
+                            register.* = if (query_row < load.seqlen_q)
+                                words[query_row * row_words + column]
+                            else
+                                0;
+                        }
+                        fragment.* = registers;
+                    }
+                }
+                return query;
+            }
+            const query_addresses = queryAddresses();
             inline for (&query, 0..) |*rows, row_tile| {
                 inline for (&rows.wide, 0..) |*fragment, k_step| {
                     fragment.* = nvptx.ldmatrix(.x4, false, query_addresses.chunk(
@@ -404,23 +689,40 @@ pub fn FlashAttnFwdSm80(
             return query;
         }
 
-        pub fn qkScores(query: Query, stage: u32, visible: Span) Scores {
+        /// Calls `prologue.awaitPart` before the first step of each column part.
+        pub fn qkScores(
+            query: Query,
+            stage: u32,
+            visible: Span,
+            lanes: anytype,
+            prologue: anytype,
+        ) Scores {
             @setEvalBranchQuota(100_000);
             const lane = thread.lane();
-            const query_addresses = queryAddresses();
-            const keys = Layout.Addresses(block_n).init(lane % 8 + lane / 16 * 8, lane / 8 % 2);
+            const query_addresses = if (@TypeOf(lanes) == void) queryAddresses() else lanes.query;
+            const keys = if (@TypeOf(lanes) == void)
+                PairAddresses(block_n).init(lane % 8 + lane / 16 * 8, lane / 8 % 2)
+            else
+                lanes.keys;
             const tile = Storage.kTile(stage);
             var result: Scores = @splat(@splat(@splat(0)));
             inline for (0..k_steps) |k_step_index| {
                 const k_step: u32 = k_step_index;
+                if (@TypeOf(prologue) != @TypeOf(null)) {
+                    const part_steps = k_steps / Storage.prologue_parts;
+                    const part = k_step_index / part_steps;
+                    if (k_step_index % part_steps == 0) prologue.awaitPart(part);
+                }
                 var a: [mma_m_per_warp]@Vector(4, u32) = undefined;
                 inline for (&a, 0..) |*fragment, row_tile| {
-                    fragment.* = if (tiling.q_in_regs) query[row_tile]
-                        .wide[k_step] else nvptx.ldmatrix(
-                        .x4,
-                        false,
-                        query_addresses.chunk(Storage.queryTile(), row_tile * 16, k_step * 2),
-                    );
+                    fragment.* = if (k_step_index < register_steps)
+                        query[row_tile].wide[k_step_index]
+                    else
+                        nvptx.ldmatrix(.x4, false, query_addresses.chunk(
+                            Storage.queryTile(),
+                            row_tile * 16,
+                            (k_step_index - register_steps) * 2,
+                        ));
                 }
                 inline for (0..block_n / 16) |j| {
                     if (j >= visible.first and j < visible.end) {
@@ -506,12 +808,21 @@ pub fn FlashAttnFwdSm80(
 
         pub const Output = [mma_m_per_warp][row_chunks]Accumulator;
 
-        pub fn accumulateOutput(output: *Output, step: Step, stage: u32, visible: Span) void {
+        pub fn accumulateOutput(
+            output: *Output,
+            step: Step,
+            stage: u32,
+            visible: Span,
+            lanes: anytype,
+        ) void {
             @setEvalBranchQuota(100_000);
             const lane = thread.lane();
-            const pairs = Layout.Addresses(block_n).init(lane % 8 + lane / 8 % 2 * 8, lane / 16);
+            const pairs = if (@TypeOf(lanes) == void)
+                PairAddresses(block_n).init(lane % 8 + lane / 8 % 2 * 8, lane / 16)
+            else
+                lanes.values;
             inline for (output, step) |*rows, rows_step| {
-                if (rows_step.should_rescale) {
+                if (!single_warp and rows_step.should_rescale) {
                     inline for (rows) |*fragment| fragment.* *= rows_step.row_scale;
                 }
             }
@@ -524,6 +835,10 @@ pub fn FlashAttnFwdSm80(
                         const low: @Vector(2, u32) = .{ b[0], b[1] };
                         const high: @Vector(2, u32) = .{ b[2], b[3] };
                         inline for (output, step) |*rows, rows_step| {
+                            if (single_warp and k_step == 0) {
+                                rows[2 * j] *= rows_step.row_scale;
+                                rows[2 * j + 1] *= rows_step.row_scale;
+                            }
                             const a = rows_step.probabilities[k_step];
                             rows[2 * j] =
                                 nvptx.mmaSync(fragments.mma_m16n8k16, a, low, rows[2 * j]);
@@ -565,7 +880,11 @@ pub fn FlashAttnFwdSm80(
             const warp = thread.warp();
             const lane = thread.lane();
             const lane_word = lane % 4;
-            const staging = Storage.queryTile();
+            const staging = if (@hasDecl(Storage, "outputStaging"))
+                Storage.outputStaging()
+            else
+                Storage.queryTile();
+            if (single_warp) return Storage.storeRows(params, tile, finalized[0], output[0]);
             nvptx.barrierSyncAligned(.work_group, null);
             inline for (output, finalized, 0..) |rows, rows_finalized, row_tile| {
                 inline for (rows, 0..) |fragment, n_tile| {
@@ -647,31 +966,75 @@ pub fn FlashAttnFwdSm80(
             var work = Work.init(params) orelse return;
             var load = Load.init(params, args, &work);
             load.start();
-            const query = loadQuery();
+            const query = loadQuery(&load);
             load.queryConsumed();
             var softmax: Running = undefined;
             inline for (&softmax) |*rows| rows.* = Online.init();
             var output: Output = @splat(@splat(@splat(0)));
+            // The kernels with swizzled rows keep the shared memory offsets of the lane in
+            // registers. ptxas otherwise reads the lane index again inside the loop.
+            const lanes = if (Layout.swizzle_columns == 1) {} else lanes: {
+                const lane = thread.lane();
+                break :lanes .{
+                    .query = queryAddresses(),
+                    .keys = PairAddresses(block_n).init(lane % 8 + lane / 16 * 8, lane / 8 % 2),
+                    .values = PairAddresses(block_n).init(lane % 8 + lane / 8 % 2 * 8, lane / 16),
+                };
+            };
             const tile_count = work.tile.n_block_max - work.tile.n_block_min;
             var index: u32 = 0;
-            while (index < tile_count) : (index += 1) {
+            if (single_warp) {
+                // The first tile waits for the prologue parts. Then masked tiles before the
+                // unmasked ones, the unmasked tiles, and masked tiles after them run in loops.
+                const first_block = work.tile.n_block_min;
+                const last_block = work.tile.n_block_max;
+                const unmasked = work.tile.unmaskedBlocks();
+                const middle = std.math.clamp(unmasked[0], first_block, last_block);
+                const middle_end = std.math.clamp(unmasked[1], middle, last_block);
+                const ends = .{
+                    @min(1, tile_count),
+                    middle - first_block,
+                    middle_end - first_block,
+                    tile_count,
+                };
+                const phases: [4]?bool = .{ null, true, false, true };
+                inline for (phases, ends) |phase_masked, end| {
+                    while (index < end) : (index += 1) {
+                        const n_block = first_block + index;
+                        const masked = phase_masked orelse work.tile.needsMask(n_block);
+                        const prologue = if (phase_masked == null) &load else null;
+                        var scores = qkScores(query, 0, Work.all_groups, lanes, prologue);
+                        load.releaseKeys(index);
+                        if (masked) maskScores(&scores, n_block, &work);
+                        const step = softmaxStep(&softmax, scores, params.softmax_scale_log2);
+                        accumulateOutput(&output, step, 0, Work.all_groups, lanes);
+                        load.releaseValues(index);
+                    }
+                }
+                if (tile_count == 0) load.drain();
+            } else while (index < tile_count) : (index += 1) {
                 const n_block = work.tile.n_block_min + index;
                 const slot = load.acquireK(index);
                 if (work.tile.needsMask(n_block)) {
-                    const visible = work.visibleGroups(n_block);
-                    var scores = qkScores(query, slot, visible);
+                    // With square tiles of `cp.async` copies, the warps multiply every key group
+                    // of a masked tile, and the mask clears the groups that a warp cannot see.
+                    const visible = if (tiling.tma or block_m != block_n)
+                        work.visibleGroups(n_block)
+                    else
+                        Work.all_groups;
+                    var scores = qkScores(query, slot, visible, lanes, null);
                     if (separate_v_empty) load.releaseKeys(index);
                     maskScores(&scores, n_block, &work);
                     const step = softmaxStep(&softmax, scores, params.softmax_scale_log2);
                     load.acquireV(index);
-                    accumulateOutput(&output, step, slot, visible);
+                    accumulateOutput(&output, step, slot, visible, lanes);
                 } else {
                     const visible = Work.all_groups;
-                    const scores = qkScores(query, slot, visible);
+                    const scores = qkScores(query, slot, visible, lanes, null);
                     if (separate_v_empty) load.releaseKeys(index);
                     const step = softmaxStep(&softmax, scores, params.softmax_scale_log2);
                     load.acquireV(index);
-                    accumulateOutput(&output, step, slot, visible);
+                    accumulateOutput(&output, step, slot, visible, lanes);
                 }
                 if (separate_v_empty) load.releaseValues(index) else load.release(index);
             }

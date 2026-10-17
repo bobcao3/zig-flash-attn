@@ -18,6 +18,7 @@ const Backward = sm80.FlashAttnBwdSm80(backward_tiling, variant.specialization, 
 const auxiliary: flash_bwd_preprocess.Options = .{
     .pdl = Backward.pdl,
     .varlen_as_one_sequence = variant.specialization.scheduler_metadata,
+    .fragment_ordered_dq_accum = sm80.fragment_ordered_dq_accum,
 };
 
 const bulk = backward_tiling.bulk_reduce;

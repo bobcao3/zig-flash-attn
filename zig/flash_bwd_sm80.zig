@@ -22,30 +22,55 @@ const RowPair = fragments.RowPair;
 const chunk_elements = configurations.Sm80FwdTiling.chunk_elements;
 
 const vector_reductions = nvptx.gpu.sm >= 90;
+/// Without vector reductions, the backward adds each query gradient value with its own reduction,
+/// and the fragment order of `dq_accum` lets each of those reductions cover 32 consecutive floats.
+pub const fragment_ordered_dq_accum = !vector_reductions;
 
-pub fn SharedStorage(comptime tiling: configurations.Sm80BwdTiling) type {
+pub fn SharedStorage(
+    comptime tiling: configurations.Sm80BwdTiling,
+    comptime loop_schedule: @import("Sm80BwdSchedule.zig"),
+) type {
     const padded_chunks = tiling.rowChunks();
     const real_chunks = tiling.head_dim / chunk_elements;
     const block_m = tiling.block_m;
     const block_n = tiling.block_n;
     const stages = tiling.stages;
+    const query_stages = loop_schedule.queryStages(tiling);
     const threads = tiling.threads();
     const Rows = smem.Layout(padded_chunks);
     const PdS = smem.Layout(block_n / chunk_elements);
 
+    comptime {
+        if (loop_schedule.dq_column_splits > 1 and tiling.bulk_reduce) @compileError(
+            "only the scalar query gradient reductions split the columns",
+        );
+        if (loop_schedule.double_buffered_query and (stages != 1 or tiling.alternate_gradient_order))
+            @compileError("the second query buffer needs one buffer for the output gradient");
+        if (loop_schedule.interleaved_dq_reduction and (!fragment_ordered_dq_accum or tiling.tma or
+            !tiling.p_first or !tiling.alternate_gradient_order or
+            tiling.head_dim != tiling.headDimPadded())) @compileError(
+            "the interleaved dQ reduction needs fragment ordered query gradients, the split " ++
+                "gradient order, the probabilities first and an unpadded head dimension",
+        );
+    }
+
     return struct {
+        const Shared = @This();
         pub const Layout = Rows;
         pub const PdSLayout = PdS;
-        pub const shared_bytes = tiling.sharedBytes();
+        pub const shared_bytes = loop_schedule.sharedBytes(tiling);
         pub const Args = struct {};
 
+        const value_tile = tiling.valueTile();
+        const PdSTiles = [2]PdS.Tile(block_m);
+        const shared_region_bytes = @max(@sizeOf(Rows.Tile(block_n)), @sizeOf(PdSTiles));
+        const SharedRegion = [shared_region_bytes / @sizeOf(Chunk)]Chunk;
         const Tiles = struct {
             k: Rows.Tile(block_n),
-            v: Rows.Tile(block_n),
-            q: [stages]Rows.Tile(block_m),
+            v: if (value_tile == .own) Rows.Tile(block_n) else void,
+            q: [query_stages]Rows.Tile(block_m),
             do: [stages]Rows.Tile(block_m),
-            p: PdS.Tile(block_m),
-            ds: PdS.Tile(block_m),
+            pds: if (value_tile == .shared_with_pds) SharedRegion else PdSTiles,
         };
 
         comptime {
@@ -60,7 +85,11 @@ pub fn SharedStorage(comptime tiling: configurations.Sm80BwdTiling) type {
         }
 
         pub fn vTile() *addrspace(.shared) Rows.Tile(block_n) {
-            return &tiles.v;
+            return switch (value_tile) {
+                .own => &tiles.v,
+                .last_query_stage => @ptrCast(&tiles.q[stages - 1]),
+                .shared_with_pds => @ptrCast(&tiles.pds),
+            };
         }
 
         pub fn qTile(buffer: u32) *addrspace(.shared) Rows.Tile(block_m) {
@@ -71,65 +100,140 @@ pub fn SharedStorage(comptime tiling: configurations.Sm80BwdTiling) type {
             return &tiles.do[buffer];
         }
 
+        fn pdsTiles() *addrspace(.shared) PdSTiles {
+            return @ptrCast(&tiles.pds);
+        }
+
         pub fn pTile() *addrspace(.shared) PdS.Tile(block_m) {
-            return &tiles.p;
+            return &pdsTiles()[0];
         }
 
         pub fn dsTile() *addrspace(.shared) PdS.Tile(block_m) {
-            return &tiles.ds;
+            return &pdsTiles()[1];
         }
 
-        pub const Load = struct {
-            params: BackwardParams,
+        const TileCopy = smem.RowCopy(Rows, threads, padded_chunks, real_chunks);
 
-            pub fn init(params: BackwardParams, _: Args, _: anytype) Load {
-                return .{ .params = params };
-            }
+        /// Locates the rows of one tensor that a CTA copies into shared memory.
+        const RowCopy = struct {
+            rows: [*]addrspace(.global) const Chunk,
+            row_stride: u64,
+            head_stride: u64,
+            limit: u32,
 
-            fn copyRows(
-                comptime count: u32,
-                destination: *addrspace(.shared) Rows.Tile(count),
-                base: u64,
-                origin: u64,
-                stride: u64,
+            fn init(
+                comptime name: []const u8,
+                params: BackwardParams,
+                batch: u32,
                 first_row: u32,
                 limit: u32,
+            ) RowCopy {
+                const chunks: [*]addrspace(.global) const Chunk = @ptrFromInt(@field(params, name));
+                const stride = @field(params, name ++ "_row_stride");
+                const origin = batch * @field(params, name ++ "_batch_stride") + first_row * stride;
+                return .{
+                    .rows = chunks + origin / chunk_elements,
+                    .row_stride = stride / chunk_elements,
+                    .head_stride = @field(params, name ++ "_head_stride") / chunk_elements,
+                    .limit = limit,
+                };
+            }
+
+            fn copy(
+                source: RowCopy,
+                comptime count: u32,
+                destination: *addrspace(.shared) Rows.Tile(count),
+                head: u32,
+                first_row: u32,
             ) void {
-                const source: [*]addrspace(.global) const Chunk = @ptrFromInt(base);
-                const chunks = count * padded_chunks;
-                const tid = thread.id();
-                inline for (0..(chunks + threads - 1) / threads) |pass| {
-                    const linear: u32 = @as(u32, pass) * threads + tid;
-                    if ((pass + 1) * threads <= chunks or linear < chunks) {
-                        const row = linear / padded_chunks;
-                        const column = linear % padded_chunks;
-                        const valid = first_row + row < limit and column < real_chunks;
-                        const source_row = if (valid) first_row + row else 0;
-                        const source_column = if (valid) column else 0;
+                const origin = source.rows + head * source.head_stride;
+                const stride = source.row_stride;
+                TileCopy.copy(count, destination, origin, stride, first_row, source.limit);
+            }
+        };
+
+        const copy_rows_per_pass = threads / padded_chunks;
+        const thread_rows_copy = stages == 2 and padded_chunks == real_chunks and
+            threads % padded_chunks == 0 and block_m % copy_rows_per_pass == 0 and
+            copy_rows_per_pass % 8 == 0;
+
+        /// Locates the chunks that a thread copies for the first query block of a work tile, so
+        /// that a later block of the same head only adds a multiple of the row stride.
+        const ThreadRows = struct {
+            q: [*]addrspace(.global) const Chunk,
+            do: [*]addrspace(.global) const Chunk,
+            rows_left: i32,
+            slot: u32,
+
+            fn init(q: RowCopy, do: RowCopy, work: anytype) ThreadRows {
+                const tid = @workItemId(0);
+                const column = tid % padded_chunks;
+                const thread_row = tid / padded_chunks;
+                const row = work.m_block_min * block_m + thread_row;
+                return .{
+                    .q = q.rows + work.first_qhead * q.head_stride + row * q.row_stride + column,
+                    .do = do.rows + work.first_qhead * do.head_stride + row * do.row_stride +
+                        column,
+                    .rows_left = @as(i32, @intCast(q.limit)) - @as(i32, @intCast(row)),
+                    .slot = Rows.slot(thread_row, column),
+                };
+            }
+        };
+
+        pub const Load = struct {
+            pub const schedule = loop_schedule;
+
+            /// Returns the steps of the main loop that the schedule adds to `Kernel`, which keeps
+            /// its tiles in this storage.
+            pub fn Steps(comptime Kernel: type) type {
+                return @import("Sm80BwdSchedule.zig").Steps(Kernel, Shared, tiling, schedule);
+            }
+
+            params: BackwardParams,
+            q: RowCopy,
+            do: RowCopy,
+            thread_rows: if (thread_rows_copy) ThreadRows else void,
+
+            pub fn init(params: BackwardParams, _: Args, work: anytype) Load {
+                const sequence = work.sequence;
+                const offset = sequence.offset_q;
+                const q: RowCopy = .init("q", params, work.batch, offset, sequence.seqlen_q);
+                const do: RowCopy = .init("do", params, work.batch, offset, sequence.seqlen_q);
+                return .{
+                    .params = params,
+                    .q = q,
+                    .do = do,
+                    .thread_rows = if (thread_rows_copy) .init(q, do, work) else {},
+                };
+            }
+
+            inline fn copyBlock(load: *const Load, buffer: u32, block: u32) void {
+                comptime std.debug.assert(thread_rows_copy);
+                const rows = load.thread_rows;
+                const first_row = block * block_m;
+                const rows_left = rows.rows_left - @as(i32, @intCast(first_row));
+                inline for (.{ "q", "do" }) |name| {
+                    const source = @field(load, name);
+                    const tile = &@field(tiles, name)[buffer];
+                    var chunk = @field(rows, name) + first_row * source.row_stride;
+                    inline for (0..block_m / copy_rows_per_pass) |pass| {
+                        const valid = rows_left > pass * copy_rows_per_pass;
                         cp_async.copyZeroFill(
                             .cache_global_level,
-                            &destination[Rows.slot(row, column)],
-                            &source[
-                                origin / chunk_elements +
-                                    source_row * stride / chunk_elements + source_column
-                            ],
-                            if (valid) configurations.Sm80FwdTiling.chunk_bytes else 0,
+                            &tile[rows.slot + comptime Rows.slot(pass * copy_rows_per_pass, 0)],
+                            if (valid) &chunk[0] else &source.rows[0],
+                            if (valid) @sizeOf(Chunk) else 0,
                         );
+                        chunk += copy_rows_per_pass * source.row_stride;
                     }
                 }
             }
 
-            fn fetch(load: *const Load, comptime name: anytype, work: anytype, index: u32) void {
-                const step = work.step(index);
-                const params = load.params;
-                const sequence = work.sequence;
-                const stride = @field(params, name ++ "_row_stride");
-                const origin = work.batch * @field(params, name ++ "_batch_stride") +
-                    sequence.offset_q * stride + step.head * @field(params, name ++ "_head_stride");
-                const tile = &@field(tiles, name)[index % stages];
-                const source = @field(params, name);
-                const first_row = step.block_info.first_row;
-                copyRows(block_m, tile, source, origin, stride, first_row, sequence.seqlen_q);
+            fn fetch(load: *const Load, comptime name: []const u8, work: anytype, index: u32) void {
+                const step = work.branchedStep(index);
+                const buffers = comptime if (std.mem.eql(u8, name, "q")) query_stages else stages;
+                const tile = &@field(tiles, name)[index % buffers];
+                @field(load, name).copy(block_m, tile, step.head, step.block_info.first_row);
             }
 
             fn copyQuery(load: *const Load, work: anytype, iteration: u32) void {
@@ -141,56 +245,59 @@ pub fn SharedStorage(comptime tiling: configurations.Sm80BwdTiling) type {
                 if (work.iterations() == 0) return;
                 const params = load.params;
                 const sequence = work.sequence;
-                const k_origin =
-                    work.batch * params.k_batch_stride + sequence.offset_k * params.k_row_stride +
-                    work.kv_head * params.k_head_stride;
-                const v_origin =
-                    work.batch * params.v_batch_stride + sequence.offset_k * params.v_row_stride +
-                    work.kv_head * params.v_head_stride;
-                copyRows(
-                    block_n,
-                    &tiles.k,
-                    params.k,
-                    k_origin,
-                    params.k_row_stride,
-                    work.first_key,
-                    sequence.seqlen_k,
-                );
-                load.fetch("q", work, 0);
-                cp_async.commitGroup();
-                copyRows(
-                    block_n,
-                    &tiles.v,
-                    params.v,
-                    v_origin,
-                    params.v_row_stride,
-                    work.first_key,
-                    sequence.seqlen_k,
-                );
-                load.fetch("do", work, 0);
-                cp_async.commitGroup();
+                const key_tiles = .{ kTile(), vTile() };
+                inline for (.{ "k", "v" }, key_tiles, .{ "q", "do" }) |key_name, key_tile, name| {
+                    const keys: RowCopy =
+                        .init(key_name, params, work.batch, sequence.offset_k, sequence.seqlen_k);
+                    keys.copy(block_n, key_tile, work.kv_head, work.first_key);
+                    load.fetch(name, work, 0);
+                    cp_async.commitGroup();
+                }
                 cp_async.waitGroup(1);
                 nvptx.barrierSyncAligned(.work_group, null);
             }
 
             pub fn acquireDo(_: *const Load, iteration: u32, work: anytype) void {
+                // With the values in registers, `loadValues` has waited for every copy.
+                if (schedule.double_buffered_query and tiling.v_in_regs) return;
                 if (iteration > 0) return;
-                if (stages == 2 and work.iterations() > 1) cp_async.waitGroup(
+                // The copy of the second query block starts later with the interleaved reduction.
+                const prefetched = !schedule.interleaved_dq_reduction and work.iterations() > 1;
+                if (query_stages == 2 and prefetched) cp_async.waitGroup(
                     1,
                 ) else cp_async.waitGroup(0);
                 nvptx.barrierSyncAligned(.work_group, null);
             }
 
+            /// Starts the copy of the query block of iteration `next` at the top of the loop, or
+            /// between the S and dP GEMMs with the interleaved dQ reduction.
             pub fn prefetch(load: *const Load, next: u32, count: u32, work: anytype) void {
+                if (schedule.interleaved_dq_reduction) return;
+                load.prefetchQuery(next, count, work);
+            }
+
+            pub fn prefetchQuery(load: *const Load, next: u32, count: u32, work: anytype) void {
                 if (stages == 2 and next < count) {
-                    load.copyQuery(work, next);
+                    if (thread_rows_copy and work.qhead_per_kvhead == 1)
+                        load.copyBlock(next % stages, next)
+                    else
+                        load.copyQuery(work, next);
+                    cp_async.commitGroup();
+                } else if (stages == 1 and query_stages == 2 and next < count) {
+                    load.fetch("q", work, next);
                     cp_async.commitGroup();
                 }
             }
 
             pub fn release(load: *const Load, iteration: u32, count: u32, work: anytype) void {
-                if (stages == 1 and iteration + 1 < count) {
-                    nvptx.barrierSyncAligned(.work_group, null);
+                if (stages == 1 and query_stages == 2) {
+                    schedule.loopBarrier();
+                    if (iteration + 1 < count) {
+                        load.fetch("do", work, iteration + 1);
+                        cp_async.commitGroup();
+                    }
+                } else if (stages == 1 and iteration + 1 < count) {
+                    schedule.loopBarrier();
                     load.copyQuery(work, iteration + 1);
                     cp_async.commitGroup();
                 }
@@ -198,7 +305,7 @@ pub fn SharedStorage(comptime tiling: configurations.Sm80BwdTiling) type {
 
             pub fn finish(_: *const Load, _: u32, _: u32, _: anytype) void {
                 cp_async.waitGroup(0);
-                nvptx.barrierSyncAligned(.work_group, null);
+                schedule.loopBarrier();
             }
         };
     };
@@ -214,15 +321,20 @@ pub fn FlashAttnBwdSm80(
     const block_m = tiling.block_m;
     const block_n = tiling.block_n;
     const stages = tiling.stages;
+    const sm80_schedule = @hasDecl(Storage.Load, "schedule");
+    const query_stages = if (sm80_schedule) Storage.Load.schedule.queryStages(tiling) else stages;
     const threads = tiling.threads();
     const warps = tiling.warps;
-    const warps_m = block_m / 16;
+    const score_rows = tiling.score_row_tiles;
+    const warps_m = block_m / (16 * score_rows);
     const warps_n = warps / warps_m;
     const columns_per_warp = block_n / warps_n;
-    const warps_kv_n = block_n / 16;
+    const row_tiles = tiling.gradient_row_tiles;
+    const warps_kv_n = block_n / (16 * row_tiles);
     const warps_kv_d = warps / warps_kv_n;
     const tiles_kv = padded_chunks / warps_kv_d;
-    const warps_dq_d = warps / warps_m;
+    const warps_dq_m = block_m / (16 * row_tiles);
+    const warps_dq_d = warps / warps_dq_m;
     const tiles_dq = padded_chunks / warps_dq_d;
     const k_steps = padded_chunks / 2;
     const Rows = Storage.Layout;
@@ -245,8 +357,11 @@ pub fn FlashAttnBwdSm80(
             @compileError("the score tile does not divide among the warps");
         if (warps % warps_kv_n != 0 or padded_chunks % warps_kv_d != 0)
             @compileError("the gradient tile does not divide among the warps");
-        if (padded_chunks % warps_dq_d != 0) @compileError(
+        if (warps % warps_dq_m != 0 or padded_chunks % warps_dq_d != 0) @compileError(
             "the query gradient does not divide among the warps",
+        );
+        if (row_tiles > 1 and (vector_reductions or tiling.bulk_reduce)) @compileError(
+            "only the scalar query gradient reductions handle several row tiles",
         );
         if (tiling.alternate_gradient_order and (stages != 2 or warps % 2 != 0)) @compileError(
             "the split gradient order needs two query stages and an even warp count",
@@ -268,94 +383,187 @@ pub fn FlashAttnBwdSm80(
             specialization.sort_batches,
         );
 
-        const Step = Work.Step;
+        pub const Step = Work.Step;
 
         const Terms = struct {
             lse_negated: RowPair,
             dpsum_negated: RowPair,
         };
 
+        const Scores = [score_rows][columns_per_warp / 8]Accumulator;
+
         const Probabilities = struct {
-            p: [columns_per_warp / 8]@Vector(2, u32),
-            ds: [columns_per_warp / 8]@Vector(2, u32),
+            p: [score_rows][columns_per_warp / 8]@Vector(2, u32),
+            ds: [score_rows][columns_per_warp / 8]@Vector(2, u32),
         };
 
-        fn scoresGemm(a_tile: anytype, b_tile: anytype) [columns_per_warp / 8]Accumulator {
-            @setEvalBranchQuota(100_000);
-            const warp_m = thread.warp() % warps_m;
-            const warp_n = thread.warp() / warps_m;
-            const lane = thread.lane();
-            const lane_row = lane % 8;
-            var scores: [columns_per_warp / 8]Accumulator = @splat(@splat(0));
-            inline for (0..k_steps) |step_index| {
-                const k_step: u32 = step_index;
-                const a = nvptx.ldmatrix(
+        fn TransposedOperand(comptime rows: u32, comptime tile_count: u32) type {
+            return struct {
+                pairs: Rows.Addresses(rows),
+                tail: if (tile_count % 2 == 1) Rows.Addresses(rows) else void,
+
+                fn init(first_tile: u32) @This() {
+                    const lane = thread.lane();
+                    return .{
+                        .pairs = .init(lane % 8 + lane / 8 % 2 * 8, first_tile + lane / 16),
+                        .tail = if (tile_count % 2 == 1) .init(lane % 16, first_tile) else {},
+                    };
+                }
+            };
+        }
+
+        const dq_gemm_tiles = if (tiling.bulk_reduce) Storage.DqAccum.box_columns / 8 else tiles_dq;
+
+        /// Holds the shared memory offsets of the matrix operands that each thread loads. The
+        /// kernel computes them once per CTA, so that each `ldmatrix` in the loop adds only a
+        /// constant to a register.
+        pub const Operands = struct {
+            query: Rows.Addresses(block_m),
+            key: Rows.Addresses(block_n),
+            gradient: TransposedOperand(block_m, tiles_kv),
+            query_gradient: TransposedOperand(block_n, dq_gemm_tiles),
+            pds_columns: PdSLayout.Addresses(block_m),
+            ds_rows: PdSLayout.Addresses(block_m),
+            pds_store: PdSLayout.Addresses(block_m),
+
+            pub fn init() Operands {
+                const lane = thread.lane();
+                const warp_m = thread.warp() % warps_m;
+                const warp_n = thread.warp() / warps_m;
+                const warp_kv_n = thread.warp() % warps_kv_n;
+                const warp_kv_d = thread.warp() / warps_kv_n;
+                const warp_dq_m = thread.warp() % warps_dq_m;
+                const warp_dq_d = thread.warp() / warps_dq_m;
+                const key_row = warp_n * columns_per_warp + lane % 8 + lane / 16 * 8;
+                const ds_column = warp_kv_n * 2 * row_tiles + lane / 8 % 2;
+                return .{
+                    .query = .init(warp_m * 16 * score_rows + lane % 16, lane / 16),
+                    .key = .init(key_row, lane / 8 % 2),
+                    .gradient = .init(warp_kv_d * tiles_kv),
+                    .query_gradient = .init(warp_dq_d * tiles_dq),
+                    .pds_columns = .init(lane % 8 + lane / 16 * 8, ds_column),
+                    .ds_rows = .init(warp_dq_m * 16 * row_tiles + lane % 16, lane / 16),
+                    .pds_store = .init(
+                        warp_m * 16 * score_rows + lane / 4,
+                        warp_n * (columns_per_warp / 8),
+                    ),
+                };
+            }
+        };
+
+        /// Holds the B operand fragments of the dP GEMM, which a warp keeps in registers for the
+        /// whole CTA when `tiling.v_in_regs` is set.
+        pub const Values = if (tiling.v_in_regs)
+            [k_steps][columns_per_warp / 16]@Vector(4, u32)
+        else
+            void;
+
+        pub fn loadValues(operands: *const Operands) Values {
+            if (!tiling.v_in_regs) return {};
+            cp_async.waitGroup(0);
+            nvptx.barrierSyncAligned(.work_group, null);
+            var values: Values = undefined;
+            inline for (&values, 0..) |*step_values, k_step| {
+                inline for (step_values, 0..) |*b, j| b.* = nvptx.ldmatrix(
                     .x4,
                     false,
-                    Rows.chunk(a_tile, warp_m * 16 + lane % 16, k_step * 2 + lane / 16, lane_row),
+                    operands.key.chunk(Storage.vTile(), j * 16, k_step * 2),
                 );
-                inline for (0..columns_per_warp / 16) |pair_index| {
-                    const j: u32 = pair_index;
-                    const row = warp_n * columns_per_warp + j * 16 + lane_row + lane / 16 * 8;
-                    const b = nvptx.ldmatrix(
-                        .x4,
-                        false,
-                        Rows.chunk(b_tile, row, k_step * 2 + lane / 8 % 2, lane_row),
-                    );
-                    scores[2 * j] = nvptx.mmaSync(
-                        fragments.mma_m16n8k16,
-                        a,
-                        @Vector(2, u32){ b[0], b[1] },
-                        scores[2 * j],
-                    );
-                    scores[2 * j + 1] = nvptx.mmaSync(
-                        fragments.mma_m16n8k16,
-                        a,
-                        @Vector(2, u32){ b[2], b[3] },
-                        scores[2 * j + 1],
-                    );
+            }
+            if (tiling.valueTile() != .own) nvptx.barrierSyncAligned(.work_group, null);
+            return values;
+        }
+
+        /// Multiplies rows of `a_tile` by the key rows in `b_source`, which is either a shared
+        /// memory tile or `Values`.
+        fn scoresGemm(operands: *const Operands, a_tile: anytype, b_source: anytype) Scores {
+            @setEvalBranchQuota(100_000);
+            const keys = operands.key;
+            var scores: Scores = @splat(@splat(@splat(0)));
+            inline for (0..k_steps) |k_step| {
+                var a: [score_rows]@Vector(4, u32) = undefined;
+                inline for (&a, 0..) |*row_a, tile| row_a.* = nvptx.ldmatrix(
+                    .x4,
+                    false,
+                    operands.query.chunk(a_tile, tile * 16, k_step * 2),
+                );
+                inline for (0..columns_per_warp / 16) |j| {
+                    const b = if (@TypeOf(b_source) == Values)
+                        b_source[k_step][j]
+                    else
+                        nvptx.ldmatrix(.x4, false, keys.chunk(b_source, j * 16, k_step * 2));
+                    inline for (&scores, a) |*row_scores, row_a| {
+                        row_scores[2 * j] = nvptx.mmaSync(
+                            fragments.mma_m16n8k16,
+                            row_a,
+                            @Vector(2, u32){ b[0], b[1] },
+                            row_scores[2 * j],
+                        );
+                        row_scores[2 * j + 1] = nvptx.mmaSync(
+                            fragments.mma_m16n8k16,
+                            row_a,
+                            @Vector(2, u32){ b[2], b[3] },
+                            row_scores[2 * j + 1],
+                        );
+                    }
                 }
             }
             return scores;
         }
 
-        fn transposedGemm(
+        const ValueSource = if (tiling.v_in_regs) Values else @TypeOf(Storage.vTile());
+
+        fn valueSource(values: *const Values) ValueSource {
+            return if (tiling.v_in_regs) values.* else Storage.vTile();
+        }
+
+        /// Multiplies each A fragment of `a`, one per row tile, by the columns of `b_tile` that
+        /// `operand` locates, so that each B fragment serves every row tile.
+        pub fn transposedGemm(
             accumulator: anytype,
             comptime tile_count: u32,
             a: anytype,
+            operand: anytype,
             b_tile: anytype,
             comptime k_step: u32,
-            first_tile: u32,
+            comptime first_column: u32,
         ) void {
             @setEvalBranchQuota(100_000);
-            const lane = thread.lane();
-            const lane_row = lane % 8;
-            inline for (0..tile_count / 2) |pair_index| {
-                const j: u32 = pair_index;
-                const b = nvptx.ldmatrix(.x4, true, Rows.chunk(b_tile, k_step * 16 + lane_row +
-                    lane / 8 % 2 * 8, first_tile + 2 * j + lane / 16, lane_row));
-                accumulator[2 * j] = nvptx.mmaSync(
-                    fragments.mma_m16n8k16,
-                    a,
-                    @Vector(2, u32){ b[0], b[1] },
-                    accumulator[2 * j],
+            inline for (0..tile_count / 2) |j| {
+                const b = nvptx.ldmatrix(
+                    .x4,
+                    true,
+                    operand.pairs.chunk(b_tile, k_step * 16, first_column + 2 * j),
                 );
-                accumulator[2 * j + 1] = nvptx.mmaSync(
-                    fragments.mma_m16n8k16,
-                    a,
-                    @Vector(2, u32){ b[2], b[3] },
-                    accumulator[2 * j + 1],
-                );
+                inline for (accumulator, a) |*row_accumulator, row_a| {
+                    row_accumulator[2 * j] = nvptx.mmaSync(
+                        fragments.mma_m16n8k16,
+                        row_a,
+                        @Vector(2, u32){ b[0], b[1] },
+                        row_accumulator[2 * j],
+                    );
+                    row_accumulator[2 * j + 1] = nvptx.mmaSync(
+                        fragments.mma_m16n8k16,
+                        row_a,
+                        @Vector(2, u32){ b[2], b[3] },
+                        row_accumulator[2 * j + 1],
+                    );
+                }
             }
             if (tile_count % 2 == 1) {
-                const b = nvptx.ldmatrix(.x2, true, Rows.chunk(
-                    b_tile,
-                    k_step * 16 + lane % 16,
-                    first_tile + tile_count - 1,
-                    lane_row,
-                ));
-                accumulator[tile_count - 1] =
-                    nvptx.mmaSync(fragments.mma_m16n8k16, a, b, accumulator[tile_count - 1]);
+                const b = nvptx.ldmatrix(
+                    .x2,
+                    true,
+                    operand.tail.chunk(b_tile, k_step * 16, first_column + tile_count - 1),
+                );
+                inline for (accumulator, a) |*row_accumulator, row_a| {
+                    row_accumulator[tile_count - 1] = nvptx.mmaSync(
+                        fragments.mma_m16n8k16,
+                        row_a,
+                        b,
+                        row_accumulator[tile_count - 1],
+                    );
+                }
             }
         }
 
@@ -364,8 +572,15 @@ pub fn FlashAttnBwdSm80(
                 if (specialization.head_split and params.cu_seqlens_k == 0) nvptx.nctaid(0) /
                 ((params.seqlen_k + block_n - 1) / block_n) else 1;
             const persistent_scheduler: PersistentScheduler = .create();
-            const grid =
-                tile_scheduler.gridTile(.x, splits, persistent_scheduler.initialWorkTileInfo());
+            const ctaid = persistent_scheduler.initialWorkTileInfo();
+            const grid = tile_scheduler.gridTile(
+                .x,
+                splits,
+                if (sm80_schedule and !specialization.head_split)
+                    Storage.Load.schedule.orderedCtaid(params, ctaid)
+                else
+                    ctaid,
+            );
             const scheduler = TileScheduler.create(tile_scheduler.keyArguments(params, grid));
             return Work.init(
                 params,
@@ -375,150 +590,154 @@ pub fn FlashAttnBwdSm80(
             );
         }
 
+        fn rowQuad(pair: RowPair) Accumulator {
+            return .{ pair[0], pair[0], pair[1], pair[1] };
+        }
+
         pub fn computeProbabilities(
             params: BackwardParams,
             iteration: u32,
             work: *const Work,
             step: Step,
             load: *const Storage.Load,
+            operands: *const Operands,
+            values: *const Values,
         ) Probabilities {
-            const row =
-                step.block_info.first_row + thread.warp() % warps_m * 16 + thread.lane() / 4;
+            const warp_m = thread.warp() % warps_m;
+            const warp_n = thread.warp() / warps_m;
+            const first_row =
+                step.block_info.first_row + warp_m * 16 * score_rows + thread.lane() / 4;
             const lse: [*]addrspace(.global) const f32 = @ptrFromInt(params.lse_log2);
             const dpsum: [*]addrspace(.global) const f32 = @ptrFromInt(params.dpsum);
             const base = work.batch * params.lse_batch_stride + step.head * params.lse_head_stride +
                 work.sequence.offset_q;
             const seqlen_q = work.sequence.seqlen_q;
-            var terms: Terms = .{
+            var terms: [score_rows]Terms = @splat(.{
                 .lse_negated = @splat(-std.math.inf(f32)),
                 .dpsum_negated = @splat(0),
-            };
-            inline for (0..2) |half| {
-                const half_row = row + @as(u32, half) * 8;
-                if (half_row < seqlen_q) {
-                    terms.lse_negated[half] = lse[base + half_row];
-                    terms.dpsum_negated[half] = dpsum[base + half_row];
+            });
+            inline for (&terms, 0..) |*row_terms, tile| {
+                inline for (0..2) |half| {
+                    const row = first_row + @as(u32, tile) * 16 + @as(u32, half) * 8;
+                    if (row < seqlen_q) {
+                        row_terms.lse_negated[half] = lse[base + row];
+                        row_terms.dpsum_negated[half] = dpsum[base + row];
+                    }
                 }
             }
             const buffer = iteration % stages;
-            const warp_m = thread.warp() % warps_m;
-            const warp_n = thread.warp() / warps_m;
-            var scores = scoresGemm(Storage.qTile(buffer), Storage.kTile());
+            const query = Storage.qTile(if (query_stages == stages) buffer else iteration % 2);
+            var scores = scoresGemm(operands, query, Storage.kTile());
             load.acquireDo(iteration, work);
+            if (sm80_schedule and Storage.Load.schedule.interleaved_dq_reduction) {
+                load.prefetchQuery(iteration + 1, work.iterations(), work);
+            }
             var d_probabilities = if (tiling.p_first)
-                @as([columns_per_warp / 8]Accumulator, undefined)
+                @as(Scores, undefined)
             else
-                scoresGemm(Storage.doTile(buffer), Storage.vTile());
+                scoresGemm(operands, Storage.doTile(buffer), valueSource(values));
             if (step.block_info.needsMask(
                 step.block_info.colLimitBounds(),
                 work.first_key / block_n,
                 block_n,
             )) {
-                const limits = ColLimits.init(step.block_info, step.block_info.first_row +
-                    warp_m * 16 + thread.lane() / 4);
-                applyMask(&scores, work.first_key + warp_n *
-                    columns_per_warp, limits, -std.math.inf(f32));
+                inline for (&scores, 0..) |*row_scores, tile| {
+                    const limits = ColLimits.init(step.block_info, first_row + @as(u32, tile) * 16);
+                    applyMask(row_scores, work.first_key + warp_n *
+                        columns_per_warp, limits, -std.math.inf(f32));
+                }
             }
             const scale: Accumulator = @splat(params.softmax_scale_log2);
-            var result: Probabilities = undefined;
-            const lse4: Accumulator = .{
-                terms.lse_negated[0], terms.lse_negated[0],
-                terms.lse_negated[1], terms.lse_negated[1],
-            };
-            const sum4: Accumulator = .{
-                terms.dpsum_negated[0], terms.dpsum_negated[0],
-                terms.dpsum_negated[1], terms.dpsum_negated[1],
-            };
-            var probabilities: [columns_per_warp / 8]Accumulator = undefined;
+            var probabilities: Scores = undefined;
             if (tiling.p_first) {
-                inline for (&probabilities, scores) |*p, score| p.* =
-                    fragments.exp2(@mulAdd(Accumulator, score, scale, lse4));
-                d_probabilities = scoresGemm(Storage.doTile(buffer), Storage.vTile());
+                inline for (&probabilities, scores, terms) |*row_p, row_scores, row_terms| {
+                    const lse4 = rowQuad(row_terms.lse_negated);
+                    inline for (row_p, row_scores) |*p, score| p.* =
+                        fragments.exp2(@mulAdd(Accumulator, score, scale, lse4));
+                }
+                d_probabilities = scoresGemm(operands, Storage.doTile(buffer), valueSource(values));
             }
-            inline for (scores, d_probabilities, 0..) |score, d_probability, tile| {
-                const p = if (tiling.p_first) probabilities[tile] else fragments.exp2(
-                    @mulAdd(Accumulator, score, scale, lse4),
-                );
-                const ds = p * (d_probability + sum4);
-                result.p[tile] = .{
-                    @backingInt(nvptx.Bf16x2.fromF32(p[0], p[1])),
-                    @backingInt(nvptx.Bf16x2.fromF32(p[2], p[3])),
-                };
-                result.ds[tile] = .{
-                    @backingInt(nvptx.Bf16x2.fromF32(ds[0], ds[1])),
-                    @backingInt(nvptx.Bf16x2.fromF32(ds[2], ds[3])),
-                };
+            var result: Probabilities = undefined;
+            inline for (0..score_rows) |row_tile| {
+                const lse4 = rowQuad(terms[row_tile].lse_negated);
+                const sum4 = rowQuad(terms[row_tile].dpsum_negated);
+                inline for (scores[row_tile], d_probabilities[row_tile], 0..) |score, d_p, tile| {
+                    const p = if (tiling.p_first) probabilities[row_tile][tile] else fragments.exp2(
+                        @mulAdd(Accumulator, score, scale, lse4),
+                    );
+                    const ds = p * (d_p + sum4);
+                    result.p[row_tile][tile] = .{
+                        @backingInt(nvptx.Bf16x2.fromF32(p[0], p[1])),
+                        @backingInt(nvptx.Bf16x2.fromF32(p[2], p[3])),
+                    };
+                    result.ds[row_tile][tile] = .{
+                        @backingInt(nvptx.Bf16x2.fromF32(ds[0], ds[1])),
+                        @backingInt(nvptx.Bf16x2.fromF32(ds[2], ds[3])),
+                    };
+                }
             }
             return result;
         }
 
-        pub fn storePdS(probabilities: Probabilities) void {
-            const warp_m = thread.warp() % warps_m;
-            const warp_n = thread.warp() / warps_m;
-            const lane = thread.lane();
-            const row = warp_m * 16 + lane / 4;
-            inline for (0..columns_per_warp / 8) |tile_index| {
-                const tile: u32 = tile_index;
-                const column = warp_n * (columns_per_warp / 8) + tile;
-                PdSLayout.word(Storage.pTile(), row, column, lane % 4).* = probabilities.p[tile][0];
-                PdSLayout.word(Storage.pTile(), row + 8, column, lane % 4).* =
-                    probabilities.p[tile][1];
-                PdSLayout.word(Storage.dsTile(), row, column, lane % 4).* =
-                    probabilities.ds[tile][0];
-                PdSLayout.word(Storage.dsTile(), row + 8, column, lane % 4).* =
-                    probabilities.ds[tile][1];
+        pub fn storePdS(probabilities: Probabilities, operands: *const Operands) void {
+            const word = thread.lane() % 4;
+            inline for (0..score_rows * columns_per_warp / 8) |index| {
+                const row_tile = index / (columns_per_warp / 8);
+                const tile = index % (columns_per_warp / 8);
+                inline for (.{ Storage.pTile(), Storage.dsTile() }, .{
+                    probabilities.p[row_tile][tile], probabilities.ds[row_tile][tile],
+                }) |destination, pair| {
+                    inline for (0..2) |half| {
+                        const row = row_tile * 16 + half * 8;
+                        const words: [*]addrspace(.shared) u32 =
+                            @ptrCast(operands.pds_store.chunk(destination, row, tile));
+                        words[word] = pair[half];
+                    }
+                }
             }
         }
 
-        const DkvAccumulators = struct {
-            dk: [tiles_kv]Accumulator,
-            dv: [tiles_kv]Accumulator,
+        pub const DkvAccumulators = struct {
+            dk: [row_tiles][tiles_kv]Accumulator,
+            dv: [row_tiles][tiles_kv]Accumulator,
         };
 
         pub fn zeroDkv() DkvAccumulators {
-            return .{ .dk = @splat(@splat(0)), .dv = @splat(@splat(0)) };
+            return .{ .dk = @splat(@splat(@splat(0))), .dv = @splat(@splat(@splat(0))) };
         }
 
+        /// Accumulates dK and dV, and adds `query_gradient`, if it is not void, to `dq_accum` in
+        /// parts after the products of each step.
         pub fn accumulateDkv(
             accumulators: *DkvAccumulators,
             _: *const Storage.Load,
             iteration: u32,
+            operands: *const Operands,
+            query_gradient: anytype,
         ) void {
             @setEvalBranchQuota(100_000);
             const buffer = iteration % stages;
-            const warp_n = thread.warp() % warps_kv_n;
-            const warp_d = thread.warp() / warps_kv_n;
-            const lane = thread.lane();
-            const lane_row = lane % 8;
-            inline for (0..block_m / 16) |k_step| {
-                const row = @as(u32, k_step) * 16 + lane_row + lane / 16 * 8;
-                const column = warp_n * 2 + lane / 8 % 2;
-                const dv_a = nvptx.ldmatrix(
-                    .x4,
-                    true,
-                    PdSLayout.chunk(Storage.pTile(), row, column, lane_row),
-                );
-                const dk_a = nvptx.ldmatrix(
-                    .x4,
-                    true,
-                    PdSLayout.chunk(Storage.dsTile(), row, column, lane_row),
-                );
-                transposedGemm(
-                    &accumulators.dv,
-                    tiles_kv,
-                    dv_a,
-                    Storage.doTile(buffer),
-                    k_step,
-                    warp_d * tiles_kv,
-                );
-                transposedGemm(
-                    &accumulators.dk,
-                    tiles_kv,
-                    dk_a,
-                    Storage.qTile(buffer),
-                    k_step,
-                    warp_d * tiles_kv,
-                );
+            const k_steps_kv = block_m / 16;
+            inline for (0..k_steps_kv) |k_step| {
+                var dv_a: [row_tiles]@Vector(4, u32) = undefined;
+                var dk_a: [row_tiles]@Vector(4, u32) = undefined;
+                inline for (&dv_a, &dk_a, 0..) |*p, *ds, tile| {
+                    const columns = operands.pds_columns;
+                    const row = k_step * 16;
+                    const column = tile * 2;
+                    p.* = nvptx.ldmatrix(.x4, true, columns.chunk(Storage.pTile(), row, column));
+                    ds.* = nvptx.ldmatrix(.x4, true, columns.chunk(Storage.dsTile(), row, column));
+                }
+                const gradient = operands.gradient;
+                const do_tile = Storage.doTile(buffer);
+                const q_tile = Storage.qTile(buffer);
+                transposedGemm(&accumulators.dv, tiles_kv, dv_a, gradient, do_tile, k_step, 0);
+                transposedGemm(&accumulators.dk, tiles_kv, dk_a, gradient, q_tile, k_step, 0);
+                if (@TypeOf(query_gradient) != void) {
+                    const reductions = @TypeOf(query_gradient.*).reductions;
+                    const part = (reductions + k_steps_kv - 1) / k_steps_kv;
+                    query_gradient.add(k_step * part, part);
+                }
             }
         }
 
@@ -532,42 +751,42 @@ pub fn FlashAttnBwdSm80(
             step: Step,
             load: *const Storage.Load,
             _: u32,
+            operands: *const Operands,
         ) void {
             @setEvalBranchQuota(100_000);
-            const warp_m = thread.warp() % warps_m;
-            const warp_d = thread.warp() / warps_m;
+            const warp_m = thread.warp() % warps_dq_m;
+            const warp_d = thread.warp() / warps_dq_m;
             const lane = thread.lane();
-            const lane_row = lane % 8;
+            var a: [block_n / 16][row_tiles]@Vector(4, u32) = undefined;
+            inline for (&a, 0..) |*step_a, k_step| {
+                inline for (step_a, 0..) |*fragment, tile| fragment.* = nvptx.ldmatrix(
+                    .x4,
+                    false,
+                    operands.ds_rows.chunk(Storage.dsTile(), tile * 16, k_step * 2),
+                );
+            }
             if (tiling.bulk_reduce) {
                 const gradient = Storage.DqAccum;
                 const tiles_per_box = gradient.box_columns / 8;
                 const row_base = work.sequence.offset_q +
                     if (params.cu_seqlens_q == 0) work.batch * params.seqlen_q else 0;
                 const row = row_base + step.block_info.first_row + warp_m * 16;
-                var a: [block_n / 16]@Vector(4, u32) = undefined;
-                inline for (&a, 0..) |*fragment, k_step| {
-                    fragment.* = nvptx.ldmatrix(.x4, false, PdSLayout.chunk(
-                        Storage.dsTile(),
-                        warp_m * 16 + lane % 16,
-                        @as(u32, k_step) * 2 + lane / 16,
-                        lane_row,
-                    ));
-                }
                 inline for (0..tiles_dq / tiles_per_box) |box| {
                     const first_tile = warp_d * tiles_dq + @as(u32, box) * tiles_per_box;
-                    var dq: [tiles_per_box]Accumulator = @splat(@splat(0));
+                    var dq: [1][tiles_per_box]Accumulator = @splat(@splat(@splat(0)));
                     inline for (a, 0..) |fragment, k_step| {
                         transposedGemm(
                             &dq,
                             tiles_per_box,
                             fragment,
+                            operands.query_gradient,
                             Storage.kTile(),
                             k_step,
-                            first_tile,
+                            box * tiles_per_box,
                         );
                     }
                     gradient.waitFree();
-                    inline for (dq, 0..) |fragment, tile| {
+                    inline for (dq[0], 0..) |fragment, tile| {
                         const column = @as(u32, tile) * 8 + lane % 4 * 2;
                         gradient.store(lane / 4, column, .{ fragment[0], fragment[1] });
                         gradient.store(lane / 4 + 8, column, .{ fragment[2], fragment[3] });
@@ -581,62 +800,49 @@ pub fn FlashAttnBwdSm80(
                 }
                 return;
             }
-            var dq: [tiles_dq]Accumulator = @splat(@splat(0));
-            inline for (0..block_n / 16) |k_step| {
-                const a = nvptx.ldmatrix(.x4, false, PdSLayout.chunk(
-                    Storage.dsTile(),
-                    warp_m * 16 + lane % 16,
-                    @as(u32, k_step) * 2 + lane / 16,
-                    lane_row,
-                ));
-                transposedGemm(&dq, tiles_dq, a, Storage.kTile(), k_step, warp_d * tiles_dq);
+            if (fragment_ordered_dq_accum) {
+                return Storage.Load.Steps(@This()).reduceDq(params, work, step, operands, a);
             }
-            const row = step.block_info.first_row + warp_m * 16 + lane / 4;
+            var dq: [row_tiles][tiles_dq]Accumulator = @splat(@splat(@splat(0)));
+            inline for (a, 0..) |fragment, k_step| {
+                transposedGemm(
+                    &dq,
+                    tiles_dq,
+                    fragment,
+                    operands.query_gradient,
+                    Storage.kTile(),
+                    k_step,
+                    0,
+                );
+            }
+            const row = step.block_info.first_row + warp_m * 16 * row_tiles + lane / 4;
             const seqlen_q = work.sequence.seqlen_q;
-            const origin =
-                work.batch * params.dq_accum_batch_stride + step.head * params.dq_accum_head_stride;
+            const first_column = warp_d * tiles_dq * 8;
+            const padded = head_dim != tiling.headDimPadded();
             const base: [*]addrspace(.global) f32 = @ptrFromInt(params.dq_accum);
-            const row_index =
-                origin + @as(u64, work.sequence.offset_q) * params.dq_accum_row_stride;
-            inline for (dq, 0..) |fragment, tile_index| {
-                const tile: u32 = tile_index;
-                const first_column = (warp_d * tiles_dq + tile) * 8;
-                if (first_column < head_dim) {
-                    if (vector_reductions) {
-                        const odd = lane % 2 == 1;
-                        const sent_low = if (odd) fragment[0] else fragment[2];
-                        const sent_high = if (odd) fragment[1] else fragment[3];
-                        const clamp: nvptx.ShuffleClamp = .{ .clamp = 31, .segment_mask = 0 };
-                        const received_low = nvptx.shflSync(.bfly, f32, sent_low, 1, clamp, .all);
-                        const received_high = nvptx.shflSync(.bfly, f32, sent_high, 1, clamp, .all);
-                        const values: Accumulator = if (odd)
-                            .{ received_low, received_high, fragment[2], fragment[3] }
-                        else
-                            .{ fragment[0], fragment[1], received_low, received_high };
-                        const r = row + if (odd) @as(u32, 8) else 0;
-                        if (r < seqlen_q) {
-                            const column = first_column + (lane % 4 & 2) * 2;
-                            fragments.reduceAdd(&base[
-                                row_index + @as(u64, r) * params.dq_accum_row_stride + column
-                            ], values);
-                        }
-                    } else {
-                        const column = first_column + lane % 4 * 2;
-                        inline for (.{ 0, 1 }) |half| {
-                            const r = row + half * 8;
-                            if (r < seqlen_q) {
-                                const index =
-                                    row_index + @as(u64, r) * params.dq_accum_row_stride + column;
-                                nvptx.red(.gpu, .monotonic, .add, &base[index], fragment[half * 2]);
-                                nvptx.red(
-                                    .gpu,
-                                    .monotonic,
-                                    .add,
-                                    &base[index + 1],
-                                    fragment[half * 2 + 1],
-                                );
-                            }
-                        }
+            const dq_head = base + step.head * params.dq_accum_head_stride;
+            const stride = params.dq_accum_row_stride;
+            const dq_rows = dq_head + work.batch * params.dq_accum_batch_stride +
+                @as(u64, work.sequence.offset_q) * stride;
+            const odd = lane % 2 == 1;
+            const clamp: nvptx.ShuffleClamp = .{ .clamp = 31, .segment_mask = 0 };
+            var values: [tiles_dq]Accumulator = undefined;
+            inline for (&values, dq[0]) |*value, fragment| {
+                const sent_low = if (odd) fragment[0] else fragment[2];
+                const sent_high = if (odd) fragment[1] else fragment[3];
+                const received_low = nvptx.shflSync(.bfly, f32, sent_low, 1, clamp, .all);
+                const received_high = nvptx.shflSync(.bfly, f32, sent_high, 1, clamp, .all);
+                value.* = if (odd)
+                    .{ received_low, received_high, fragment[2], fragment[3] }
+                else
+                    .{ fragment[0], fragment[1], received_low, received_high };
+            }
+            const r = row + if (odd) @as(u32, 8) else 0;
+            if (r < seqlen_q) {
+                const dq_row = dq_rows + @as(u64, r) * stride + first_column + (lane % 4 & 2) * 2;
+                inline for (values, 0..) |value, tile| {
+                    if (!padded or first_column + tile * 8 < head_dim) {
+                        fragments.reduceAdd(&dq_row[tile * 8], value);
                     }
                 }
             }
@@ -663,16 +869,52 @@ pub fn FlashAttnBwdSm80(
             const scale: Accumulator = @splat(params.softmax_scale);
             const dk: [*]addrspace(.global) f32 = @ptrFromInt(params.dk);
             const dv: [*]addrspace(.global) f32 = @ptrFromInt(params.dv);
+            if (fragment_ordered_dq_accum) {
+                const decode_again = Storage.Load.schedule.decode_work_twice;
+                const decoded = if (decode_again) decodeWork(params).? else work.*;
+                const final_work = &decoded;
+                const group_row = final_work.sequence.offset_k + final_work.first_key +
+                    warp_n * row_tiles * 16 + lane / 4 +
+                    if (params.cu_seqlens_k == 0) final_work.batch * params.seqlen_k else 0;
+                const lane_offset = @as(u64, group_row - group_row % 8) * head_dim +
+                    (group_row % 8 * 4 + lane % 4 + warp_d * tiles_kv * 64);
+                const dk_row = dk + final_work.kv_head * params.dk_head_stride + lane_offset;
+                const dv_row = dv + final_work.kv_head * params.dv_head_stride + lane_offset;
+                inline for (0..row_tiles * tiles_kv) |index| {
+                    const row_tile: u32 = index / tiles_kv;
+                    const tile_index = index % tiles_kv;
+                    const column = (warp_d * tiles_kv + @as(u32, tile_index)) * 8;
+                    const dk_scaled = accumulators.dk[row_tile][tile_index] * scale;
+                    const dv_values = accumulators.dv[row_tile][tile_index];
+                    inline for (.{ 0, 1 }) |half| {
+                        const offset = row_tile * 16 + half * 8;
+                        const row = warp_n * row_tiles * 16 + lane / 4 + offset;
+                        if (row < final_work.key_count and column < head_dim) {
+                            inline for (0..2) |parity| {
+                                const element = offset * head_dim + tile_index * 64 + parity * 32;
+                                const value = half * 2 + parity;
+                                const dk_value = dk_scaled[value];
+                                const dv_value = dv_values[value];
+                                nvptx.red(.gpu, .monotonic, .add, &dk_row[element], dk_value);
+                                nvptx.red(.gpu, .monotonic, .add, &dv_row[element], dv_value);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             const dk_origin =
                 work.batch * params.dk_batch_stride + work.kv_head * params.dk_head_stride;
             const dv_origin =
                 work.batch * params.dv_batch_stride + work.kv_head * params.dv_head_stride;
-            inline for (0..tiles_kv) |tile_index| {
+            inline for (0..row_tiles * tiles_kv) |index| {
+                const row_tile: u32 = index / tiles_kv;
+                const tile_index = index % tiles_kv;
                 const column = (warp_d * tiles_kv + @as(u32, tile_index)) * 8 + lane % 4 * 2;
-                const dk_scaled = accumulators.dk[tile_index] * scale;
-                const dv_values = accumulators.dv[tile_index];
+                const dk_scaled = accumulators.dk[row_tile][tile_index] * scale;
+                const dv_values = accumulators.dv[row_tile][tile_index];
                 inline for (.{ 0, 1 }) |half| {
-                    const row = warp_n * 16 + lane / 4 + half * 8;
+                    const row = (warp_n * row_tiles + row_tile) * 16 + lane / 4 + half * 8;
                     if (row < work.key_count and column < head_dim) {
                         const key_row = work.sequence.offset_k + work.first_key + row;
                         reducePair(&dk[dk_origin + key_row * params.dk_row_stride + column], .{
@@ -727,11 +969,14 @@ pub fn FlashAttnBwdSm80(
             const sequence = work.sequence;
             const scale: Accumulator = @splat(params.softmax_scale);
             nvptx.barrierSyncAligned(.work_group, null);
-            inline for (0..tiles_kv) |tile_index| {
+            inline for (0..row_tiles * tiles_kv) |index| {
+                const row_tile: u32 = index / tiles_kv;
+                const tile_index = index % tiles_kv;
                 const chunk_column = warp_d * tiles_kv + @as(u32, tile_index);
-                const dk_scaled = accumulators.dk[tile_index] * scale;
+                const dk_scaled = accumulators.dk[row_tile][tile_index] * scale;
+                const dv_values = accumulators.dv[row_tile][tile_index];
                 inline for (.{ 0, 1 }) |half| {
-                    const staged_row = warp_n * 16 + lane_row + half * 8;
+                    const staged_row = (warp_n * row_tiles + row_tile) * 16 + lane_row + half * 8;
                     const dk_words: [*]addrspace(.shared) u32 =
                         @ptrCast(Rows.chunk(Storage.kTile(), staged_row, chunk_column, lane_row));
                     const dv_words: [*]addrspace(.shared) u32 =
@@ -739,10 +984,9 @@ pub fn FlashAttnBwdSm80(
                     dk_words[lane % 4] = @backingInt(
                         nvptx.Bf16x2.fromF32(dk_scaled[half * 2], dk_scaled[half * 2 + 1]),
                     );
-                    dv_words[lane % 4] = @backingInt(nvptx.Bf16x2.fromF32(
-                        accumulators.dv[tile_index][half * 2],
-                        accumulators.dv[tile_index][half * 2 + 1],
-                    ));
+                    dv_words[lane % 4] = @backingInt(
+                        nvptx.Bf16x2.fromF32(dv_values[half * 2], dv_values[half * 2 + 1]),
+                    );
                 }
             }
             nvptx.barWarpSync(.all);
@@ -760,10 +1004,10 @@ pub fn FlashAttnBwdSm80(
                 .params = params,
                 .offset_k = sequence.offset_k,
                 .work = work,
-                .warp_row = warp_n * 16,
+                .warp_row = warp_n * 16 * row_tiles,
                 .warp_column = warp_d * tiles_kv,
             };
-            smem.copyStagedRows(16, tiles_kv, 32, lane, copier);
+            smem.copyStagedRows(16 * row_tiles, tiles_kv, 32, lane, copier);
         }
 
         pub const Kernel = FlashAttnBwdSm80Kernel(@This());
@@ -773,12 +1017,16 @@ pub fn FlashAttnBwdSm80(
 const variant =
     configurations.backwardSm80Variant(config.head_dim, @field(configurations.Mode, config.mode)).?;
 const backward_tiling = variant.tiling;
-const Backward =
-    FlashAttnBwdSm80(backward_tiling, variant.specialization, SharedStorage(backward_tiling));
+const Backward = FlashAttnBwdSm80(
+    backward_tiling,
+    variant.specialization,
+    SharedStorage(backward_tiling, .init(config.head_dim, @field(configurations.Mode, config.mode))),
+);
 const flash_bwd_preprocess = @import("flash_bwd_preprocess.zig");
 const flash_bwd_postprocess = @import("flash_bwd_postprocess.zig");
 const auxiliary: flash_bwd_preprocess.Options = .{
     .varlen_as_one_sequence = variant.specialization.scheduler_metadata,
+    .fragment_ordered_dq_accum = fragment_ordered_dq_accum,
 };
 
 const Entry = entry.Entry(BackwardParams, Backward.Args, .{

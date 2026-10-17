@@ -197,7 +197,11 @@ pub fn launch(comptime source: Source, head_dim: u32, mode: Mode) ?Launch {
     var masks = limits.masks.iterator();
     while (masks.next()) |mask| result.masks |= @as(u32, 1) << @backingInt(mask);
     switch (source) {
-        .flash_fwd_sm80, .flash_bwd_sm80 => {},
+        .flash_fwd_sm80 => {},
+        .flash_bwd_sm80 => {
+            const schedule = @import("Sm80BwdSchedule.zig").init(head_dim, mode);
+            result.shared_bytes = schedule.sharedBytes(tile);
+        },
         .flash_fwd_sm120, .flash_bwd_sm120 => {
             const pitch = tile.rowPitchChunks();
             const swizzle = swizzleBytes(pitch);
@@ -270,8 +274,14 @@ pub fn maxRegistersPerThread(thread_count: u32) u32 {
     return registers_per_cta / thread_count / 8 * 8;
 }
 
+/// Returns the XOR swizzle of a shared memory row layout that `cp.async` fills. Rows of 4 chunks
+/// stay unswizzled and get padded instead.
+pub fn rowSwizzleBytes(row_chunks: u32) u32 {
+    return if (row_chunks % 8 == 0) 128 else if (row_chunks % 4 == 0 and row_chunks > 4) 64 else 0;
+}
+
 pub fn pitchChunks(row_chunks: u32) u32 {
-    return if (swizzleBytes(row_chunks) == 128 or row_chunks % 2 == 1) row_chunks else row_chunks +
+    return if (rowSwizzleBytes(row_chunks) != 0 or row_chunks % 2 == 1) row_chunks else row_chunks +
         1;
 }
 
@@ -314,6 +324,9 @@ pub const Sm80FwdTiling = struct {
     stages: u32,
     prefetch_stages: u32,
     q_in_regs: bool,
+    /// Holds only this many 16-column steps of the query in registers. The kernel loads them
+    /// from global memory, and the query tile in shared memory keeps the remaining columns.
+    q_register_steps: ?u32 = null,
     tma: bool = false,
     max_registers: ?u32 = null,
     mma_m_per_warp: u32 = 1,
@@ -343,15 +356,22 @@ pub const Sm80FwdTiling = struct {
     }
 
     pub fn shareQvSmem(tiling: Sm80FwdTiling) bool {
-        return tiling.q_in_regs and tiling.block_m <= 2 * tiling.block_n;
+        return tiling.q_in_regs and tiling.stages > 1 and tiling.block_m <= 2 * tiling.block_n;
     }
 
     pub fn tileBytes(tiling: Sm80FwdTiling, rows: u32) u32 {
         return rows * tiling.rowPitchChunks() * chunk_bytes;
     }
 
+    /// Returns the number of chunks per row of the query tile in shared memory.
+    pub fn queryChunks(tiling: Sm80FwdTiling) u32 {
+        const steps = tiling.q_register_steps orelse return tiling.rowChunks();
+        return tiling.rowChunks() - 2 * steps;
+    }
+
     pub fn queryBytes(tiling: Sm80FwdTiling) u32 {
-        return tiling.tileBytes(tiling.block_m);
+        if (tiling.q_register_steps == null) return tiling.tileBytes(tiling.block_m);
+        return tiling.block_m * pitchChunks(tiling.queryChunks()) * chunk_bytes;
     }
 
     pub fn sharedBytes(tiling: Sm80FwdTiling) u32 {
@@ -461,20 +481,38 @@ pub fn forwardSm80Limited1(head_dim: u32) ?Sm80FwdTiling {
 fn forwardSm80Regular(head_dim: u32) Sm80FwdTiling {
     var tiling = forwardSm80(head_dim);
     if (head_dim == 96) {
-        tiling.block_n = 48;
+        tiling.block_n = 64;
         tiling.stages = 1;
         tiling.q_in_regs = false;
         tiling.mma_m_per_warp = 2;
         tiling.separate_v_empty = true;
     }
+    if (head_dim == 256) {
+        tiling.block_m = 64;
+        tiling.block_n = 64;
+        tiling.stages = 1;
+        tiling.q_in_regs = false;
+        tiling.separate_v_empty = true;
+    }
+    return tiling;
+}
+
+/// Returns the tiling for dense and causal attention over short sequences. Rows of 64 queries waste
+/// less of the causal triangle, and two CTAs of 4 warps fit on an SM.
+fn forwardSm80Short(head_dim: u32) Sm80FwdTiling {
+    var tiling = forwardSm80(head_dim);
+    tiling.block_m = 64;
+    tiling.block_n = 64;
+    tiling.stages = 1;
+    tiling.q_in_regs = true;
+    tiling.separate_v_empty = true;
     return tiling;
 }
 
 pub fn forwardSm80Variant(head_dim: u32, mode: Mode) ?Variant(Sm80FwdTiling) {
     const tiling = switch (mode.tier()) {
         .limited_1 => forwardSm80Limited1(head_dim) orelse return null,
-        .limited_2 => switch (mode) {
-            .limited_2 => if (head_dim == 96) forwardSm80(head_dim) else return null,
+        .limited_2 => if (head_dim == 128) forwardSm80Short(head_dim) else switch (mode) {
             .varlen_limited_2 => switch (head_dim) {
                 72 => batch_major: {
                     var tiling = forwardSm80(head_dim);
@@ -497,7 +535,11 @@ pub fn forwardSm80Variant(head_dim: u32, mode: Mode) ?Variant(Sm80FwdTiling) {
             .limited_1_limits = limited_1_limits,
             .limited_2_limits = .{ .max_seqlen_q = 1024 },
         }) orelse return null;
-    if (mode == .limited_2) variant.specialization.limits.max_window_size = 8192;
+    if (mode.tier() == .limited_2 and head_dim == 128) {
+        variant.specialization.limits.masks = .initMany(&.{ .causal, .dense });
+        variant.specialization.limits.max_seqlen_k = 2048;
+        if (mode == .varlen_limited_2) variant.specialization.limits.max_seqlen_q = 2048;
+    }
     if (mode == .varlen_limited_2 and forwardSm80Limited1(head_dim) != null) {
         variant.specialization.limits.min_seqlen_q = limited_1_limits.max_seqlen_q + 1;
     }
@@ -510,6 +552,12 @@ pub const Sm80BwdTiling = struct {
     block_n: u32,
     warps: u32,
     stages: u32,
+    /// Holds the value operand of the dP GEMM in registers for the whole CTA.
+    v_in_regs: bool = false,
+    /// Sets the number of 16-row tiles of the S and dP GEMMs that one warp computes.
+    score_row_tiles: u32 = 1,
+    /// Sets the number of 16-row tiles of the dK, dV and dQ GEMMs that one warp computes.
+    gradient_row_tiles: u32 = 1,
     tma: bool = false,
     bulk_reduce: bool = false,
     p_first: bool = false,
@@ -540,25 +588,46 @@ pub const Sm80BwdTiling = struct {
         return rows * tiling.rowPitchChunks() * Sm80FwdTiling.chunk_bytes;
     }
 
+    /// Names the shared memory that the value tile occupies. When the warps hold the values in
+    /// registers, they copy the values before anything else writes that memory.
+    pub const ValueTile = enum { own, last_query_stage, shared_with_pds };
+
+    pub fn valueTile(tiling: Sm80BwdTiling) ValueTile {
+        if (!tiling.v_in_regs) return .own;
+        if (tiling.stages > 1 and tiling.block_n <= tiling.block_m) return .last_query_stage;
+        return .shared_with_pds;
+    }
+
+    pub fn pdsBytes(tiling: Sm80BwdTiling) u32 {
+        return 2 * tiling.block_m *
+            pitchChunks(tiling.block_n / Sm80FwdTiling.chunk_elements) * Sm80FwdTiling.chunk_bytes;
+    }
+
     pub fn dqAccumBoxColumns(tiling: Sm80BwdTiling) u32 {
         const warp_columns = tiling.headDimPadded() * (tiling.block_m / 16) / tiling.warps;
         return if (warp_columns % 32 == 0) 32 else 16;
     }
 
     pub fn sharedBytes(tiling: Sm80BwdTiling) u32 {
-        const pds_bytes = 2 * tiling.block_m *
-            pitchChunks(tiling.block_n / Sm80FwdTiling.chunk_elements) * Sm80FwdTiling.chunk_bytes;
+        const pds_bytes = tiling.pdsBytes();
         const dq_accum_staging = if (tiling.bulk_reduce)
             tiling.warps * dq_accum_box_rows * tiling.dqAccumBoxColumns() * @sizeOf(f32)
         else
             0;
-        return 2 * tiling.tileBytes(tiling.block_n) +
+        const value_bytes = tiling.tileBytes(tiling.block_n);
+        const values_and_pds = switch (tiling.valueTile()) {
+            .own => value_bytes + pds_bytes,
+            .last_query_stage => pds_bytes,
+            .shared_with_pds => @max(value_bytes, pds_bytes),
+        };
+        return tiling.tileBytes(tiling.block_n) +
             tiling.stages * 2 * tiling.tileBytes(tiling.block_m) +
-            pds_bytes + dq_accum_staging;
+            values_and_pds + dq_accum_staging;
     }
 };
 
-pub fn backwardSm80(head_dim: u32) Sm80BwdTiling {
+/// Returns the tile shape that the SM80 and SM120 backward tilings start from.
+fn backwardTiling(head_dim: u32) Sm80BwdTiling {
     return switch (head_dim) {
         64 => .{ .head_dim = 64, .block_m = 64, .block_n = 128, .warps = 8, .stages = 2 },
         72 => .{ .head_dim = 72, .block_m = 64, .block_n = 64, .warps = 8, .stages = 2 },
@@ -567,6 +636,44 @@ pub fn backwardSm80(head_dim: u32) Sm80BwdTiling {
         256 => .{ .head_dim = 256, .block_m = 32, .block_n = 32, .warps = 4, .stages = 1 },
         else => @panic("unsupported head dimension"),
     };
+}
+
+pub fn backwardSm80(head_dim: u32) Sm80BwdTiling {
+    var tiling = backwardTiling(head_dim);
+    switch (head_dim) {
+        64 => {
+            tiling.p_first = true;
+            tiling.alternate_gradient_order = true;
+            tiling.gradient_row_tiles = 2;
+        },
+        72 => {
+            tiling.block_n = 128;
+            tiling.v_in_regs = true;
+            tiling.score_row_tiles = 2;
+            tiling.alternate_gradient_order = true;
+        },
+        96 => {
+            tiling.block_n = 128;
+            tiling.v_in_regs = true;
+            tiling.score_row_tiles = 2;
+            tiling.p_first = true;
+            tiling.gradient_row_tiles = 2;
+        },
+        128 => {
+            tiling.stages = 2;
+            tiling.v_in_regs = true;
+            tiling.alternate_gradient_order = true;
+            tiling.p_first = true;
+        },
+        256 => {
+            tiling.block_m = 64;
+            tiling.warps = 8;
+            tiling.v_in_regs = true;
+            tiling.gradient_row_tiles = 2;
+        },
+        else => {},
+    }
+    return tiling;
 }
 
 pub fn backwardSm80Limited1(head_dim: u32) ?Sm80BwdTiling {
@@ -604,7 +711,7 @@ fn withTensorMaps(sm80_tiling: Sm80BwdTiling) Sm80BwdTiling {
 }
 
 pub fn backwardSm120(head_dim: u32) Sm80BwdTiling {
-    var tiling = withTensorMaps(backwardSm80(head_dim));
+    var tiling = withTensorMaps(backwardTiling(head_dim));
     if (head_dim == 96) tiling.stages = 2;
     if (head_dim == 72) tiling.batch_major = true;
     return tiling;

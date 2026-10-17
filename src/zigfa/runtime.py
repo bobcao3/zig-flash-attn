@@ -153,11 +153,17 @@ def verify_parameters(kernel, signature):
         raise RuntimeError(f"kernel parameter sizes {sizes} do not match launch signature {signature!r}")
 
 
+@functools.cache
+def stream_from_handle(handle):
+    # Each Stream.from_handle builds a new wrapper class, which only the cycle collector frees.
+    return Stream.from_handle(handle)
+
+
 def stream_of(stream):
     if stream is None:
         return current_device().default_stream
     if isinstance(stream, int):
-        return Stream.from_handle(stream)
+        return stream_from_handle(stream)
     return current_device().create_stream(stream)
 
 

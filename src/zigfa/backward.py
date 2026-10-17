@@ -31,8 +31,20 @@ AUXILIARY_THREADS = 256
 
 
 ACCUMULATOR_PADDING_ROWS = 128
+# The SM80 query gradient accumulator starts each sequence of a varlen batch at a multiple of 8 rows,
+# which takes up to 8 more rows per sequence.
+SM80_SEQUENCE_ROW_ALIGNMENT = 8
 HEAD_SPLITS = 4
 HEAD_SPLIT_MINIMUM_GROUP = 16
+# The shortest sequences from which an SM80 head split pays, by head dimension, without and with a
+# causal mask.
+SM80_HEAD_SPLIT_MINIMUM_SEQLEN = {
+    64: (2048, 2048),
+    72: (1024, 1024),
+    96: (4096, 2048),
+    128: (2048, 2048),
+    256: (1024, 2048),
+}
 HEAD_SPLIT_EFFICIENCY = 0.92
 WAVE_SPLIT_TRIGGER_EFFICIENCY = 0.85
 WAVE_SPLIT_TARGET_EFFICIENCY = 0.9
@@ -60,10 +72,12 @@ def backward_workspace_layout(
 ):
     facts = specialization.facts(q_shape, k_shape, cu_seqlens_shape, max_seqlen_q, max_seqlen_k)
     infos = specialization.reachable(device_id, "bwd", q_shape[-1], facts)
+    aligned = cu_seqlens_shape is not None and any(info.arch == 80 for info in infos)
+    alignment_rows = SM80_SEQUENCE_ROW_ALIGNMENT * facts.batch_size if aligned else 0
     return BackwardWorkspace(
         facts,
         max(max(info.block_m, info.dq_block_m) for info in infos),
-        max(ACCUMULATOR_PADDING_ROWS, *(info.block_m for info in infos)),
+        max(ACCUMULATOR_PADDING_ROWS, *(info.block_m for info in infos)) + alignment_rows,
         k_shape is not None
         and any(
             info.head_split and head_split_pays(device_id, info, q_shape, k_shape, window_size_left, window_size_right)
@@ -166,9 +180,29 @@ def two_cta_head_splits(device_id, info, q_shape, k_shape, window_size_left, win
     return num_qhead_splits
 
 
+def sm80_head_split_pays(q_shape, k_shape, window_size_left, window_size_right):
+    # A split adds dK and dV reductions that grow with the sequence length, and it shortens the
+    # longest CTA, whose work grows with the square of the sequence length.
+    if len(q_shape) != 4 or window_size_left >= 0 or window_size_right > 0:
+        return False
+    _, seqlen_q, num_head, head_dim = q_shape
+    seqlen_k, num_head_kv = k_shape[1], k_shape[2]
+    qhead_per_kvhead = num_head // num_head_kv
+    if head_dim not in SM80_HEAD_SPLIT_MINIMUM_SEQLEN:
+        return False
+    dense_minimum, causal_minimum = SM80_HEAD_SPLIT_MINIMUM_SEQLEN[head_dim]
+    minimum_seqlen = causal_minimum if window_size_right == 0 else dense_minimum
+    return (
+        qhead_per_kvhead >= HEAD_SPLITS and qhead_per_kvhead % HEAD_SPLITS == 0 and seqlen_q == seqlen_k
+        and seqlen_k >= minimum_seqlen
+    )
+
+
 def head_split_pays(device_id, info, q_shape, k_shape, window_size_left, window_size_right):
     if info.cluster_ctas:
         return two_cta_head_splits(device_id, info, q_shape, k_shape, window_size_left, window_size_right) > 1
+    if info.arch == 80 and sm80_head_split_pays(q_shape, k_shape, window_size_left, window_size_right):
+        return True
     if len(q_shape) != 4 or window_size_left >= 0 or window_size_right != 0:
         return False
     batch_size, seqlen_q, num_head, _ = q_shape
