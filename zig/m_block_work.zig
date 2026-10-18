@@ -1,13 +1,16 @@
+const std = @import("std");
 const ForwardParams = @import("ForwardParams.zig");
 const SeqlenInfoQK = @import("SeqlenInfoQK.zig");
 const BlockInfo = @import("BlockInfo.zig");
 const ColLimits = BlockInfo.ColLimits;
 const tile_scheduler = @import("tile_scheduler.zig");
+const inter_sequence = @import("inter_sequence.zig");
 
 pub const Options = struct {
     bottom_aligned: bool = false,
     pack_gqa: bool = false,
     divmod_pack: bool = false,
+    inter_sequence: bool = false,
 };
 
 pub const PackGqa = PackGqaWith(u32);
@@ -35,6 +38,10 @@ fn PackGqaWith(comptime Divisor: type) type {
 pub fn MBlockWork(comptime block_m: u32, comptime block_n: u32, comptime options: Options) type {
     const PackGqaRows =
         if (!options.pack_gqa) void else if (options.divmod_pack) PackGqaDivmod else PackGqa;
+    comptime {
+        if (options.inter_sequence and (options.pack_gqa or options.bottom_aligned))
+            @compileError("the runs of keys need unpacked rows that start at the top");
+    }
 
     return struct {
         batch: u32,
@@ -97,6 +104,66 @@ pub fn MBlockWork(comptime block_m: u32, comptime block_n: u32, comptime options
                 .first_row = first_row,
                 .pack_gqa = pack_gqa,
             };
+        }
+
+        pub fn takeOnlyRun(work: *Work, params: ForwardParams) bool {
+            comptime std.debug.assert(options.inter_sequence);
+            const entries: [*]addrspace(.global) const inter_sequence.RunEntry =
+                @ptrFromInt(params.run_table);
+            const entry = entries[work.batch];
+            if (entry.key_count == inter_sequence.several_runs) return false;
+            work.setRun(entry.first_key, entry.key_count, entry.window);
+            return true;
+        }
+
+        fn setRun(work: *Work, first_key: u32, key_count: u32, window: inter_sequence.Window) void {
+            work.sequence.offset_k = first_key;
+            work.sequence.seqlen_k = key_count;
+            work.block_info.seqlen_k = key_count;
+            work.block_info.window_size_left = window.left;
+            work.block_info.window_size_right = window.right;
+            work.n_block_min, work.n_block_max = work.block_info.nBlockMinMax(block_n);
+            work.col_limit_bounds = work.block_info.colLimitBounds();
+        }
+
+        pub fn firstRun(work: *Work, params: ForwardParams) void {
+            if (!work.findRun(params, 0)) {
+                work.n_block_min = 0;
+                work.n_block_max = 0;
+            }
+        }
+
+        pub fn nextRun(work: *Work, params: ForwardParams) bool {
+            const cu_seqlens_k: [*]addrspace(.global) const i32 = @ptrFromInt(params.cu_seqlens_k);
+            const end_key = work.sequence.offset_k + work.sequence.seqlen_k;
+            return work.findRun(params, inter_sequence.lastBoundaryAtOrBefore(
+                cu_seqlens_k,
+                params.num_batch,
+                end_key,
+            ));
+        }
+
+        fn findRun(work: *Work, params: ForwardParams, from: u32) bool {
+            comptime std.debug.assert(options.inter_sequence);
+            const cu_seqlens_k: [*]addrspace(.global) const i32 = @ptrFromInt(params.cu_seqlens_k);
+            const runs: inter_sequence.Runs = .init(
+                params.visibility_bits,
+                params.window_sizes,
+                .{ .left = params.window_size_left, .right = params.window_size_right },
+                @ptrFromInt(params.cu_seqlens_q),
+                cu_seqlens_k,
+                params.num_batch,
+                work.batch,
+            );
+            var next_sequence = from;
+            while (runs.next(next_sequence)) |run| {
+                next_sequence = run.end;
+                const first_key: u32 = @intCast(cu_seqlens_k[run.first]);
+                const key_count = @as(u32, @intCast(cu_seqlens_k[run.end])) - first_key;
+                work.setRun(first_key, key_count, runs.windowOf(run));
+                if (work.n_block_max > work.n_block_min) return true;
+            }
+            return false;
         }
 
         pub fn needsMask(work: *const Work, n_block: u32) bool {

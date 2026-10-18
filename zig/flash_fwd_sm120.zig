@@ -7,8 +7,7 @@ const sm80 = @import("flash_fwd_sm80.zig");
 const entry = @import("entry.zig");
 const ForwardParams = @import("ForwardParams.zig");
 
-const variant =
-    configurations.forwardSm120Variant(config.head_dim, @field(configurations.Mode, config.mode)).?;
+const variant = configurations.variants(.flash_fwd_sm120, config.head_dim)[config.variant];
 const forward_tiling = variant.tiling;
 const Forward = sm80.FlashAttnFwdSm80(
     forward_tiling,

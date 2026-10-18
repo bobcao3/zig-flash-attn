@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from shapes import HEAD_DIM
-from zigfa import runtime, specialization
+from zigfa import runtime
 from zigfa.tensors import build_scheduler_metadata, varlen_blocks, view_of
 
 SCHEDULER_METADATA_KERNELS = {"forward": ("fwd", "flash_attn_fwd"), "backward": ("bwd", "flash_attn_bwd")}
@@ -31,8 +31,8 @@ def scheduler_metadata_lengths(kind, batch, block_m, generator):
 @pytest.mark.parametrize("kind", SCHEDULER_METADATA_LENGTHS)
 def test_scheduler_metadata_lists_every_block_once(kernel, batch, kind):
     direction, kernel_name = SCHEDULER_METADATA_KERNELS[kernel]
-    mode = specialization.Mode.VARLEN.value
-    _, info = runtime.load(direction, HEAD_DIM, kernel_name, mode)
+    variant = "_varlen"
+    _, info = runtime.load(direction, HEAD_DIM, kernel_name, variant)
     assert info.scheduler_metadata
     block_m = info.cluster_block_m if direction == "fwd" else (info.cluster_ctas or 1) * info.block_n
     generator = torch.Generator().manual_seed(batch * 7 + len(kind))
@@ -46,7 +46,7 @@ def test_scheduler_metadata_lists_every_block_once(kernel, batch, kind):
     num_block = varlen_blocks(int(lengths.sum()), batch, block_m)
     table = torch.full((max(num_block, 1), 2), -1, dtype=torch.int32, device="cuda")
     build_scheduler_metadata(
-        table, direction, HEAD_DIM, mode, kernel_name, view_of(cu_seqlens).pointer, view_of(cu_seqlens_other).pointer,
+        table, direction, HEAD_DIM, variant, kernel_name, view_of(cu_seqlens).pointer, view_of(cu_seqlens_other).pointer,
         batch, num_block, "the test", torch.cuda.current_stream().cuda_stream,
     )
     torch.cuda.synchronize()

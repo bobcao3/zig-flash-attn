@@ -19,7 +19,7 @@ def zig_arguments():
         ("sm", "ZIGFA_SM"),
         ("source", "ZIGFA_SOURCE"),
         ("head-dim", "ZIGFA_HEAD_DIM"),
-        ("mode", "ZIGFA_MODE"),
+        ("variant", "ZIGFA_VARIANT"),
     ):
         for value in filter(None, os.environ.get(variable, "").split(",")):
             arguments.append(f"-D{option}={value}")

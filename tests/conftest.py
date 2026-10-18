@@ -4,14 +4,14 @@ import torch
 import checks
 from shapes import HEAD_DIMS
 from zigfa import specialization
-from zigfa.backward import backward_mode, backward_workspace_layout
-from zigfa.forward import forward_mode, forward_workspace_layout
+from zigfa.backward import backward_variant, backward_workspace_layout
+from zigfa.forward import forward_variant, forward_workspace_layout
 
 SELECTION_CACHES = (
     forward_workspace_layout,
-    forward_mode,
+    forward_variant,
     backward_workspace_layout,
-    backward_mode,
+    backward_variant,
 )
 
 
@@ -48,8 +48,14 @@ def fresh_selection():
 
 @pytest.fixture
 def restrict_candidates(monkeypatch):
-    def restrict(modes):
-        monkeypatch.setattr(specialization, "candidates", lambda facts: modes)
+    candidates = specialization.candidates
+
+    def restrict(variants):
+        monkeypatch.setattr(
+            specialization,
+            "candidates",
+            lambda declared, facts: tuple(pair for pair in candidates(declared, facts) if pair[0] in variants),
+        )
         clear_selection()
 
     return restrict

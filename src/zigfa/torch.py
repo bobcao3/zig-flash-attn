@@ -1,8 +1,9 @@
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 from cuda.core import Device
 
+from . import inter_sequence
 from .backward import backward_workspace_shapes
 from .backward import backward as launch_backward
 from .forward import forward_workspace_shapes
@@ -821,8 +822,460 @@ def flash_attn_varlen_kvpacked_func(
     )
 
 
+class InterSequenceSchedulerMetadata(NamedTuple):
+
+    visibility_bits_t: torch.Tensor
+    cu_visible_k: torch.Tensor
+    cu_visible_q: torch.Tensor
+
+
+def require_int32(name, tensor, shape):
+    if tensor.dtype != torch.int32 or tuple(tensor.shape) != tuple(shape) or not tensor.is_contiguous():
+        raise ValueError(
+            f"{name} must be a contiguous int32 tensor of shape {tuple(shape)}, "
+            f"got {tensor.dtype} {tuple(tensor.shape)}"
+        )
+
+
+def validate_inter_sequence_layout(cu_seqlens_q, cu_seqlens_k, visibility_bits, window_sizes=None):
+    require_cu_seqlens(cu_seqlens_q, cu_seqlens_k)
+    num_sequences = cu_seqlens_q.shape[0] - 1
+    if num_sequences < 1:
+        raise ValueError("cu_seqlens_q must describe at least one sequence")
+    require_int32("visibility_bits", visibility_bits, (num_sequences, inter_sequence.words_per_row(num_sequences)))
+    if window_sizes is not None:
+        require_int32("window_sizes", window_sizes, (2, num_sequences))
+    return num_sequences
+
+
+def allocate_inter_sequence_metadata(cu_seqlens_q):
+    shapes = inter_sequence.metadata_shapes(cu_seqlens_q.shape[0] - 1)
+    return tuple(cu_seqlens_q.new_empty(shape) for shape in shapes)
+
+
+@torch.library.custom_op("zigfa::inter_sequence_metadata", mutates_args=(), device_types="cuda")
+def inter_sequence_metadata(
+    cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor, visibility_bits: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    validate_inter_sequence_layout(cu_seqlens_q, cu_seqlens_k, visibility_bits)
+    bind_current_device(visibility_bits)
+    metadata = allocate_inter_sequence_metadata(cu_seqlens_q)
+    inter_sequence.prepare_metadata(
+        cu_seqlens_q, cu_seqlens_k, visibility_bits, *metadata, stream=current_stream_handle()
+    )
+    return metadata
+
+
+@inter_sequence_metadata.register_fake
+def inter_sequence_metadata_fake(cu_seqlens_q, cu_seqlens_k, visibility_bits):
+    return allocate_inter_sequence_metadata(cu_seqlens_q)
+
+
+def get_inter_sequence_scheduler_metadata(cu_seqlens_q, cu_seqlens_k, visibility_bits):
+    return InterSequenceSchedulerMetadata(*inter_sequence_metadata(cu_seqlens_q, cu_seqlens_k, visibility_bits))
+
+
+def inter_sequence_layout(
+    cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, window_sizes
+):
+    return inter_sequence.Sequences(
+        maybe_contiguous(cu_seqlens_q),
+        maybe_contiguous(cu_seqlens_k),
+        visibility_bits,
+        visibility_bits_t,
+        cu_visible_k,
+        cu_visible_q,
+        window_sizes,
+    )
+
+
+@torch.library.custom_op("zigfa::inter_sequence_forward", mutates_args=(), device_types="cuda")
+def inter_sequence_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    visibility_bits: torch.Tensor,
+    visibility_bits_t: torch.Tensor,
+    cu_visible_k: torch.Tensor,
+    cu_visible_q: torch.Tensor,
+    window_sizes: Optional[torch.Tensor],
+    softmax_scale: float,
+    window_size_left: int,
+    window_size_right: int,
+    max_seqlen_q: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    validate_attention_inputs(q, k, v, cu_seqlens_q, cu_seqlens_k)
+    num_sequences = validate_inter_sequence_layout(cu_seqlens_q, cu_seqlens_k, visibility_bits, window_sizes)
+    bind_current_device(q)
+    q, k, v = (clone_unless_kernel_ready(tensor) for tensor in (q, k, v))
+    out, softmax_lse = allocate_forward_outputs(q, True)
+    workspace = tuple(
+        torch.empty(shape, dtype=torch.int32, device=q.device)
+        for shape in inter_sequence.forward_workspace_shapes(tuple(q.shape), num_sequences)
+    )
+    inter_sequence.forward(
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        workspace,
+        inter_sequence_layout(
+            cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, window_sizes
+        ),
+        max_seqlen_q=max_seqlen_q,
+        softmax_scale=softmax_scale,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        stream=current_stream_handle(),
+    )
+    return out, softmax_lse
+
+
+@inter_sequence_forward.register_fake
+def inter_sequence_forward_fake(q, k, v, *unused):
+    return allocate_forward_outputs(q, True)
+
+
+def inter_sequence_backward_into(
+    dout,
+    q,
+    k,
+    v,
+    out,
+    softmax_lse,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    visibility_bits,
+    visibility_bits_t,
+    cu_visible_k,
+    cu_visible_q,
+    window_sizes,
+    softmax_scale,
+    window_size_left,
+    window_size_right,
+    dq,
+    dk,
+    dv,
+):
+    validate_attention_inputs(q, k, v, cu_seqlens_q, cu_seqlens_k)
+    validate_backward_operands(dout, q, k, v, out, softmax_lse, dq, dk, dv, True)
+    num_sequences = validate_inter_sequence_layout(cu_seqlens_q, cu_seqlens_k, visibility_bits, window_sizes)
+    bind_current_device(q)
+    dout, q, k, v, out = (clone_unless_kernel_ready(tensor) for tensor in (dout, q, k, v, out))
+    softmax_lse = softmax_lse.contiguous()
+    gradients = tuple(empty_unless_kernel_ready(tensor) for tensor in (dq, dk, dv))
+    *accumulators, table = inter_sequence.backward_workspace_shapes(
+        tuple(q.shape), tuple(softmax_lse.shape), tuple(k.shape), num_sequences
+    )
+    workspace = (
+        *(torch.empty(shape, dtype=torch.float32, device=q.device) for shape in accumulators),
+        torch.empty(table, dtype=torch.int32, device=q.device),
+    )
+    inter_sequence.backward(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        softmax_lse,
+        *gradients,
+        workspace,
+        inter_sequence_layout(
+            cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, window_sizes
+        ),
+        softmax_scale=softmax_scale,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        stream=current_stream_handle(),
+    )
+    for target, source in zip((dq, dk, dv), gradients):
+        if source is not target:
+            target.copy_(source)
+
+
+@torch.library.custom_op("zigfa::inter_sequence_backward", mutates_args=(), device_types="cuda")
+def inter_sequence_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    visibility_bits: torch.Tensor,
+    visibility_bits_t: torch.Tensor,
+    cu_visible_k: torch.Tensor,
+    cu_visible_q: torch.Tensor,
+    window_sizes: Optional[torch.Tensor],
+    softmax_scale: float,
+    window_size_left: int,
+    window_size_right: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    gradients = allocate_gradients(q, k, v)
+    inter_sequence_backward_into(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        visibility_bits,
+        visibility_bits_t,
+        cu_visible_k,
+        cu_visible_q,
+        window_sizes,
+        softmax_scale,
+        window_size_left,
+        window_size_right,
+        *gradients,
+    )
+    return gradients
+
+
+@inter_sequence_backward.register_fake
+def inter_sequence_backward_fake(dout, q, k, v, *unused):
+    return allocate_gradients(q, k, v)
+
+
+@torch.library.custom_op(
+    "zigfa::inter_sequence_backward_packed", mutates_args=("dq", "dpacked"), device_types="cuda"
+)
+def inter_sequence_backward_packed(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    visibility_bits: torch.Tensor,
+    visibility_bits_t: torch.Tensor,
+    cu_visible_k: torch.Tensor,
+    cu_visible_q: torch.Tensor,
+    window_sizes: Optional[torch.Tensor],
+    softmax_scale: float,
+    window_size_left: int,
+    window_size_right: int,
+    dq: torch.Tensor,
+    dpacked: torch.Tensor,
+) -> None:
+    inter_sequence_backward_into(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        visibility_bits,
+        visibility_bits_t,
+        cu_visible_k,
+        cu_visible_q,
+        window_sizes,
+        softmax_scale,
+        window_size_left,
+        window_size_right,
+        *packed_gradient_views(q, dq, dpacked),
+    )
+
+
+@inter_sequence_backward_packed.register_fake
+def inter_sequence_backward_packed_fake(*unused):
+    return None
+
+
+def inter_sequence_window(causal, window_size, window_sizes):
+    left, right = window_size
+    if window_sizes is not None and (causal or (left, right) != (-1, -1)):
+        raise ValueError("window_sizes cannot be combined with causal=True or a window_size")
+    return left, 0 if causal else right
+
+
+def run_inter_sequence_forward(
+    ctx,
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    visibility_bits,
+    softmax_scale,
+    causal,
+    window_size,
+    window_sizes,
+    scheduler_metadata,
+    deterministic,
+    return_softmax,
+):
+    reject_unsupported_options(deterministic=deterministic)
+    softmax_scale = default_softmax_scale(softmax_scale, q.shape[-1])
+    window = inter_sequence_window(causal, window_size, window_sizes)
+    if scheduler_metadata is None:
+        scheduler_metadata = get_inter_sequence_scheduler_metadata(cu_seqlens_q, cu_seqlens_k, visibility_bits)
+    layout = (cu_seqlens_q, cu_seqlens_k, visibility_bits, *scheduler_metadata, window_sizes)
+    out, softmax_lse = inter_sequence_forward(q, k, v, *layout, softmax_scale, *window, max_seqlen_q)
+    ctx.save_for_backward(q, k, v, out, softmax_lse, *layout)
+    ctx.softmax_scale = softmax_scale
+    ctx.window = window
+    if not return_softmax:
+        return out
+    ctx.mark_non_differentiable(softmax_lse)
+    return out, softmax_lse
+
+
+def inter_sequence_backward_arguments(ctx, dout):
+    return (dout, *ctx.saved_tensors, ctx.softmax_scale, *ctx.window)
+
+
+class FlashAttnInterSequenceFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        visibility_bits,
+        softmax_scale,
+        causal,
+        window_size=(-1, -1),
+        window_sizes=None,
+        scheduler_metadata=None,
+        deterministic=False,
+        return_softmax=False,
+    ):
+        return run_inter_sequence_forward(
+            ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, visibility_bits, softmax_scale, causal, window_size,
+            window_sizes, scheduler_metadata, deterministic, return_softmax,
+        )
+
+    @staticmethod
+    def backward(ctx, dout, *unused):
+        dq, dk, dv = inter_sequence_backward(*inter_sequence_backward_arguments(ctx, dout))
+        return pad_gradients(ctx, dq, dk, dv)
+
+
+class FlashAttnInterSequenceKVPackedFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        kv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        visibility_bits,
+        softmax_scale,
+        causal,
+        window_size=(-1, -1),
+        window_sizes=None,
+        scheduler_metadata=None,
+        deterministic=False,
+        return_softmax=False,
+    ):
+        k, v = kv.unbind(dim=-3)
+        return run_inter_sequence_forward(
+            ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, visibility_bits, softmax_scale, causal, window_size,
+            window_sizes, scheduler_metadata, deterministic, return_softmax,
+        )
+
+    @staticmethod
+    def backward(ctx, dout, *unused):
+        arguments = inter_sequence_backward_arguments(ctx, dout)
+        q, k = arguments[1], arguments[2]
+        dq = q.new_empty(q.shape)
+        dkv = k.new_empty(stacked_shape(k, 2))
+        inter_sequence_backward_packed(*arguments, dq, dkv)
+        return pad_gradients(ctx, dq, dkv)
+
+
+def flash_attn_inter_sequence_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    visibility_bits,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    window_sizes=None,
+    scheduler_metadata=None,
+    deterministic=False,
+    return_attn_probs=False,
+):
+    return FlashAttnInterSequenceFunc.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        visibility_bits,
+        softmax_scale,
+        causal,
+        window_size,
+        window_sizes,
+        scheduler_metadata,
+        deterministic,
+        return_attn_probs,
+    )
+
+
+def flash_attn_inter_sequence_kvpacked_func(
+    q,
+    kv,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    visibility_bits,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    window_sizes=None,
+    scheduler_metadata=None,
+    deterministic=False,
+    return_attn_probs=False,
+):
+    return FlashAttnInterSequenceKVPackedFunc.apply(
+        q,
+        kv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        visibility_bits,
+        softmax_scale,
+        causal,
+        window_size,
+        window_sizes,
+        scheduler_metadata,
+        deterministic,
+        return_attn_probs,
+    )
+
+
 __all__ = [
     "FlashAttnFunc",
+    "FlashAttnInterSequenceFunc",
+    "FlashAttnInterSequenceKVPackedFunc",
     "FlashAttnKVPackedFunc",
     "FlashAttnQKVPackedFunc",
     "FlashAttnVarlenFunc",
@@ -831,8 +1284,12 @@ __all__ = [
     "flash_attn_backward_packed",
     "flash_attn_forward",
     "flash_attn_func",
+    "flash_attn_inter_sequence_func",
+    "flash_attn_inter_sequence_kvpacked_func",
     "flash_attn_kvpacked_func",
     "flash_attn_qkvpacked_func",
     "flash_attn_varlen_func",
     "flash_attn_varlen_kvpacked_func",
+    "get_inter_sequence_scheduler_metadata",
+    "InterSequenceSchedulerMetadata",
 ]

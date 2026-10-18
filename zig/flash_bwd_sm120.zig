@@ -8,10 +8,7 @@ const sm80 = @import("flash_bwd_sm80.zig");
 const flash_bwd_preprocess = @import("flash_bwd_preprocess.zig");
 const flash_bwd_postprocess = @import("flash_bwd_postprocess.zig");
 
-const variant = configurations.backwardSm120Variant(
-    config.head_dim,
-    @field(configurations.Mode, config.mode),
-).?;
+const variant = configurations.variants(.flash_bwd_sm120, config.head_dim)[config.variant];
 const backward_tiling = variant.tiling;
 const Storage = tma.BackwardStorage(backward_tiling);
 const Backward = sm80.FlashAttnBwdSm80(backward_tiling, variant.specialization, Storage);

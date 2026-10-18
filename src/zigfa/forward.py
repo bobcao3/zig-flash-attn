@@ -40,18 +40,18 @@ def forward_workspace_layout(device_id, q_shape, k_shape, cu_seqlens_shape, max_
 
 
 @functools.cache
-def forward_mode(
+def forward_variant(
     device_id, q_shape, k_shape, cu_seqlens_shape, max_seqlen_q, max_seqlen_k, window=specialization.UNBOUNDED
 ):
     layout = forward_workspace_layout(device_id, q_shape, k_shape, cu_seqlens_shape, max_seqlen_q, max_seqlen_k)
-    mode = specialization.choose(
+    variant = specialization.choose(
         device_id, "fwd", q_shape[-1], layout.facts, rule=lambda info, facts: specialization.accepts(info, facts, window)
     )
     specialization.log_choice(
-        "forward", device_id, q_shape[-1], mode, q=q_shape, k=k_shape, window=window,
+        "forward", device_id, q_shape[-1], variant, q=q_shape, k=k_shape, window=window,
         cu_seqlens=cu_seqlens_shape, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
     )
-    return mode
+    return variant
 
 
 def forward_workspace_shapes(q_shape, *, k_shape=None, cu_seqlens_shape=None, max_seqlen_q=None, max_seqlen_k=None):
@@ -108,8 +108,8 @@ def forward(
         raise ValueError("pass the workspace that forward_workspace_shapes returns for these shapes")
     if not layout.row_axis_len_q:
         return
-    mode = forward_mode(*key, (window_size_left, window_size_right))
-    kernel, info = runtime.load_for(device_id, "fwd", head_dim, "flash_attn_fwd", mode.value)
+    variant = forward_variant(*key, (window_size_left, window_size_right))
+    kernel, info = runtime.load_for(device_id, "fwd", head_dim, "flash_attn_fwd", variant)
     qhead_per_kvhead = num_head // num_head_kv
     packed_heads = qhead_per_kvhead if info.pack_gqa else 1
     if info.pack_gqa and varlen:
@@ -191,7 +191,7 @@ def forward(
         signature += "p"
         values += (
             build_scheduler_metadata(
-                workspace[-1], "fwd", head_dim, mode.value, "flash_attn_fwd", layout.cu_seqlens_q_pointer, layout.cu_seqlens_k_pointer,
+                workspace[-1], "fwd", head_dim, variant, "flash_attn_fwd", layout.cu_seqlens_q_pointer, layout.cu_seqlens_k_pointer,
                 layout.batch_size, num_m_blocks, "forward_workspace_shapes", stream,
             ),
         )

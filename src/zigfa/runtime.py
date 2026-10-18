@@ -8,6 +8,8 @@ from cuda.bindings import driver
 from cuda.core import Device, LaunchConfig, ObjectCode, Stream, launch
 
 ARCHS = {8: "sm80", 9: "sm90", 10: "sm100", 12: "sm120"}
+INTER_SEQUENCE_ARCHS = {8: "sm80", 12: "sm80"}
+INTER_SEQUENCE = "inter_sequence"
 SCALAR_TYPES = {"p": np.uint64, "u": np.uint32, "i": np.int32, "f": np.float32}
 FLOAT_CODES = {code for code, scalar in SCALAR_TYPES.items() if np.issubdtype(scalar, np.floating)}
 TENSOR_MAP_BYTES = driver.CU_TENSOR_MAP_NUM_QWORDS * np.dtype(np.uint64).itemsize
@@ -46,7 +48,9 @@ class KernelInfo:
     dkv_box_rows: int
     two_sided_window: int
     masks: int
-    batched_only: int
+    inputs: str
+    grouped: int
+    inter_sequence: int
     arch: int
 
     @property
@@ -82,7 +86,7 @@ def manifest():
 def declared():
     lines = (manifest()[0] / "kernels.declared").read_text().split()
     partial = bool(lines) and lines[0] == "partial"
-    return partial, frozenset(lines[1:] if partial else lines)
+    return partial, tuple(lines[1:] if partial else lines)
 
 
 def current_device():
@@ -91,8 +95,8 @@ def current_device():
     return device
 
 
-def load(direction, head_dim, kernel_name, mode="", dynamic_shared=True):
-    return load_for(current_device().device_id, direction, head_dim, kernel_name, mode, dynamic_shared)
+def load(direction, head_dim, kernel_name, variant="", dynamic_shared=True):
+    return load_for(current_device().device_id, direction, head_dim, kernel_name, variant, dynamic_shared)
 
 
 @functools.cache
@@ -106,21 +110,36 @@ def head_dims():
 
 
 @functools.cache
-def instance_name(device_id, direction, head_dim, mode=""):
+def arch_name(device_id, inter_sequence=False):
     major = Device(device_id).compute_capability.major
-    arch = os.environ.get("ZIGFA_ARCH") or ARCHS.get(major)
+    arch = os.environ.get("ZIGFA_ARCH") or (INTER_SEQUENCE_ARCHS if inter_sequence else ARCHS).get(major)
     if arch is None:
         raise RuntimeError(f"no kernel arch supports sm_{major}x")
     if arch not in ARCHS.values():
         raise RuntimeError(f"ZIGFA_ARCH must be one of {sorted(ARCHS.values())}, got {arch!r}")
-    return f"flash_{direction}_{arch}{mode}_hd{head_dim}"
+    return arch
+
+
+def instance_name(device_id, direction, head_dim, variant=""):
+    return f"flash_{direction}_{arch_name(device_id, INTER_SEQUENCE in variant)}{variant}_hd{head_dim}"
 
 
 @functools.cache
-def load_for(device_id, direction, head_dim, kernel_name, mode="", dynamic_shared=True):
+def variant_names(device_id, direction, head_dim, inter_sequence=False):
+    prefix, suffix = f"flash_{direction}_{arch_name(device_id, inter_sequence)}", f"_hd{head_dim}"
+    _, names = declared()
+    return tuple(
+        name[len(prefix) : -len(suffix)]
+        for name in names
+        if name.startswith(prefix) and name.endswith(suffix) and name[len(prefix) : -len(suffix)][:1] in ("", "_")
+    )
+
+
+@functools.cache
+def load_for(device_id, direction, head_dim, kernel_name, variant="", dynamic_shared=True):
     directory, entries = manifest()
     major = Device(device_id).compute_capability.major
-    instance = instance_name(device_id, direction, head_dim, mode)
+    instance = instance_name(device_id, direction, head_dim, variant)
     if instance not in entries:
         raise RuntimeError(f"{instance} is not built for head_dim={head_dim} on sm_{major}x")
     for cubin_directory in (directory / "cubin", directory):

@@ -88,17 +88,17 @@ def backward_workspace_layout(
 
 
 @functools.cache
-def backward_mode(
+def backward_variant(
     device_id, q_shape, k_shape, window_size_left, window_size_right, cu_seqlens_shape, max_seqlen_q, max_seqlen_k
 ):
     layout = backward_workspace_layout(
         device_id, q_shape, k_shape, window_size_left, window_size_right, cu_seqlens_shape, max_seqlen_q, max_seqlen_k
     )
-    regular = next((info for _, info in specialization.declared_instances(device_id, "bwd", q_shape[-1], (specialization.Mode.REGULAR,))), None)
+    regular = specialization.unrestricted(device_id, "bwd", q_shape[-1])
     two_cta_split = bool(regular and regular.head_split and regular.cluster_ctas) and head_split_pays(
         device_id, regular, q_shape, k_shape, window_size_left, window_size_right
     )
-    mode = specialization.Mode.REGULAR if two_cta_split else specialization.choose(
+    variant = "" if two_cta_split else specialization.choose(
         device_id,
         "bwd",
         q_shape[-1],
@@ -110,11 +110,11 @@ def backward_mode(
         ),
     )
     specialization.log_choice(
-        "backward", device_id, q_shape[-1], mode, q=q_shape, k=k_shape,
+        "backward", device_id, q_shape[-1], variant, q=q_shape, k=k_shape,
         window=(window_size_left, window_size_right), cu_seqlens=cu_seqlens_shape,
         max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
     )
-    return mode
+    return variant
 
 
 def backward_workspace_shapes(
@@ -281,8 +281,8 @@ def backward(
     ) = sequence_layout(views["q"], views["k"], views["lse"], cu_seqlens_q, cu_seqlens_k)
     if not row_axis_len_q and not row_axis_len_k:
         return
-    mode = backward_mode(*key)
-    main, info = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd", mode.value)
+    variant = backward_variant(*key)
+    main, info = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd", variant)
     dkv_accum = extra[: layout.dkv_accum] if info.head_split else ()
 
     def blocks(rows, block):
@@ -313,7 +313,7 @@ def backward(
         strides = (seqlen_k * head_dim, head_dim, accumulator_rows * head_dim, 1)
         for index, name in enumerate(("dk", "dv")):
             views[name] = View(accumulator.pointer + index * half * 4, views["k"].shape, strides)
-        clear, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_clear", mode.value)
+        clear, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_clear", variant)
         runtime.run(
             clear, (CLEAR_BLOCKS, 1, 1), AUXILIARY_THREADS, 0, CLEAR_SIGNATURE, (accumulator.pointer, half // 2), stream
         )
@@ -323,7 +323,7 @@ def backward(
         return (0 if varlen else view.strides[0]), view.strides[-3], view.strides[-2]
 
     accum_strides = accumulator_strides(tuple(views["q"].shape), layout.accumulator_padding)
-    preprocess, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_preprocess", mode.value)
+    preprocess, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_preprocess", variant)
     if info.box_columns:
         maps = tuple(
             tensor_map(views[name].pointer, *as_four_dimensional(views[name]), rows, info.box_columns, info.swizzle_bytes)
@@ -397,7 +397,7 @@ def backward(
         signature += "p"
         main_values += (
             build_scheduler_metadata(
-                extra[-1], "bwd", head_dim, mode.value, "flash_attn_bwd", cu_seqlens_k_pointer, cu_seqlens_q_pointer,
+                extra[-1], "bwd", head_dim, variant, "flash_attn_bwd", cu_seqlens_k_pointer, cu_seqlens_q_pointer,
                 batch_size, num_n_blocks, "backward_workspace_shapes", stream,
             ),
         )
@@ -457,7 +457,7 @@ def backward(
         cluster_dims=(1, num_qhead_splits, 1) if num_qhead_splits > 1 else None,
     )
     if info.dq_block_m:
-        dq_kernel, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_dq", mode.value)
+        dq_kernel, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_dq", variant)
         runtime.run(
             dq_kernel,
             (cluster_ctas * blocks(row_axis_len_q, info.dq_block_m), num_head, grid_z),
@@ -474,7 +474,7 @@ def backward(
             pdl=info.pdl,
         )
         return
-    postprocess, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_postprocess", mode.value)
+    postprocess, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_postprocess", variant)
     runtime.run(
         postprocess,
         (row_blocks(row_axis_len_q, POSTPROCESS_ROWS), num_head, grid_z),

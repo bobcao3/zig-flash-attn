@@ -1234,8 +1234,7 @@ pub fn FlashAttnFwdSm100(
     };
 }
 
-const variant =
-    configurations.forwardSm100Variant(config.head_dim, @field(configurations.Mode, config.mode)).?;
+const variant = configurations.variants(.flash_fwd_sm100, config.head_dim)[config.variant];
 const forward_tiling = variant.tiling;
 const Forward = FlashAttnFwdSm100(forward_tiling, variant.specialization);
 

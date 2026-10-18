@@ -1,4 +1,3 @@
-import enum
 import functools
 import logging
 import numbers
@@ -19,24 +18,6 @@ SCHEDULER_METADATA_MIN_BATCH = 4
 DEBUG_LEVELS = ("INFO",)
 
 logger = logging.getLogger("zigfa")
-
-
-class Mode(enum.Enum):
-    REGULAR = ""
-    VARLEN = "_varlen"
-    GQA = "_gqa"
-    VARLEN_GQA = "_varlen_gqa"
-    LIMITED_1 = "_limited_1"
-    VARLEN_LIMITED_1 = "_varlen_limited_1"
-    LIMITED_2 = "_limited_2"
-    VARLEN_LIMITED_2 = "_varlen_limited_2"
-    LOCAL_TWO_SIDED = "_local_two_sided"
-    GQA_LOCAL_TWO_SIDED = "_gqa_local_two_sided"
-    GQA_LIMITED_1 = "_gqa_limited_1"
-    LOCAL_TWO_SIDED_LIMITED_2 = "_local_two_sided_limited_2"
-    VARLEN_GQA_LIMITED_1 = "_varlen_gqa_limited_1"
-    GQA_LIMITED_2 = "_gqa_limited_2"
-    VARLEN_GQA_LIMITED_2 = "_varlen_gqa_limited_2"
 
 
 @dataclass(frozen=True)
@@ -85,12 +66,14 @@ def facts(q_shape, k_shape=None, cu_seqlens_shape=None, max_seqlen_q=None, max_s
     )
 
 
-def candidates(facts):
-    if facts.varlen:
-        regular = (Mode.VARLEN_LIMITED_1, Mode.VARLEN_LIMITED_2, Mode.VARLEN, Mode.LIMITED_1, Mode.LIMITED_2)
-        return regular if facts.qhead_per_kvhead == 1 else (Mode.VARLEN_GQA, *regular)
-    regular = (Mode.LIMITED_1, Mode.LOCAL_TWO_SIDED_LIMITED_2, Mode.LIMITED_2, Mode.LOCAL_TWO_SIDED)
-    return regular if facts.qhead_per_kvhead == 1 else (Mode.GQA_LOCAL_TWO_SIDED, Mode.GQA_LIMITED_1, Mode.GQA, *regular)
+def serves(info, facts):
+    if info.inter_sequence or info.inputs != "any" and info.inputs != ("varlen" if facts.varlen else "batched"):
+        return False
+    return not (info.grouped and facts.qhead_per_kvhead == 1)
+
+
+def candidates(variants, facts):
+    return tuple((variant, info) for variant, info in variants if variant and serves(info, facts))
 
 
 def fill(rows, tile):
@@ -148,8 +131,6 @@ def accepts(info, facts, window=UNBOUNDED):
         return False
     if not (info.masks >> mask(window)) & 1:
         return False
-    if info.batched_only and facts.varlen:
-        return False
     if not (local_two_sided(window) and window[0] + window[1] < info.max_window_size):
         packs_bounded = info.pack_gqa and info.max_seqlen_q and bounded(window)
         query_limit = 2 * info.max_seqlen_q if packs_bounded else info.max_seqlen_q
@@ -166,27 +147,32 @@ def accepts(info, facts, window=UNBOUNDED):
     return True
 
 
-def declared_instances(device_id, direction, head_dim, modes):
+def declared_variants(device_id, direction, head_dim):
     _, entries = runtime.manifest()
-    partial, names = runtime.declared()
-    for mode in modes:
-        name = runtime.instance_name(device_id, direction, head_dim, mode.value)
-        if name in names:
-            if name in entries:
-                yield mode, entries[name]
-            elif not partial:
-                raise RuntimeError(f"{name} is declared but not built")
+    partial, _ = runtime.declared()
+    for variant in runtime.variant_names(device_id, direction, head_dim):
+        name = runtime.instance_name(device_id, direction, head_dim, variant)
+        if name in entries:
+            yield variant, entries[name]
+        elif not partial:
+            raise RuntimeError(f"{name} is declared but not built")
+
+
+def unrestricted(device_id, direction, head_dim):
+    return next((info for variant, info in declared_variants(device_id, direction, head_dim) if not variant), None)
 
 
 def choose(device_id, direction, head_dim, facts, rule=accepts):
-    for mode, info in declared_instances(device_id, direction, head_dim, candidates(facts)):
+    for variant, info in candidates(tuple(declared_variants(device_id, direction, head_dim)), facts):
         if rule(info, facts):
-            return mode
-    return Mode.REGULAR
+            return variant
+    return ""
 
 
 def reachable(device_id, direction, head_dim, facts):
-    return tuple(info for _, info in declared_instances(device_id, direction, head_dim, (Mode.REGULAR, *candidates(facts))))
+    variants = tuple(declared_variants(device_id, direction, head_dim))
+    regular = tuple(info for variant, info in variants if not variant)
+    return regular + tuple(info for _, info in candidates(variants, facts))
 
 
 @functools.cache
@@ -202,10 +188,10 @@ def debug_enabled():
     return bool(setting)
 
 
-def log_choice(direction, device_id, head_dim, mode, **request):
+def log_choice(direction, device_id, head_dim, variant, **request):
     if not debug_enabled():
         return
-    info = runtime.manifest()[1][runtime.instance_name(device_id, direction, head_dim, mode.value)]
+    info = runtime.manifest()[1][runtime.instance_name(device_id, direction, head_dim, variant)]
     described = " ".join(f"{name}={value}" for name, value in request.items())
     logger.info(
         "%s device=%d %s -> %s threads=%d block_m=%d block_n=%d",

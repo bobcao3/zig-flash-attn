@@ -7,6 +7,8 @@ pub const backward_sequence = .{
     "window_size_right",
 };
 
+const max_arguments = 48;
+
 pub fn strides(comptime tensor: []const u8) [3][]const u8 {
     return .{ tensor ++ "_batch_stride", tensor ++ "_row_stride", tensor ++ "_head_stride" };
 }
@@ -19,8 +21,8 @@ pub fn Entry(
     comptime launch: fn (Params, Args) void,
 ) type {
     return struct {
-        const map: [43]bool = mapped: {
-            var result: [43]bool = @splat(false);
+        const map: [max_arguments]bool = mapped: {
+            var result: [max_arguments]bool = @splat(false);
             for (0..names.len) |index| result[index] = isMap(index);
             break :mapped result;
         };
@@ -80,9 +82,14 @@ pub fn Entry(
             a40: Argument(40),
             a41: Argument(41),
             a42: Argument(42),
+            a43: Argument(43),
+            a44: Argument(44),
+            a45: Argument(45),
+            a46: Argument(46),
+            a47: Argument(47),
         ) callconv(.{ .nvptx_kernel = options }) void {
             @setEvalBranchQuota(100_000);
-            comptime std.debug.assert(names.len <= 43);
+            comptime std.debug.assert(names.len <= max_arguments);
             const arguments = .{
                 if (map[0]) &a0 else a0,    if (map[1]) &a1 else a1,    if (map[2]) &a2 else a2,
                 if (map[3]) &a3 else a3,    if (map[4]) &a4 else a4,    if (map[5]) &a5 else a5,
@@ -98,7 +105,8 @@ pub fn Entry(
                 if (map[33]) &a33 else a33, if (map[34]) &a34 else a34, if (map[35]) &a35 else a35,
                 if (map[36]) &a36 else a36, if (map[37]) &a37 else a37, if (map[38]) &a38 else a38,
                 if (map[39]) &a39 else a39, if (map[40]) &a40 else a40, if (map[41]) &a41 else a41,
-                a42,
+                if (map[42]) &a42 else a42, if (map[43]) &a43 else a43, if (map[44]) &a44 else a44,
+                if (map[45]) &a45 else a45, if (map[46]) &a46 else a46, a47,
             };
             var params: Params = .{};
             var args: Args = undefined;
