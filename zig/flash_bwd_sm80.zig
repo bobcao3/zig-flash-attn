@@ -303,6 +303,14 @@ pub fn SharedStorage(
                 }
             }
 
+            pub fn restart(load: *Load, work: anytype) void {
+                load.* = .init(load.params, .{}, work);
+                load.copyQuery(work, 0);
+                cp_async.commitGroup();
+                cp_async.waitGroup(0);
+                nvptx.barrierSyncAligned(.work_group, null);
+            }
+
             pub fn finish(_: *const Load, _: u32, _: u32, _: anytype) void {
                 cp_async.waitGroup(0);
                 schedule.loopBarrier();
@@ -376,7 +384,10 @@ pub fn FlashAttnBwdSm80(
         pub const waits_for_scheduler_metadata = specialization.scheduler_metadata;
         pub const Args = Storage.Args;
         pub const Load = Storage.Load;
-        pub const Work = NBlockWork(block_m, block_n);
+        pub const Work = NBlockWork(block_m, block_n, .{
+            .inter_sequence = specialization.inter_sequence,
+        });
+        pub const inter_sequence = specialization.inter_sequence;
         pub const PrepareScheduler = prepare_scheduler.PrepareScheduler(
             scheduler_options.block_m,
             scheduler_options.block_order,
@@ -1014,13 +1025,12 @@ pub fn FlashAttnBwdSm80(
     };
 }
 
-const variant =
-    configurations.backwardSm80Variant(config.head_dim, @field(configurations.Mode, config.mode)).?;
+const variant = configurations.variants(.flash_bwd_sm80, config.head_dim)[config.variant];
 const backward_tiling = variant.tiling;
 const Backward = FlashAttnBwdSm80(
     backward_tiling,
     variant.specialization,
-    SharedStorage(backward_tiling, .init(config.head_dim, @field(configurations.Mode, config.mode))),
+    SharedStorage(backward_tiling, backward_tiling.schedule),
 );
 const flash_bwd_preprocess = @import("flash_bwd_preprocess.zig");
 const flash_bwd_postprocess = @import("flash_bwd_postprocess.zig");
@@ -1034,7 +1044,8 @@ const Entry = entry.Entry(BackwardParams, Backward.Args, .{
 } ++ entry.backward_sequence ++ entry.strides("q") ++ entry.strides("k") ++ entry.strides("v") ++
     entry.strides("do") ++ entry.strides("dk") ++ entry.strides("dv") ++
     entry.strides("dq_accum") ++ .{ "lse_batch_stride", "lse_head_stride", "num_batch" } ++
-    if (variant.specialization.scheduler_metadata) .{"scheduler_metadata"} else .{}, .{
+    (if (variant.specialization.scheduler_metadata) .{"scheduler_metadata"} else .{}) ++
+    if (variant.specialization.inter_sequence) .{ "visibility_bits", "window_sizes" } else .{}, .{
     .required_work_group_size = .{ .x = Backward.thread_count },
 }, Backward.Kernel.run);
 

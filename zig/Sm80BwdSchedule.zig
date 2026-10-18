@@ -22,10 +22,9 @@ key_block_major: bool = false,
 /// Decodes the work tile again after the main loop, which then holds fewer registers.
 decode_work_twice: bool = false,
 
-pub fn init(head_dim: u32, mode: configurations.Mode) Sm80BwdSchedule {
-    if (mode.isLimited1()) return .{};
+pub fn init(head_dim: u32) Sm80BwdSchedule {
     return switch (head_dim) {
-        64 => .{ .interleaved_dq_reduction = mode != .regular, .decode_work_twice = true },
+        64 => .{ .decode_work_twice = true },
         96 => .{
             .double_buffered_query = true,
             .plain_loop_barriers = true,
@@ -273,7 +272,7 @@ pub fn Steps(
                     const base: [*]addrspace(.global) f32 = @ptrFromInt(params.dq_accum);
                     const sequence_rows = if (params.cu_seqlens_q == 0) params.seqlen_q else 8;
                     const group_row =
-                        row + work.sequence.offset_q / 8 * 8 + work.batch * sequence_rows;
+                        row + work.sequence.offset_q / 8 * 8 + work.queryBatch() * sequence_rows;
                     return .{
                         .dq = dq,
                         .address = base + step.head * params.dq_accum_head_stride +

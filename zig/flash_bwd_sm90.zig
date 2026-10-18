@@ -175,7 +175,7 @@ pub fn FlashAttnBwdSm90(
     const DsOperands = wgmma.Operands(ds_swizzle_bytes);
     const DsLayout = tma.SwizzledLayout(block_m / 8, ds_swizzle_bytes);
     const ds_box_chunks = DsLayout.swizzle_columns;
-    const Work = NBlockWork(block_m, block_n);
+    const Work = NBlockWork(block_m, block_n, .{});
     const dq_split = tiling.dq_split;
     const dq_groups: u32 = if (dq_split == .none) 1 else 2;
     const dq_columns = if (dq_split == .by_columns) padded / 2 else padded;
@@ -921,7 +921,7 @@ pub fn FlashAttnBwdSm90SinglePdsStage(
     const halves = group_columns / 64;
     const score_rows = block_m * pds_swizzle_bytes;
     const Layout = tma.SwizzledLayout(row_chunks, swizzle_bytes);
-    const Work = NBlockWork(block_m, block_n);
+    const Work = NBlockWork(block_m, block_n, .{});
     const staging_boxes = tiling.residentStagingBoxes();
     const box_columns = configurations.Sm90BwdTiling.dq_accum_box_columns;
     const ReduceStaging = tma.InterleavedReduceStaging(block_m, box_columns);
@@ -1469,15 +1469,15 @@ pub fn FlashAttnBwdSm90SinglePdsStage(
     };
 }
 
-const variant =
-    configurations.backwardSm90Variant(config.head_dim, @field(configurations.Mode, config.mode)).?;
+const variant = configurations.variants(.flash_bwd_sm90, config.head_dim)[config.variant];
 const backward_tiling = variant.tiling;
 
 comptime {
-    std.debug.assert(configurations.launchBackwardSm90(
+    std.debug.assert(configurations.launch(
+        .flash_bwd_sm90,
         config.head_dim,
-        @field(configurations.Mode, config.mode),
-    ).?.max_qhead_splits <= split_units);
+        config.variant,
+    ).max_qhead_splits <= split_units);
 }
 
 const auxiliary: flash_bwd_preprocess.Options = .{

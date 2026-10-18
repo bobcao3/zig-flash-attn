@@ -56,7 +56,7 @@ pub fn FlashAttnBwdSm100TwoCta(
     const reduce_warps = 4;
     const compute_warps = 4 * compute_groups;
     const other_warp = reduce_warps + compute_warps;
-    const Work = @import("n_block_work.zig").NBlockWork(query_rows, cluster_keys);
+    const Work = @import("n_block_work.zig").NBlockWork(query_rows, cluster_keys, .{});
     const TileScheduler = tile_scheduler.TileScheduler(.{
         .block_m = cluster_keys,
         .row_bytes = 8 * head_dim,

@@ -91,3 +91,26 @@ def reference_gradients(function, q, k, v, dout, *arguments, **options):
     inputs = [x.detach().clone().requires_grad_() for x in (q, k, v)]
     out, _ = function(*inputs, *arguments, **options)
     return torch.autograd.grad(out, inputs, dout.to(out.dtype).clone(memory_format=torch.contiguous_format))
+
+
+def inter_sequence_visible(cu_seqlens_q, cu_seqlens_k, visible, windows):
+    cu_q, cu_k = cu_seqlens_q.cpu().long(), cu_seqlens_k.cpu().long()
+    mask = torch.zeros(int(cu_q[-1]), int(cu_k[-1]), dtype=torch.bool)
+    for query, key in visible.nonzero().tolist():
+        length_q, length_k = int(cu_q[query + 1] - cu_q[query]), int(cu_k[key + 1] - cu_k[key])
+        block = torch.ones(length_q, length_k, dtype=torch.bool)
+        if query == key:
+            left, right = windows[query]
+            rows = torch.arange(length_q)[:, None] + length_k - length_q
+            columns = torch.arange(length_k)[None, :]
+            if left >= 0:
+                block &= columns >= rows - left
+            if right >= 0:
+                block &= columns <= rows + right
+        mask[cu_q[query] : cu_q[query + 1], cu_k[key] : cu_k[key + 1]] = block
+    return mask
+
+
+def inter_sequence_attention_ref(q, k, v, mask, upcast=True, softmax_scale=None):
+    out, lse = masked_attention(q[None], k[None], v[None], on_device(mask[None], q.device), upcast, softmax_scale)
+    return out[0], lse[0]

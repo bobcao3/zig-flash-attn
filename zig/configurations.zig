@@ -1,5 +1,6 @@
 const std = @import("std");
 const SchedulingMode = @import("tile_scheduler.zig").SchedulingMode;
+const Sm80BwdSchedule = @import("Sm80BwdSchedule.zig");
 
 pub const warps_per_warp_group = 4;
 pub const registers_per_cta = 65536;
@@ -18,47 +19,9 @@ pub const Mask = enum {
 
 pub const BlockOrder = enum { ascending, descending };
 
-pub const Tier =
-    enum(u3) { regular, limited_1, limited_2, local_two_sided, local_two_sided_limited_2 };
-
 pub const Ex2EmulationPlacement = enum { interleaved, leading, inner_fragments };
 
-pub const Mode = enum(u5) {
-    regular = 0,
-    varlen = 1,
-    gqa = 2,
-    varlen_gqa = 3,
-    limited_1 = 4,
-    varlen_limited_1 = 5,
-    gqa_limited_1 = 6,
-    varlen_gqa_limited_1 = 7,
-    limited_2 = 8,
-    varlen_limited_2 = 9,
-    gqa_limited_2 = 10,
-    varlen_gqa_limited_2 = 11,
-    local_two_sided = 12,
-    gqa_local_two_sided = 14,
-    local_two_sided_limited_2 = 16,
-
-    pub fn isVarlen(mode: Mode) bool {
-        return @backingInt(mode) & 1 != 0;
-    }
-
-    pub fn tier(mode: Mode) Tier {
-        return @fromBackingInt(@intCast(@backingInt(mode) >> 2));
-    }
-
-    pub fn isLimited1(mode: Mode) bool {
-        return mode.tier() == .limited_1;
-    }
-
-    pub fn suffix(mode: Mode) []const u8 {
-        return switch (mode) {
-            .regular => "",
-            inline else => |tag| "_" ++ @tagName(tag),
-        };
-    }
-};
+pub const Inputs = enum { any, batched, varlen };
 
 pub const SequenceLimits = struct {
     min_seqlen_q: u32 = 0,
@@ -67,15 +30,49 @@ pub const SequenceLimits = struct {
     max_window_size: u32 = 0,
     two_sided_window: bool = false,
     masks: std.EnumSet(Mask) = .full,
-    batched_only: bool = false,
 };
 
 pub const Specialization = struct {
+    inputs: Inputs = .any,
+    grouped: bool = false,
+    inter_sequence: bool = false,
     scheduler_metadata: bool = false,
     sort_batches: bool = false,
     pack_gqa: bool = false,
     head_split: bool = false,
     limits: SequenceLimits = .{},
+
+    pub fn name(comptime specialization: Specialization) []const u8 {
+        comptime {
+            @setEvalBranchQuota(100_000);
+            const limits = specialization.limits;
+            var result: []const u8 = "";
+            if (specialization.inputs != .any) result = result ++ "_" ++
+                @tagName(specialization.inputs);
+            if (specialization.grouped) result = result ++ "_gqa";
+            if (specialization.inter_sequence) result = result ++ "_inter_sequence";
+            if (limits.two_sided_window) result = result ++ "_local_two_sided";
+            if (!limits.masks.eql(.full)) {
+                var separator: []const u8 = "_";
+                for (std.enums.values(Mask)) |mask| if (limits.masks.contains(mask)) {
+                    result = result ++ separator ++ @tagName(mask);
+                    separator = "_or_";
+                };
+            }
+            for ([_]struct { []const u8, u32 }{
+                .{ "minq", limits.min_seqlen_q },
+                .{ "maxq", limits.max_seqlen_q },
+                .{ "maxk", limits.max_seqlen_k },
+                .{ "window", limits.max_window_size },
+            }) |bound| {
+                if (bound[1] != 0) result = result ++ std.fmt.comptimePrint(
+                    "_{s}{d}",
+                    .{ bound[0], bound[1] },
+                );
+            }
+            return result;
+        }
+    }
 };
 
 pub fn Variant(comptime T: type) type {
@@ -85,61 +82,61 @@ pub fn Variant(comptime T: type) type {
     };
 }
 
-const varlen_sorted: Specialization = .{ .scheduler_metadata = true, .sort_batches = true };
-const pack_gqa_only: Specialization = .{ .pack_gqa = true };
+pub fn Variants(comptime T: type) type {
+    return []const Variant(T);
+}
 
-pub const Declaration = struct {
-    varlen_head_dims: []const u32 = &.{},
-    gqa_head_dims: []const u32 = &.{},
-    gqa_limited_1_head_dims: []const u32 = &.{},
-    varlen_gqa_head_dims: []const u32 = &.{},
-    gqa_specialization: Specialization = .{},
-    limited_1_limits: SequenceLimits = .{},
-    limited_2_limits: ?SequenceLimits = null,
-    local_head_dims: []const u32 = &.{},
+const varlen_sorted: Specialization = .{
+    .inputs = .varlen,
+    .scheduler_metadata = true,
+    .sort_batches = true,
 };
 
-fn declare(comptime T: type, tiling: T, mode: Mode, declaration: Declaration) ?Variant(T) {
-    const head_dim = tiling.head_dim;
-    const untiered: Mode = @fromBackingInt(@backingInt(mode) & 3);
-    var specialization: Specialization = switch (untiered) {
-        .regular => .{},
-        .varlen => if (std.mem.indexOfScalar(
-            u32,
-            declaration.varlen_head_dims,
-            head_dim,
-        ) != null) varlen_sorted else return null,
-        .gqa => if ((mode.tier() == .regular or mode.tier() == .local_two_sided) and
-            std.mem.indexOfScalar(u32, declaration.gqa_head_dims, head_dim) != null)
-            declaration.gqa_specialization
-        else if (mode.tier() == .limited_1 and
-            std.mem.indexOfScalar(u32, declaration.gqa_limited_1_head_dims, head_dim) != null)
-            declaration.gqa_specialization
-        else
-            return null,
-        .varlen_gqa => if (mode.tier() == .regular and std.mem.indexOfScalar(
-            u32,
-            declaration.varlen_gqa_head_dims,
-            head_dim,
-        ) != null) varlen_sorted else return null,
-        else => return null,
+fn varlenSorted(limits: SequenceLimits) Specialization {
+    var specialization = varlen_sorted;
+    specialization.limits = limits;
+    return specialization;
+}
+
+const grouped_pack: Specialization = .{ .inputs = .batched, .grouped = true, .pack_gqa = true };
+const grouped_head_split: Specialization = .{
+    .inputs = .batched,
+    .grouped = true,
+    .head_split = true,
+};
+const inter_sequence_sorted: Specialization = .{
+    .inputs = .varlen,
+    .inter_sequence = true,
+    .scheduler_metadata = true,
+    .sort_batches = true,
+};
+pub const inter_sequence_head_dims = [_]u32{ 64, 128, 256 };
+
+fn interSequenceSorted(limits: SequenceLimits) Specialization {
+    var specialization = inter_sequence_sorted;
+    specialization.limits = limits;
+    return specialization;
+}
+
+fn hasInterSequence(head_dim: u32) bool {
+    return std.mem.indexOfScalar(u32, &inter_sequence_head_dims, head_dim) != null;
+}
+
+fn VariantList(comptime T: type) type {
+    return struct {
+        items: [16]Variant(T) = undefined,
+        len: usize = 0,
+
+        fn add(list: *@This(), tiling: T, specialization: Specialization) void {
+            list.items[list.len] = .{ .tiling = tiling, .specialization = specialization };
+            list.len += 1;
+        }
+
+        fn slice(comptime list: @This()) Variants(T) {
+            const items = list.items[0..list.len].*;
+            return &items;
+        }
     };
-    switch (mode.tier()) {
-        .regular => {},
-        .limited_1 => specialization.limits = declaration.limited_1_limits,
-        .limited_2 => specialization.limits = declaration.limited_2_limits orelse return null,
-        .local_two_sided, .local_two_sided_limited_2 => {
-            if (std.mem.indexOfScalar(
-                u32,
-                declaration.local_head_dims,
-                head_dim,
-            ) == null) return null;
-            if (mode.tier() == .local_two_sided_limited_2) specialization.limits =
-                declaration.limited_2_limits orelse return null;
-            specialization.limits.two_sided_window = true;
-        },
-    }
-    return .{ .tiling = tiling, .specialization = specialization };
 }
 
 pub const Source = enum {
@@ -160,19 +157,48 @@ pub const Source = enum {
             .flash_fwd_sm100, .flash_bwd_sm100 => 100,
         };
     }
+
+    pub fn Tiling(comptime source: Source) type {
+        return switch (source) {
+            .flash_fwd_sm80, .flash_fwd_sm120 => Sm80FwdTiling,
+            .flash_bwd_sm80, .flash_bwd_sm120 => Sm80BwdTiling,
+            .flash_fwd_sm90 => Sm90FwdTiling,
+            .flash_bwd_sm90 => Sm90BwdTiling,
+            .flash_fwd_sm100 => Sm100FwdTiling,
+            .flash_bwd_sm100 => Sm100BwdTiling,
+        };
+    }
 };
 
-pub fn launch(comptime source: Source, head_dim: u32, mode: Mode) ?Launch {
-    const variant = switch (source) {
-        .flash_fwd_sm80 => forwardSm80Variant(head_dim, mode),
-        .flash_bwd_sm80 => backwardSm80Variant(head_dim, mode),
-        .flash_fwd_sm120 => forwardSm120Variant(head_dim, mode),
-        .flash_fwd_sm90 => forwardSm90Variant(head_dim, mode),
-        .flash_bwd_sm90 => backwardSm90Variant(head_dim, mode),
-        .flash_fwd_sm100 => forwardSm100Variant(head_dim, mode),
-        .flash_bwd_sm100 => backwardSm100Variant(head_dim, mode),
-        .flash_bwd_sm120 => backwardSm120Variant(head_dim, mode),
-    } orelse return null;
+pub fn variants(comptime source: Source, comptime head_dim: u32) Variants(source.Tiling()) {
+    const list = comptime switch (source) {
+        .flash_fwd_sm80 => forwardSm80Variants(head_dim),
+        .flash_bwd_sm80 => backwardSm80Variants(head_dim),
+        .flash_fwd_sm120 => forwardSm120Variants(head_dim),
+        .flash_fwd_sm90 => forwardSm90Variants(head_dim),
+        .flash_bwd_sm90 => backwardSm90Variants(head_dim),
+        .flash_fwd_sm100 => forwardSm100Variants(head_dim),
+        .flash_bwd_sm100 => backwardSm100Variants(head_dim),
+        .flash_bwd_sm120 => backwardSm120Variants(head_dim),
+    };
+    comptime {
+        @setEvalBranchQuota(2_000_000);
+        var unrestricted = 0;
+        for (list, 0..) |variant, index| {
+            if (variant.specialization.name().len == 0) unrestricted += 1;
+            for (list[0..index]) |earlier| if (std.mem.eql(
+                u8,
+                earlier.specialization.name(),
+                variant.specialization.name(),
+            )) @compileError("two variants share the name " ++ variant.specialization.name());
+        }
+        if (unrestricted != 1) @compileError("a source needs one variant without conditions");
+    }
+    return list;
+}
+
+pub fn launch(comptime source: Source, comptime head_dim: u32, comptime index: usize) Launch {
+    const variant = comptime variants(source, head_dim)[index];
     const tile = variant.tiling;
     const specialization = variant.specialization;
     const limits = specialization.limits;
@@ -191,17 +217,16 @@ pub fn launch(comptime source: Source, head_dim: u32, mode: Mode) ?Launch {
         .max_seqlen_k = limits.max_seqlen_k,
         .max_window_size = limits.max_window_size,
         .two_sided_window = @intFromBool(limits.two_sided_window),
-        .batched_only = @intFromBool(limits.batched_only),
+        .inputs = specialization.inputs,
+        .grouped = @intFromBool(specialization.grouped),
+        .inter_sequence = @intFromBool(specialization.inter_sequence),
         .arch = source.arch(),
     };
     var masks = limits.masks.iterator();
     while (masks.next()) |mask| result.masks |= @as(u32, 1) << @backingInt(mask);
     switch (source) {
         .flash_fwd_sm80 => {},
-        .flash_bwd_sm80 => {
-            const schedule = @import("Sm80BwdSchedule.zig").init(head_dim, mode);
-            result.shared_bytes = schedule.sharedBytes(tile);
-        },
+        .flash_bwd_sm80 => result.shared_bytes = tile.schedule.sharedBytes(tile),
         .flash_fwd_sm120, .flash_bwd_sm120 => {
             const pitch = tile.rowPitchChunks();
             const swizzle = swizzleBytes(pitch);
@@ -460,11 +485,13 @@ pub const Launch = struct {
     dkv_box_rows: u32 = 0,
     two_sided_window: u32 = 0,
     masks: u32 = 0,
-    batched_only: u32 = 0,
+    inputs: Inputs = .any,
+    grouped: u32 = 0,
+    inter_sequence: u32 = 0,
     arch: u32,
 };
 
-pub fn forwardSm80Limited1(head_dim: u32) ?Sm80FwdTiling {
+pub fn forwardSm80SmallTiles(head_dim: u32) ?Sm80FwdTiling {
     return switch (head_dim) {
         64, 96, 128 => .{
             .head_dim = head_dim,
@@ -509,41 +536,56 @@ fn forwardSm80Short(head_dim: u32) Sm80FwdTiling {
     return tiling;
 }
 
-pub fn forwardSm80Variant(head_dim: u32, mode: Mode) ?Variant(Sm80FwdTiling) {
-    const tiling = switch (mode.tier()) {
-        .limited_1 => forwardSm80Limited1(head_dim) orelse return null,
-        .limited_2 => if (head_dim == 128) forwardSm80Short(head_dim) else switch (mode) {
-            .varlen_limited_2 => switch (head_dim) {
-                72 => batch_major: {
-                    var tiling = forwardSm80(head_dim);
-                    tiling.batch_major = true;
-                    break :batch_major tiling;
-                },
-                96 => forwardSm80Regular(head_dim),
-                else => return null,
+pub fn forwardSm80Variants(comptime head_dim: u32) Variants(Sm80FwdTiling) {
+    comptime {
+        const regular = forwardSm80Regular(head_dim);
+        const small_tiles = forwardSm80SmallTiles(head_dim);
+        const sorted_head_dim = head_dim == 64 or head_dim == 128;
+        const maxq256: SequenceLimits = .{ .max_seqlen_q = 256 };
+        const dense_or_causal: std.EnumSet(Mask) = .initMany(&.{ .dense, .causal });
+        var list: VariantList(Sm80FwdTiling) = .{};
+        if (sorted_head_dim) if (small_tiles) |tiling| list.add(tiling, varlenSorted(maxq256));
+        switch (head_dim) {
+            72 => {
+                var tiling = forwardSm80(head_dim);
+                tiling.batch_major = true;
+                list.add(tiling, .{ .inputs = .varlen, .limits = .{ .max_seqlen_q = 1024 } });
             },
-            else => return null,
-        },
-        else => forwardSm80Regular(head_dim),
-    };
-    const limited_1_limits: SequenceLimits = .{ .max_seqlen_q = 256 };
-    var variant =
-        declare(Sm80FwdTiling, tiling, if (mode == .varlen_limited_2) .limited_2 else mode, .{
-            .varlen_head_dims = &.{ 64, 128 },
-            .gqa_head_dims = &.{ 64, 128 },
-            .gqa_specialization = pack_gqa_only,
-            .limited_1_limits = limited_1_limits,
-            .limited_2_limits = .{ .max_seqlen_q = 1024 },
-        }) orelse return null;
-    if (mode.tier() == .limited_2 and head_dim == 128) {
-        variant.specialization.limits.masks = .initMany(&.{ .causal, .dense });
-        variant.specialization.limits.max_seqlen_k = 2048;
-        if (mode == .varlen_limited_2) variant.specialization.limits.max_seqlen_q = 2048;
+            96 => list.add(regular, .{
+                .inputs = .varlen,
+                .limits = .{ .min_seqlen_q = 257, .max_seqlen_q = 1024 },
+            }),
+            128 => list.add(forwardSm80Short(head_dim), .{
+                .inputs = .varlen,
+                .limits = .{
+                    .min_seqlen_q = 257,
+                    .max_seqlen_q = 2048,
+                    .max_seqlen_k = 2048,
+                    .masks = dense_or_causal,
+                },
+            }),
+            else => {},
+        }
+        if (sorted_head_dim) {
+            list.add(regular, varlen_sorted);
+            list.add(regular, grouped_pack);
+        }
+        if (small_tiles) |tiling| list.add(tiling, .{ .limits = maxq256 });
+        if (head_dim == 128) list.add(forwardSm80Short(head_dim), .{ .limits = .{
+            .max_seqlen_q = 1024,
+            .max_seqlen_k = 2048,
+            .masks = dense_or_causal,
+        } });
+        list.add(regular, .{});
+        if (hasInterSequence(head_dim)) {
+            if (sorted_head_dim) list.add(
+                forwardSm80Short(head_dim),
+                interSequenceSorted(.{ .max_seqlen_q = 2048 }),
+            );
+            list.add(regular, inter_sequence_sorted);
+        }
+        return list.slice();
     }
-    if (mode == .varlen_limited_2 and forwardSm80Limited1(head_dim) != null) {
-        variant.specialization.limits.min_seqlen_q = limited_1_limits.max_seqlen_q + 1;
-    }
-    return variant;
 }
 
 pub const Sm80BwdTiling = struct {
@@ -566,6 +608,7 @@ pub const Sm80BwdTiling = struct {
     batch_major: bool = false,
     l2_swizzle: L2SwizzlePolicy = &.{},
     scheduling_mode: SchedulingMode = .single_tile,
+    schedule: Sm80BwdSchedule = .{},
 
     pub const dq_accum_box_rows = 16;
 
@@ -640,6 +683,7 @@ fn backwardTiling(head_dim: u32) Sm80BwdTiling {
 
 pub fn backwardSm80(head_dim: u32) Sm80BwdTiling {
     var tiling = backwardTiling(head_dim);
+    tiling.schedule = .init(head_dim);
     switch (head_dim) {
         64 => {
             tiling.p_first = true;
@@ -676,7 +720,7 @@ pub fn backwardSm80(head_dim: u32) Sm80BwdTiling {
     return tiling;
 }
 
-pub fn backwardSm80Limited1(head_dim: u32) ?Sm80BwdTiling {
+pub fn backwardSm80SmallTiles(head_dim: u32) ?Sm80BwdTiling {
     return switch (head_dim) {
         64 => .{ .head_dim = 64, .block_m = 64, .block_n = 64, .warps = 8, .stages = 2 },
         72, 96, 128 => .{
@@ -690,15 +734,24 @@ pub fn backwardSm80Limited1(head_dim: u32) ?Sm80BwdTiling {
     };
 }
 
-pub fn backwardSm80Variant(head_dim: u32, mode: Mode) ?Variant(Sm80BwdTiling) {
-    const tiling = if (mode.isLimited1()) backwardSm80Limited1(head_dim) orelse
-        return null else backwardSm80(head_dim);
-    return declare(Sm80BwdTiling, tiling, mode, .{
-        .varlen_head_dims = &.{ 64, 128 },
-        .gqa_head_dims = &head_dims,
-        .gqa_specialization = .{ .head_split = true },
-        .limited_1_limits = .{ .max_seqlen_k = 128 },
-    });
+pub fn backwardSm80Variants(comptime head_dim: u32) Variants(Sm80BwdTiling) {
+    comptime {
+        const regular = backwardSm80(head_dim);
+        var interleaved = regular;
+        if (head_dim == 64) interleaved.schedule.interleaved_dq_reduction = true;
+        const small_tiles = backwardSm80SmallTiles(head_dim);
+        const maxk128: SequenceLimits = .{ .max_seqlen_k = 128 };
+        var list: VariantList(Sm80BwdTiling) = .{};
+        if (head_dim == 64 or head_dim == 128) {
+            if (small_tiles) |tiling| list.add(tiling, varlenSorted(maxk128));
+            list.add(interleaved, varlen_sorted);
+        }
+        list.add(interleaved, grouped_head_split);
+        if (small_tiles) |tiling| list.add(tiling, .{ .limits = maxk128 });
+        list.add(regular, .{});
+        if (hasInterSequence(head_dim)) list.add(interleaved, inter_sequence_sorted);
+        return list.slice();
+    }
 }
 
 fn withTensorMaps(sm80_tiling: Sm80BwdTiling) Sm80BwdTiling {
@@ -717,67 +770,76 @@ pub fn backwardSm120(head_dim: u32) Sm80BwdTiling {
     return tiling;
 }
 
-pub fn backwardSm120Variant(head_dim: u32, mode: Mode) ?Variant(Sm80BwdTiling) {
-    var tiling = switch (mode.tier()) {
-        .regular => backwardSm120(head_dim),
-        .limited_1 => withTensorMaps(backwardSm80Limited1(head_dim) orelse return null),
-        .limited_2 => if (mode == .limited_2 and (head_dim == 64 or head_dim == 96))
-            backwardSm120(head_dim)
-        else
-            return null,
-        .local_two_sided, .local_two_sided_limited_2 => return null,
-    };
-    if (mode == .regular or mode == .varlen) {
+pub fn backwardSm120Variants(comptime head_dim: u32) Variants(Sm80BwdTiling) {
+    comptime {
+        const plain = backwardSm120(head_dim);
+        var tuned = plain;
         if (head_dim == 64) {
-            tiling.stages = 1;
-            tiling.bulk_reduce = true;
+            tuned.stages = 1;
+            tuned.bulk_reduce = true;
         }
-        if (head_dim == 96) tiling.alternate_gradient_order = true;
+        if (head_dim == 96) tuned.alternate_gradient_order = true;
+        const small_tiles: ?Sm80BwdTiling =
+            if (backwardSm80SmallTiles(head_dim)) |tiling| withTensorMaps(tiling) else null;
+        const maxk128: SequenceLimits = .{ .max_seqlen_k = 128 };
+        var list: VariantList(Sm80BwdTiling) = .{};
+        if (head_dim == 64 or head_dim == 128) {
+            if (small_tiles) |tiling| list.add(tiling, varlenSorted(maxk128));
+            list.add(tuned, varlen_sorted);
+        }
+        list.add(plain, grouped_head_split);
+        if (small_tiles) |tiling| list.add(tiling, .{ .limits = maxk128 });
+        if (head_dim == 64 or head_dim == 96) list.add(plain, .{
+            .limits = .{ .max_seqlen_k = 1024 },
+        });
+        list.add(tuned, .{});
+        return list.slice();
     }
-    return declare(Sm80BwdTiling, tiling, mode, .{
-        .varlen_head_dims = &.{ 64, 128 },
-        .gqa_head_dims = &head_dims,
-        .gqa_specialization = .{ .head_split = true },
-        .limited_1_limits = .{ .max_seqlen_k = 128 },
-        .limited_2_limits = .{ .max_seqlen_k = 1024 },
-    });
 }
 
-pub fn forwardSm120Variant(head_dim: u32, mode: Mode) ?Variant(Sm80FwdTiling) {
-    var tiling = switch (mode.tier()) {
-        .regular => forwardSm80(head_dim),
-        .limited_1 => if (head_dim == 96)
-            forwardSm80(head_dim)
-        else
-            forwardSm80Limited1(head_dim) orelse return null,
-        .limited_2 => if (mode == .limited_2 and head_dim == 96)
-            forwardSm80(head_dim)
-        else
-            return null,
-        .local_two_sided, .local_two_sided_limited_2 => return null,
-    };
+fn withTma(sm80_tiling: Sm80FwdTiling) Sm80FwdTiling {
+    var tiling = sm80_tiling;
     tiling.tma = true;
-    if (mode.tier() == .regular and head_dim == 96) {
-        tiling.stages = 1;
-        tiling.q_in_regs = false;
-        tiling.mma_m_per_warp = 2;
-        tiling.separate_v_empty = true;
+    return tiling;
+}
+
+pub fn forwardSm120Variants(comptime head_dim: u32) Variants(Sm80FwdTiling) {
+    comptime {
+        var regular = withTma(forwardSm80(head_dim));
+        if (head_dim == 96) {
+            regular.stages = 1;
+            regular.q_in_regs = false;
+            regular.mma_m_per_warp = 2;
+            regular.separate_v_empty = true;
+        }
+        if (head_dim == 72) regular.batch_major = true;
+        const small_tiles: ?Sm80FwdTiling = if (head_dim == 96)
+            withTma(forwardSm80(head_dim))
+        else if (forwardSm80SmallTiles(head_dim)) |tiling| withTma(tiling) else null;
+        const small_limits: SequenceLimits = if (head_dim == 96)
+            .{ .max_seqlen_q = 1024, .max_window_size = 1024 }
+        else
+            .{ .max_seqlen_q = 256 };
+        var list: VariantList(Sm80FwdTiling) = .{};
+        if (head_dim == 64 or head_dim == 128) {
+            if (small_tiles) |tiling| list.add(tiling, varlenSorted(small_limits));
+            list.add(regular, varlen_sorted);
+        }
+        if (head_dim == 64 or head_dim == 96 or head_dim == 128) {
+            var grouped = grouped_pack;
+            if (head_dim == 96) grouped.limits.max_seqlen_q = 512;
+            list.add(regular, grouped);
+        }
+        if (small_tiles) |tiling| list.add(tiling, .{ .limits = small_limits });
+        if (head_dim == 96) {
+            var tiling = withTma(forwardSm80(head_dim));
+            tiling.stages = 2;
+            tiling.max_registers = 128;
+            list.add(tiling, .{ .limits = .{ .max_seqlen_q = 1024, .max_window_size = 2048 } });
+        }
+        list.add(regular, .{});
+        return list.slice();
     }
-    if (mode.tier() == .regular and head_dim == 72) tiling.batch_major = true;
-    if (mode.tier() == .limited_2) {
-        tiling.stages = 2;
-        tiling.max_registers = 128;
-    }
-    var variant = declare(Sm80FwdTiling, tiling, mode, .{
-        .varlen_head_dims = &.{ 64, 128 },
-        .gqa_head_dims = &.{ 64, 96, 128 },
-        .gqa_specialization = pack_gqa_only,
-        .limited_1_limits = .{ .max_seqlen_q = if (head_dim == 96) 1024 else 256 },
-        .limited_2_limits = .{ .max_seqlen_q = 1024, .max_window_size = 2048 },
-    }) orelse return null;
-    if (mode.isLimited1() and head_dim == 96) variant.specialization.limits.max_window_size = 1024;
-    if (mode == .gqa and head_dim == 96) variant.specialization.limits.max_seqlen_q = 512;
-    return variant;
 }
 
 const causal_l2_swizzle: L2SwizzlePolicy = &.{
@@ -896,7 +958,7 @@ pub fn forwardSm90(head_dim: u32) Sm90FwdTiling {
     };
 }
 
-pub fn forwardSm90Limited1(head_dim: u32) ?Sm90FwdTiling {
+pub fn forwardSm90Bounded(head_dim: u32) ?Sm90FwdTiling {
     var tiling = forwardSm90(head_dim);
     switch (head_dim) {
         64, 96 => {
@@ -914,40 +976,45 @@ pub fn forwardSm90Limited1(head_dim: u32) ?Sm90FwdTiling {
     return tiling;
 }
 
-pub fn forwardSm90Variant(head_dim: u32, mode: Mode) ?Variant(Sm90FwdTiling) {
-    const regular = forwardSm90(head_dim);
-    var tiling = switch (mode.tier()) {
-        .regular => regular,
-        .limited_1 => forwardSm90Limited1(head_dim) orelse return null,
-        .limited_2 => if (mode != .limited_2) return null else switch (head_dim) {
-            64 => regular,
-            128 => forwardSm90Limited1(head_dim).?,
-            else => return null,
-        },
-        .local_two_sided, .local_two_sided_limited_2 => return null,
-    };
-    if (mode.tier() == .limited_2) tiling.separate_masking_iterations = false;
-    var variant = declare(Sm90FwdTiling, tiling, mode, .{
-        .varlen_head_dims = &.{ 64, 128 },
-        .gqa_head_dims = &.{ 64, 96 },
-        .gqa_limited_1_head_dims = &.{256},
-        .gqa_specialization = pack_gqa_only,
-        .limited_1_limits = .{
+pub fn forwardSm90Variants(comptime head_dim: u32) Variants(Sm90FwdTiling) {
+    comptime {
+        const regular = forwardSm90(head_dim);
+        const bounded = forwardSm90Bounded(head_dim);
+        const bound: SequenceLimits = .{
             .max_seqlen_q = if (regular.intra_wg_overlap or regular.overlap_so_sv) 1024 else 256,
-        },
-        .limited_2_limits = .{ .max_seqlen_q = if (head_dim == 64) 512 else 256 },
-    }) orelse return null;
-    if (mode == .limited_1 and head_dim == 128) variant.specialization.limits.min_seqlen_q = 257;
-    if (mode == .gqa_limited_1 and head_dim == 256) variant.specialization.limits.min_seqlen_q =
-        513;
-    if (mode == .varlen_limited_1 and
-        tiling.block_m != regular.block_m) variant.specialization.limits.max_seqlen_q =
-        tiling.block_m;
-    if (mode == .varlen_limited_1 and head_dim == 128) variant.tiling.separate_masking_iterations =
-        false;
-    if (mode.isLimited1() and regular.overlap_so_sv) variant.specialization.limits.max_window_size =
-        1280;
-    return variant;
+            .max_window_size = if (regular.overlap_so_sv) 1280 else 0,
+        };
+        var list: VariantList(Sm90FwdTiling) = .{};
+        if (head_dim == 64 or head_dim == 128) {
+            if (bounded) |bounded_tiling| {
+                var tiling = bounded_tiling;
+                if (head_dim == 128) tiling.separate_masking_iterations = false;
+                var limits = bound;
+                if (tiling.block_m != regular.block_m) limits.max_seqlen_q = tiling.block_m;
+                list.add(tiling, varlenSorted(limits));
+            }
+            list.add(regular, varlen_sorted);
+        }
+        if (head_dim == 64 or head_dim == 96) list.add(regular, grouped_pack);
+        if (head_dim == 256) {
+            var grouped = grouped_pack;
+            grouped.limits = bound;
+            grouped.limits.min_seqlen_q = 513;
+            list.add(bounded.?, grouped);
+        }
+        if (bounded) |tiling| {
+            var limits = bound;
+            if (head_dim == 128) limits.min_seqlen_q = 257;
+            list.add(tiling, .{ .limits = limits });
+        }
+        if (head_dim == 64 or head_dim == 128) {
+            var tiling = if (head_dim == 64) regular else bounded.?;
+            tiling.separate_masking_iterations = false;
+            list.add(tiling, .{ .limits = .{ .max_seqlen_q = if (head_dim == 64) 512 else 256 } });
+        }
+        list.add(regular, .{});
+        return list.slice();
+    }
 }
 
 pub const Sm90BwdTiling = struct {
@@ -963,7 +1030,6 @@ pub const Sm90BwdTiling = struct {
     separate_do_pipeline: bool = false,
     batch_major: bool = false,
     separate_masking_iterations: bool = false,
-    has_limited_2: bool = false,
     l2_swizzle: L2SwizzlePolicy = &.{},
     scheduling_mode: SchedulingMode = .single_tile,
 
@@ -1024,7 +1090,6 @@ pub fn backwardSm90(head_dim: u32) Sm90BwdTiling {
             .head_dim = 96,
             .dq_split = .none,
             .separate_masking_iterations = true,
-            .has_limited_2 = true,
         },
         128 => .{ .head_dim = 128, .early_exp_tiles = 4 },
         256 => .{
@@ -1037,25 +1102,23 @@ pub fn backwardSm90(head_dim: u32) Sm90BwdTiling {
     };
 }
 
-pub fn backwardSm90Variant(head_dim: u32, mode: Mode) ?Variant(Sm90BwdTiling) {
-    var tiling: Sm90BwdTiling =
-        if (!mode.isLimited1()) backwardSm90(head_dim) else switch (head_dim) {
-            64 => .{ .head_dim = 64, .dq_split = .none },
-            else => return null,
-        };
-    if (mode.tier() == .limited_2) {
-        if (!tiling.has_limited_2) return null;
-        tiling.separate_masking_iterations = false;
+pub fn backwardSm90Variants(comptime head_dim: u32) Variants(Sm90BwdTiling) {
+    comptime {
+        const regular = backwardSm90(head_dim);
+        const one_dq_part: Sm90BwdTiling = .{ .head_dim = 64, .dq_split = .none };
+        const maxq128: SequenceLimits = .{ .max_seqlen_q = 128 };
+        var list: VariantList(Sm90BwdTiling) = .{};
+        if (head_dim == 64) list.add(one_dq_part, varlenSorted(maxq128));
+        if (head_dim == 64 or head_dim == 128) list.add(regular, varlen_sorted);
+        if (head_dim == 64) list.add(one_dq_part, .{ .limits = maxq128 });
+        if (head_dim == 96) {
+            var tiling = regular;
+            tiling.separate_masking_iterations = false;
+            list.add(tiling, .{ .limits = .{ .max_seqlen_q = 1024 } });
+        }
+        list.add(regular, .{});
+        return list.slice();
     }
-    return declare(Sm90BwdTiling, tiling, mode, .{
-        .varlen_head_dims = &.{ 64, 128 },
-        .limited_1_limits = .{ .max_seqlen_q = 128 },
-        .limited_2_limits = .{ .max_seqlen_q = 1024 },
-    });
-}
-
-pub fn launchBackwardSm90(head_dim: u32, mode: Mode) ?Launch {
-    return launch(.flash_bwd_sm90, head_dim, mode);
 }
 
 pub const Sm100FwdTiling = struct {
@@ -1174,7 +1237,22 @@ pub fn forwardSm100(head_dim: u32) Sm100FwdTiling {
     };
 }
 
-pub fn forwardSm100Limited2(head_dim: u32) ?Sm100FwdTiling {
+pub fn forwardSm100OneQueryStage(head_dim: u32) ?Sm100FwdTiling {
+    if (head_dim != 64 and head_dim != 96 and head_dim != 128) return null;
+    const regular = forwardSm100(head_dim);
+    var tiling = regular;
+    tiling.q_stage = 1;
+    tiling.block_n = 64;
+    tiling.kv_stage = regular.kv_stage * regular.block_n / tiling.block_n;
+    tiling.ex2_emulated_pairs = 0;
+    tiling.ex2_emulation_placement = .interleaved;
+    tiling.p_split_pairs = 0;
+    tiling.load_backoff_ns = 0;
+    tiling.fragment_stores = false;
+    return tiling;
+}
+
+pub fn forwardSm100Bounded(head_dim: u32) Sm100FwdTiling {
     var tiling = forwardSm100(head_dim);
     switch (head_dim) {
         64 => {},
@@ -1189,64 +1267,65 @@ pub fn forwardSm100Limited2(head_dim: u32) ?Sm100FwdTiling {
     return tiling;
 }
 
-pub fn forwardSm100Variant(head_dim: u32, mode: Mode) ?Variant(Sm100FwdTiling) {
-    const tiling = switch (mode.tier()) {
-        .regular, .local_two_sided => forwardSm100(head_dim),
-        .limited_1 => limited_1: {
-            if (head_dim != 64 and head_dim != 96 and head_dim != 128) return null;
-            const regular = forwardSm100(head_dim);
-            var tiling = regular;
-            tiling.q_stage = 1;
-            tiling.block_n = 64;
-            tiling.kv_stage = regular.kv_stage * regular.block_n / tiling.block_n;
-            tiling.ex2_emulated_pairs = 0;
-            tiling.ex2_emulation_placement = .interleaved;
-            tiling.p_split_pairs = 0;
-            tiling.load_backoff_ns = 0;
-            tiling.fragment_stores = false;
-            break :limited_1 tiling;
-        },
-        .limited_2, .local_two_sided_limited_2 => switch (mode) {
-            .limited_2, .local_two_sided_limited_2 => forwardSm100Limited2(head_dim) orelse
-                return null,
-            .varlen_limited_2 => if (head_dim == 96) forwardSm100Limited2(
-                head_dim,
-            ).? else return null,
-            else => return null,
-        },
-    };
-    const batch_major = mode == .varlen and head_dim == 72;
-    var variant = declare(Sm100FwdTiling, tiling, mode, .{
-        .varlen_head_dims = &.{ 64, 96, 128 },
-        .gqa_head_dims = &.{ 64, 72, 96, 128 },
-        .gqa_specialization = pack_gqa_only,
-        .limited_1_limits = .{ .max_seqlen_q = 128 },
-        .limited_2_limits = switch (head_dim) {
-            64 => .{ .max_seqlen_q = 512 },
-            96 => .{ .max_seqlen_q = 256 },
-            else => .{ .max_seqlen_q = 1024, .masks = .initOne(.causal), .batched_only = true },
-        },
-        .local_head_dims = &.{64},
-    }) orelse if (batch_major) Variant(Sm100FwdTiling){
-        .tiling = tiling,
-        .specialization = .{ .limits = .{ .masks = .initOne(.dense) } },
-    } else return null;
-    variant.tiling.batch_major = batch_major;
-    if (variant.specialization.limits.two_sided_window) {
-        variant.tiling.divmod_decode = false;
-        variant.tiling.prologue_loads = false;
+fn withoutPrologueLoads(sm100_tiling: Sm100FwdTiling) Sm100FwdTiling {
+    var tiling = sm100_tiling;
+    tiling.divmod_decode = false;
+    tiling.prologue_loads = false;
+    return tiling;
+}
+
+pub fn forwardSm100Variants(comptime head_dim: u32) Variants(Sm100FwdTiling) {
+    comptime {
+        const regular = forwardSm100(head_dim);
+        const one_stage = forwardSm100OneQueryStage(head_dim);
+        const bounded = forwardSm100Bounded(head_dim);
+        var one_stage_limits: SequenceLimits = .{ .max_seqlen_q = 128 };
+        if (head_dim == 128) one_stage_limits.min_seqlen_q = 65;
+        var varlen_regular = withoutPrologueLoads(regular);
+        if (head_dim != 64 and head_dim != 96) varlen_regular.fragment_stores = false;
+        var list: VariantList(Sm100FwdTiling) = .{};
+        if (one_stage) |tiling| {
+            list.add(withoutPrologueLoads(tiling), varlenSorted(one_stage_limits));
+        }
+        if (head_dim == 96) list.add(
+            withoutPrologueLoads(bounded),
+            varlenSorted(.{ .max_seqlen_q = 1024 }),
+        );
+        switch (head_dim) {
+            64, 96, 128 => list.add(varlen_regular, varlen_sorted),
+            72 => {
+                var tiling = varlen_regular;
+                tiling.batch_major = true;
+                list.add(tiling, .{ .inputs = .varlen, .limits = .{ .masks = .initOne(.dense) } });
+            },
+            else => {},
+        }
+        if (head_dim == 64) {
+            var two_sided = grouped_pack;
+            two_sided.limits.two_sided_window = true;
+            list.add(withoutPrologueLoads(regular), two_sided);
+        }
+        if (head_dim != 256) list.add(regular, grouped_pack);
+        if (one_stage) |tiling| list.add(tiling, .{ .limits = one_stage_limits });
+        if (head_dim == 64) list.add(withoutPrologueLoads(bounded), .{
+            .inputs = .batched,
+            .limits = .{ .max_seqlen_q = 512, .two_sided_window = true },
+        });
+        list.add(bounded, switch (head_dim) {
+            64 => .{ .limits = .{ .max_seqlen_q = 512 } },
+            96 => .{ .limits = .{ .max_seqlen_q = 256 } },
+            else => .{
+                .inputs = .batched,
+                .limits = .{ .max_seqlen_q = 1024, .masks = .initOne(.causal) },
+            },
+        });
+        if (head_dim == 64) list.add(withoutPrologueLoads(regular), .{
+            .inputs = .batched,
+            .limits = .{ .two_sided_window = true },
+        });
+        list.add(regular, .{});
+        return list.slice();
     }
-    if (mode.isLimited1() and head_dim == 128) variant.specialization.limits.min_seqlen_q = 65;
-    if (mode.isVarlen()) {
-        variant.tiling.divmod_decode = false;
-        variant.tiling.prologue_loads = false;
-    }
-    if (mode == .varlen_limited_2) variant.specialization.limits.max_seqlen_q = 1024;
-    if (mode.isVarlen() and !mode.isLimited1()) switch (head_dim) {
-        64, 96 => {},
-        else => variant.tiling.fragment_stores = false,
-    };
-    return variant;
 }
 
 pub const Sm100BwdTiling = struct {
@@ -1351,35 +1430,31 @@ pub fn backwardSm100(head_dim: u32) Sm100BwdTiling {
     };
 }
 
-pub fn backwardSm100Variant(head_dim: u32, mode: Mode) ?Variant(Sm100BwdTiling) {
-    if (head_dim != 128) {
-        if (mode.isLimited1()) return null;
-        return declare(
-            Sm100BwdTiling,
-            backwardSm100(head_dim),
-            mode,
-            .{ .varlen_head_dims = &.{64} },
-        );
+pub fn backwardSm100Variants(comptime head_dim: u32) Variants(Sm100BwdTiling) {
+    comptime {
+        const plain = backwardSm100(head_dim);
+        var list: VariantList(Sm100BwdTiling) = .{};
+        if (head_dim != 128) {
+            if (head_dim == 64) list.add(plain, varlen_sorted);
+            list.add(plain, .{});
+            return list.slice();
+        }
+        const two_cta_tiling: Sm100BwdTiling = .{
+            .head_dim = 128,
+            .block_m = 64,
+            .q_stage = 1,
+            .use_2cta_instrs = true,
+            .min_qhead_per_split = 0,
+            .l2_swizzle = &.{},
+            .use_tma_store = true,
+        };
+        var grouped_varlen = varlen_sorted;
+        grouped_varlen.grouped = true;
+        list.add(plain, grouped_varlen);
+        list.add(plain, varlenSorted(.{ .max_seqlen_q = 3072 }));
+        list.add(plain, .{ .inputs = .batched, .grouped = true });
+        list.add(plain, .{ .limits = .{ .max_seqlen_q = 1024 } });
+        list.add(two_cta_tiling, .{ .head_split = true });
+        return list.slice();
     }
-    const two_cta_tiling: Sm100BwdTiling = .{
-        .head_dim = 128,
-        .block_m = 64,
-        .q_stage = 1,
-        .use_2cta_instrs = true,
-        .min_qhead_per_split = 0,
-        .l2_swizzle = &.{},
-        .use_tma_store = true,
-    };
-    return switch (mode) {
-        .regular => .{ .tiling = two_cta_tiling, .specialization = .{ .head_split = true } },
-        .limited_1, .varlen_limited_1 => declare(Sm100BwdTiling, backwardSm100(head_dim), mode, .{
-            .varlen_head_dims = &.{head_dim},
-            .limited_1_limits = .{ .max_seqlen_q = if (mode.isVarlen()) 3072 else 1024 },
-        }),
-        .gqa, .varlen_gqa => declare(Sm100BwdTiling, backwardSm100(head_dim), mode, .{
-            .gqa_head_dims = &.{head_dim},
-            .varlen_gqa_head_dims = &.{head_dim},
-        }),
-        else => null,
-    };
 }

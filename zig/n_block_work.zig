@@ -3,8 +3,13 @@ const BackwardParams = @import("BackwardParams.zig");
 const SeqlenInfoQK = @import("SeqlenInfoQK.zig");
 const tile_scheduler = @import("tile_scheduler.zig");
 const BlockInfo = @import("BlockInfo.zig");
+const inter_sequence = @import("inter_sequence.zig");
 
-pub fn NBlockWork(comptime block_m: u32, comptime block_n: u32) type {
+pub const Options = struct {
+    inter_sequence: bool = false,
+};
+
+pub fn NBlockWork(comptime block_m: u32, comptime block_n: u32, comptime options: Options) type {
     return struct {
         batch: u32,
         kv_head: u32,
@@ -16,6 +21,7 @@ pub fn NBlockWork(comptime block_m: u32, comptime block_n: u32) type {
         m_block_min: u32,
         m_block_count: u32,
         block_info: BlockInfo,
+        query_batch: if (options.inter_sequence) u32 else void,
 
         pub const Step = struct {
             head: u32,
@@ -53,7 +59,7 @@ pub fn NBlockWork(comptime block_m: u32, comptime block_n: u32) type {
             };
             const m_block_min, const m_block_max = info.mBlockMinMax(first_key, key_count, block_m);
             const qhead_per_kvhead = params.qhead_per_kvhead / num_qhead_splits;
-            return .{
+            var work: Work = .{
                 .batch = tile.batch,
                 .kv_head = tile.head,
                 .qhead_per_kvhead = qhead_per_kvhead,
@@ -64,7 +70,58 @@ pub fn NBlockWork(comptime block_m: u32, comptime block_n: u32) type {
                 .m_block_min = m_block_min,
                 .m_block_count = m_block_max - m_block_min,
                 .block_info = info,
+                .query_batch = if (options.inter_sequence) tile.batch else {},
             };
+            if (options.inter_sequence) _ = work.findSegment(params, 0);
+            return work;
+        }
+
+        pub fn queryBatch(work: *const Work) u32 {
+            return if (options.inter_sequence) work.query_batch else work.batch;
+        }
+
+        pub fn nextSegment(work: *Work, params: BackwardParams) bool {
+            return work.findSegment(params, work.query_batch + 1);
+        }
+
+        fn findSegment(work: *Work, params: BackwardParams, from: u32) bool {
+            comptime std.debug.assert(options.inter_sequence);
+            const count = params.num_batch;
+            const row: inter_sequence.BitRow = .init(params.visibility_bits, count, work.batch);
+            const cu_seqlens_q: [*]addrspace(.global) const i32 = @ptrFromInt(params.cu_seqlens_q);
+            var next_sequence = from;
+            while (true) {
+                const sequence = row.find(next_sequence, true);
+                if (sequence >= count) {
+                    work.m_block_count = 0;
+                    return false;
+                }
+                next_sequence = sequence + 1;
+                const window: inter_sequence.Window = if (sequence == work.batch)
+                    inter_sequence.sequenceWindow(params.window_sizes, count, sequence, .{
+                        .left = params.window_size_left,
+                        .right = params.window_size_right,
+                    })
+                else
+                    .unbounded;
+                const offset_q: u32 = @intCast(cu_seqlens_q[sequence]);
+                work.sequence.offset_q = offset_q;
+                work.sequence.seqlen_q = @as(u32, @intCast(cu_seqlens_q[sequence + 1])) - offset_q;
+                work.query_batch = sequence;
+                work.block_info = .{
+                    .first_row = 0,
+                    .row_count = work.sequence.seqlen_q,
+                    .seqlen_q = work.sequence.seqlen_q,
+                    .seqlen_k = work.sequence.seqlen_k,
+                    .window_size_left = window.left,
+                    .window_size_right = window.right,
+                };
+                const m_block_min, const m_block_max =
+                    work.block_info.mBlockMinMax(work.first_key, work.key_count, block_m);
+                work.m_block_min = m_block_min;
+                work.m_block_count = m_block_max - m_block_min;
+                if (work.m_block_count > 0) return true;
+            }
         }
 
         pub fn rowLimits(work: *const Work, key: u32) RowLimits {

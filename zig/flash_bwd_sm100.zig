@@ -66,7 +66,7 @@ pub fn FlashAttnBwdSm100(
     const reduce_warps = 4;
     const compute_warps = 4 * compute_groups;
     const group_warps = compute_warps / compute_groups;
-    const Work = @import("n_block_work.zig").NBlockWork(block_m, block_n);
+    const Work = @import("n_block_work.zig").NBlockWork(block_m, block_n, .{});
     const scheduler_options: tile_scheduler.Options = .{
         .block_m = block_n,
         .row_bytes = 8 * head_dim,
@@ -968,10 +968,7 @@ pub fn FlashAttnBwdSm100(
     };
 }
 
-const variant = configurations.backwardSm100Variant(
-    config.head_dim,
-    @field(configurations.Mode, config.mode),
-).?;
+const variant = configurations.variants(.flash_bwd_sm100, config.head_dim)[config.variant];
 const backward_tiling = variant.tiling;
 const Backward = if (backward_tiling.use_2cta_instrs) two_cta_kernel.FlashAttnBwdSm100TwoCta(
     backward_tiling,

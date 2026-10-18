@@ -44,6 +44,8 @@ lse_batch_stride: u64 = 0,
 lse_head_stride: u64 = 0,
 num_batch: u32 = 0,
 scheduler_metadata: u64 = 0,
+visibility_bits: u64 = 0,
+window_sizes: u64 = 0,
 
 pub const Gradient = enum { dk, dv };
 

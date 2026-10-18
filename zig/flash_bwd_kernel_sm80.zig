@@ -19,6 +19,25 @@ pub fn FlashAttnBwdSm80Kernel(comptime Components: type) type {
             const operands: Components.Operands = .init();
             const values = Components.loadValues(&operands);
             var gradients = Components.zeroDkv();
+            if (Components.inter_sequence) {
+                while (true) {
+                    iterate(params, &work, &load, &operands, &values, &gradients);
+                    if (!work.nextSegment(params)) break;
+                    load.restart(&work);
+                }
+            } else iterate(params, &work, &load, &operands, &values, &gradients);
+            Components.drainDq();
+            Components.storeGradients(params, &work, gradients);
+        }
+
+        inline fn iterate(
+            params: BackwardParams,
+            work: *const Components.Work,
+            load: *const Components.Load,
+            operands: *const Components.Operands,
+            values: *const Components.Values,
+            gradients: *Components.DkvAccumulators,
+        ) void {
             const iterations = work.iterations();
             const scheduled = @hasDecl(Components.Load, "Steps");
             const Steps = if (scheduled) Components.Load.Steps(Components) else void;
@@ -27,18 +46,18 @@ pub fn FlashAttnBwdSm80Kernel(comptime Components: type) type {
             var iteration: u32 = 0;
             while (iteration < iterations) : (iteration += 1) {
                 const step = work.branchedStep(iteration);
-                load.prefetch(iteration + 1, iterations, &work);
+                load.prefetch(iteration + 1, iterations, work);
                 const probabilities =
                     Components.computeProbabilities(
                         params,
                         iteration,
-                        &work,
+                        work,
                         step,
-                        &load,
-                        &operands,
-                        &values,
+                        load,
+                        operands,
+                        values,
                     );
-                Components.storePdS(probabilities, &operands);
+                Components.storePdS(probabilities, operands);
                 if (scheduled) {
                     Steps.schedule.loopBarrier();
                 } else {
@@ -47,41 +66,39 @@ pub fn FlashAttnBwdSm80Kernel(comptime Components: type) type {
                 if (dq_first) {
                     Steps.accumulateDqAndDkv(
                         params,
-                        &work,
+                        work,
                         step,
-                        &gradients,
-                        &load,
+                        gradients,
+                        load,
                         iteration,
-                        &operands,
+                        operands,
                     );
                 } else if (Components.alternate_gradient_order and
                     thread.warp() >= Components.thread_count / 64)
                 {
-                    Components.accumulateDq(params, &work, step, &load, iteration, &operands);
-                    Components.accumulateDkv(&gradients, &load, iteration, &operands, {});
+                    Components.accumulateDq(params, work, step, load, iteration, operands);
+                    Components.accumulateDkv(gradients, load, iteration, operands, {});
                 } else if (Components.alternate_gradient_order) {
-                    Components.accumulateDkv(&gradients, &load, iteration, &operands, {});
-                    Components.accumulateDq(params, &work, step, &load, iteration, &operands);
+                    Components.accumulateDkv(gradients, load, iteration, operands, {});
+                    Components.accumulateDq(params, work, step, load, iteration, operands);
                 } else if (scheduled and Steps.schedule.double_buffered_query) {
                     Steps.accumulateDvAndRelease(
-                        &gradients,
-                        &load,
+                        gradients,
+                        load,
                         iteration,
                         iterations,
-                        &work,
-                        &operands,
+                        work,
+                        operands,
                     );
-                    Components.accumulateDq(params, &work, step, &load, iteration, &operands);
-                    Steps.accumulateDk(&gradients, iteration, &operands);
+                    Components.accumulateDq(params, work, step, load, iteration, operands);
+                    Steps.accumulateDk(gradients, iteration, operands);
                 } else {
-                    Components.accumulateDkv(&gradients, &load, iteration, &operands, {});
-                    load.release(iteration, iterations, &work);
-                    Components.accumulateDq(params, &work, step, &load, iteration, &operands);
+                    Components.accumulateDkv(gradients, load, iteration, operands, {});
+                    load.release(iteration, iterations, work);
+                    Components.accumulateDq(params, work, step, load, iteration, operands);
                 }
-                load.finish(iteration, iterations, &work);
+                load.finish(iteration, iterations, work);
             }
-            Components.drainDq();
-            Components.storeGradients(params, &work, gradients);
         }
     };
 }

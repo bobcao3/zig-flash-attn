@@ -3,8 +3,12 @@ const configurations = @import("zig/configurations.zig");
 
 const Source = configurations.Source;
 
-fn instance(comptime source: Source, mode: configurations.Mode, head_dim: u32) []const u8 {
-    return std.fmt.comptimePrint("{s}{s}_hd{d}", .{ @tagName(source), mode.suffix(), head_dim });
+fn instance(comptime source: Source, comptime variant: []const u8, head_dim: u32) []const u8 {
+    return std.fmt.comptimePrint("{s}{s}_hd{d}", .{ @tagName(source), variant, head_dim });
+}
+
+fn variantOptionName(comptime variant: []const u8) []const u8 {
+    return if (variant.len == 0) "unrestricted" else variant[1..];
 }
 
 fn ptxTarget(comptime source: Source) []const u8 {
@@ -28,14 +32,18 @@ pub fn build(b: *std.Build) void {
     const sources = b.option([]const []const u8, "source", "Only build these kernel sources");
     const targets = b.option([]const []const u8, "sm", "Only assemble cubins for these targets");
     const head_dims = b.option([]const []const u8, "head-dim", "Only build these head dimensions");
-    const modes = b.option([]const []const u8, "mode", "Only build these modes");
+    const variant_names = b.option(
+        []const []const u8,
+        "variant",
+        "Only build these variants, named without the leading underscore or as unrestricted",
+    );
     const ptxas = ptxas_option orelse b.findProgram(.{ .names = &.{"ptxas"} }) orelse
         b.findProgram(.{ .names = &.{"/usr/local/cuda/bin/ptxas"} }) orelse "ptxas";
     const fatbinary = b.pathJoin(&.{ std.fs.path.dirname(ptxas) orelse "", "fatbinary" });
 
     var manifest: std.Io.Writer.Allocating = .init(b.allocator);
     var declared: std.Io.Writer.Allocating = .init(b.allocator);
-    if (sources != null or targets != null or head_dims != null or modes != null) {
+    if (sources != null or targets != null or head_dims != null or variant_names != null) {
         declared.writer.writeAll("partial\n") catch @panic("OOM");
     }
     manifest.writer.writeAll("# name") catch @panic("OOM");
@@ -46,28 +54,30 @@ pub fn build(b: *std.Build) void {
     @setEvalBranchQuota(300_000);
     inline for (comptime std.enums.values(Source)) |source| {
         inline for (configurations.head_dims) |head_dim| {
-            inline for (comptime std.enums.values(configurations.Mode)) |mode| {
-                if (configurations.launch(source, head_dim, mode)) |launch| {
-                    const name = comptime instance(source, mode, head_dim);
-                    declared.writer.print("{s}\n", .{name}) catch @panic("OOM");
-                    if (selected(sources, @tagName(source)) and
-                        selectedHeadDim(head_dims, head_dim) and selected(modes, @tagName(mode)))
-                    {
-                        manifest.writer.writeAll(name) catch @panic("OOM");
-                        inline for (@typeInfo(
-                            configurations.Launch,
-                        ).@"struct".field_names) |field_name| {
-                            const value = @field(launch, field_name);
-                            if (@typeInfo(@TypeOf(value)) == .@"enum") {
-                                manifest.writer.print(" {s}", .{@tagName(value)}) catch
-                                    @panic("OOM");
-                            } else {
-                                manifest.writer.print(" {d}", .{value}) catch @panic("OOM");
-                            }
+            const variants = comptime configurations.variants(source, head_dim);
+            inline for (0..variants.len) |index| {
+                const variant = comptime variants[index].specialization.name();
+                const launch = comptime configurations.launch(source, head_dim, index);
+                const name = comptime instance(source, variant, head_dim);
+                declared.writer.print("{s}\n", .{name}) catch @panic("OOM");
+                if (selected(sources, @tagName(source)) and
+                    selectedHeadDim(head_dims, head_dim) and
+                    selected(variant_names, variantOptionName(variant)))
+                {
+                    manifest.writer.writeAll(name) catch @panic("OOM");
+                    inline for (@typeInfo(
+                        configurations.Launch,
+                    ).@"struct".field_names) |field_name| {
+                        const value = @field(launch, field_name);
+                        if (@typeInfo(@TypeOf(value)) == .@"enum") {
+                            manifest.writer.print(" {s}", .{@tagName(value)}) catch
+                                @panic("OOM");
+                        } else {
+                            manifest.writer.print(" {d}", .{value}) catch @panic("OOM");
                         }
-                        manifest.writer.writeByte('\n') catch @panic("OOM");
-                        addInstance(b, source, mode, head_dim, optimize, ptxas, fatbinary, targets);
                     }
+                    manifest.writer.writeByte('\n') catch @panic("OOM");
+                    addInstance(b, source, index, head_dim, optimize, ptxas, fatbinary, targets);
                 }
             }
         }
@@ -109,17 +119,18 @@ fn selectedHeadDim(filter: ?[]const []const u8, head_dim: u32) bool {
 fn addInstance(
     b: *std.Build,
     comptime source: Source,
-    comptime mode: configurations.Mode,
+    comptime index: usize,
     comptime head_dim: u32,
     optimize: std.lang.Optimize,
     ptxas: []const u8,
     fatbinary: []const u8,
     targets: ?[]const []const u8,
 ) void {
-    const name = comptime instance(source, mode, head_dim);
+    const variant = comptime configurations.variants(source, head_dim)[index].specialization.name();
+    const name = comptime instance(source, variant, head_dim);
     const config = b.addOptions();
     config.addOption(u32, "head_dim", head_dim);
-    config.addOption([]const u8, "mode", @tagName(mode));
+    config.addOption(usize, "variant", index);
     const kernel = b.addExecutable(.{
         .name = name,
         .use_llvm = false,

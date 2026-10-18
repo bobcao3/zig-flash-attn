@@ -148,8 +148,8 @@ def test_packed_gqa_at_every_group_size(monkeypatch, restrict_candidates, head_d
         with case(group=group, window=window_name, seqlen_q=seqlen_q, seqlen_k=seqlen_k):
             window, causal = window_for(window_name, seqlen_k)
             results = []
-            for modes in ((specialization.Mode.GQA,), ()):
-                restrict_candidates(modes)
+            for variants in (("_batched_gqa",), ()):
+                restrict_candidates(variants)
                 cuda_seed(seqlen_q + seqlen_k + head_dim + group)
                 q, k, v, dout = batched_inputs(3, seqlen_q, seqlen_k, 2 * group, 2, head_dim)
                 results.append(launch_forward_backward(q, k, v, dout, (3, 2 * group, seqlen_q), window))
