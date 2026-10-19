@@ -110,32 +110,75 @@ const inter_sequence_sorted: Specialization = .{
     .scheduler_metadata = true,
     .sort_batches = true,
 };
+const inter_sequence_block_table: Specialization = .{ .inputs = .varlen, .inter_sequence = true };
+const inter_sequence_packed: Specialization = .{
+    .inputs = .varlen,
+    .grouped = true,
+    .inter_sequence = true,
+    .pack_gqa = true,
+};
 pub const inter_sequence_head_dims = [_]u32{ 64, 128, 256 };
+const single_tile_inter_sequence_head_dim = 256;
 
-fn interSequenceSorted(limits: SequenceLimits) Specialization {
-    var specialization = inter_sequence_sorted;
-    specialization.limits = limits;
-    return specialization;
-}
+pub const inter_sequence_splits = struct {
+    pub const min_block_work = 16;
+    pub const max_splits = 4;
+};
 
-pub const inter_sequence_megakernel = struct {
+pub const inter_sequence_persistent = struct {
     pub const block_n = 64;
-    pub const wide_warps = 2 * warps_per_warp_group;
-    pub const narrow_warps = warps_per_warp_group;
-    pub const supported_head_dims = [_]u32{ 64, 128 };
+    pub const cta_warps = 2 * warps_per_warp_group;
+    pub const supported_head_dims = [_]u32{ 64, 128, 512 };
 
-    pub fn supports(head_dim: u32) bool {
-        return std.mem.indexOfScalar(u32, &supported_head_dims, head_dim) != null;
-    }
+    pub const tile_buffers = 6;
+    pub const stages = 3;
+    pub const cta_tile_min_waves = 1;
 
     pub fn sharedBytes(head_dim: u32) u32 {
         const row_bytes = pitchChunks(head_dim / Sm80FwdTiling.chunk_elements) *
             Sm80FwdTiling.chunk_bytes;
-        const wide = (wide_warps * 16 + 2 * block_n) * row_bytes;
-        const narrow = (narrow_warps * 16 + 2 * block_n) * row_bytes;
-        return @max(wide, 2 * narrow);
+        if (!largeHeadDim(head_dim)) return tile_buffers * block_n * row_bytes;
+        const stage_bytes = 2 * large_head_dim_stages * large_head_dim_block_n * row_bytes;
+        const lane_scores = large_head_dim_block_n / 8 * @sizeOf(@Vector(4, f32));
+        return stage_bytes + 2 * cta_warps * 32 * lane_scores;
+    }
+
+    pub fn capsRegisters(head_dim: u32) bool {
+        return !largeHeadDim(head_dim) and forwardSm80(head_dim).max_registers != null;
+    }
+
+    pub fn largeHeadDim(head_dim: u32) bool {
+        return head_dim > 256;
+    }
+
+    pub const large_head_dim_stages = 2;
+    pub const large_head_dim_block_n = 16;
+};
+
+pub const PersistentTiling = struct {
+    head_dim: u32,
+    block_m: u32 = inter_sequence_persistent.cta_warps * 16,
+    block_n: u32 = inter_sequence_persistent.block_n,
+    scheduling_mode: SchedulingMode = .dynamic,
+
+    pub fn threads(_: PersistentTiling) u32 {
+        return inter_sequence_persistent.cta_warps * 32;
+    }
+
+    pub fn sharedBytes(tiling: PersistentTiling) u32 {
+        return inter_sequence_persistent.sharedBytes(tiling.head_dim);
     }
 };
+
+fn persistentVariants(comptime head_dim: u32) Variants(PersistentTiling) {
+    comptime {
+        const tiling: PersistentTiling = .{ .head_dim = head_dim };
+        var list: VariantList(PersistentTiling) = .{};
+        list.add(tiling, .{});
+        list.add(tiling, .{ .grouped = true, .pack_gqa = true });
+        return list.slice();
+    }
+}
 
 fn hasInterSequence(head_dim: u32) bool {
     return std.mem.indexOfScalar(u32, &inter_sequence_head_dims, head_dim) != null;
@@ -160,6 +203,7 @@ fn VariantList(comptime T: type) type {
 
 pub const Source = enum {
     flash_fwd_sm80,
+    flash_fwd_persistent_sm80,
     flash_bwd_sm80,
     flash_fwd_sm120,
     flash_fwd_sm90,
@@ -170,7 +214,7 @@ pub const Source = enum {
 
     pub fn arch(source: Source) u32 {
         return switch (source) {
-            .flash_fwd_sm80, .flash_bwd_sm80 => 80,
+            .flash_fwd_sm80, .flash_fwd_persistent_sm80, .flash_bwd_sm80 => 80,
             .flash_fwd_sm120, .flash_bwd_sm120 => 120,
             .flash_fwd_sm90, .flash_bwd_sm90 => 90,
             .flash_fwd_sm100, .flash_bwd_sm100 => 100,
@@ -180,6 +224,7 @@ pub const Source = enum {
     pub fn Tiling(comptime source: Source) type {
         return switch (source) {
             .flash_fwd_sm80, .flash_fwd_sm120 => Sm80FwdTiling,
+            .flash_fwd_persistent_sm80 => PersistentTiling,
             .flash_bwd_sm80, .flash_bwd_sm120 => Sm80BwdTiling,
             .flash_fwd_sm90 => Sm90FwdTiling,
             .flash_bwd_sm90 => Sm90BwdTiling,
@@ -187,11 +232,19 @@ pub const Source = enum {
             .flash_bwd_sm100 => Sm100BwdTiling,
         };
     }
+
+    pub fn headDims(comptime source: Source) []const u32 {
+        return switch (source) {
+            .flash_fwd_persistent_sm80 => &inter_sequence_persistent.supported_head_dims,
+            else => &head_dims,
+        };
+    }
 };
 
 pub fn variants(comptime source: Source, comptime head_dim: u32) Variants(source.Tiling()) {
     const list = comptime switch (source) {
         .flash_fwd_sm80 => forwardSm80Variants(head_dim),
+        .flash_fwd_persistent_sm80 => persistentVariants(head_dim),
         .flash_bwd_sm80 => backwardSm80Variants(head_dim),
         .flash_fwd_sm120 => forwardSm120Variants(head_dim),
         .flash_fwd_sm90 => forwardSm90Variants(head_dim),
@@ -244,7 +297,7 @@ pub fn launch(comptime source: Source, comptime head_dim: u32, comptime index: u
     var masks = limits.masks.iterator();
     while (masks.next()) |mask| result.masks |= @as(u32, 1) << @backingInt(mask);
     switch (source) {
-        .flash_fwd_sm80 => {},
+        .flash_fwd_sm80, .flash_fwd_persistent_sm80 => {},
         .flash_bwd_sm80 => result.shared_bytes = tile.schedule.sharedBytes(tile),
         .flash_fwd_sm120, .flash_bwd_sm120 => {
             const pitch = tile.rowPitchChunks();
@@ -596,12 +649,9 @@ pub fn forwardSm80Variants(comptime head_dim: u32) Variants(Sm80FwdTiling) {
             .masks = dense_or_causal,
         } });
         list.add(regular, .{});
-        if (hasInterSequence(head_dim)) {
-            if (sorted_head_dim) list.add(
-                forwardSm80Short(head_dim),
-                interSequenceSorted(.{ .max_seqlen_q = 2048 }),
-            );
-            list.add(regular, inter_sequence_sorted);
+        if (head_dim == single_tile_inter_sequence_head_dim) {
+            list.add(regular, inter_sequence_block_table);
+            list.add(regular, inter_sequence_packed);
         }
         return list.slice();
     }
@@ -623,6 +673,7 @@ pub const Sm80BwdTiling = struct {
     bulk_reduce: bool = false,
     p_first: bool = false,
     alternate_gradient_order: bool = false,
+    skips_padding_rows: bool = false,
     pdl: bool = false,
     batch_major: bool = false,
     l2_swizzle: L2SwizzlePolicy = &.{},
@@ -727,12 +778,14 @@ pub fn backwardSm80(head_dim: u32) Sm80BwdTiling {
             tiling.v_in_regs = true;
             tiling.alternate_gradient_order = true;
             tiling.p_first = true;
+            tiling.skips_padding_rows = true;
         },
         256 => {
             tiling.block_m = 64;
             tiling.warps = 8;
             tiling.v_in_regs = true;
             tiling.gradient_row_tiles = 2;
+            tiling.skips_padding_rows = true;
         },
         else => {},
     }

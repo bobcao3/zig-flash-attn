@@ -20,10 +20,17 @@ from zigfa.torch import (
 )
 
 HEAD_DIMS = inter_sequence.head_dims(runtime.current_device().device_id)
+FORWARD_HEAD_DIMS = inter_sequence.forward_head_dims(runtime.current_device().device_id)
+SINGLE_TILE_HEAD_DIMS = tuple(
+    head_dim for head_dim in HEAD_DIMS
+    if head_dim not in inter_sequence.persistent_head_dims(runtime.current_device().device_id)
+)
 LAYOUTS = [
     "i2t", "it2i", "titi", "titi_noised_first", "i2t_extend", "titi_extend", "random", "gapped", "separate_keys"
 ]
 DENSE, CAUSAL = (-1, -1), (-1, 0)
+M64_MAX_ROWS = 384
+SHORT_MAX_ROWS = 8
 TEXT, CLEAN_IMAGE, NOISED_IMAGE, SECOND_TEXT, SECOND_IMAGE = range(5)
 TITI_WINDOWS = [CAUSAL, DENSE, DENSE, CAUSAL, DENSE]
 TITI_PARTS_SEEN = {
@@ -170,15 +177,17 @@ def check_layout(layout, num_head, num_head_kv, head_dim, **options):
     out, lse = flash_attn_inter_sequence_func(
         q, k, v, cu_q, cu_k, max(layout.lengths_q), max(layout.lengths_k), bits, return_attn_probs=True, **options
     )
-    dout = torch.randn_like(out)
-    gradients = torch.autograd.grad(out, (q, k, v), dout)
     mask = inter_sequence_visible(cu_q, cu_k, layout.visible, windows)
     queue_forward_checks([(out, lse)], inter_sequence_attention_ref, q, k, v, mask)
+    if head_dim not in HEAD_DIMS:
+        return out, lse, None, mask
+    dout = torch.randn_like(out)
+    gradients = torch.autograd.grad(out, (q, k, v), dout)
     queue_gradient_checks([gradients], inter_sequence_attention_ref, q, k, v, dout, mask)
     return out, lse, gradients, mask
 
 
-@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("head_dim", FORWARD_HEAD_DIMS)
 @pytest.mark.parametrize("layout_name", LAYOUTS)
 def test_layouts_match_reference(head_dim, layout_name):
     for heads_name, seed in itertools.product(HEAD_LAYOUTS, range(2)):
@@ -187,7 +196,7 @@ def test_layouts_match_reference(head_dim, layout_name):
             check_layout(build_layout(layout_name, seed), *HEAD_LAYOUTS[heads_name], head_dim)
 
 
-@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("head_dim", FORWARD_HEAD_DIMS)
 @pytest.mark.parametrize("options", [dict(causal=True), dict(window_size=(6, 2)), dict(window_size=(-1, -1))])
 def test_scalar_windows_match_reference(head_dim, options):
     cuda_seed(3)
@@ -207,17 +216,6 @@ def test_rows_that_see_no_keys_return_zeros():
     queue_requirement("rows without keys return zeros", (out[blind] == 0).all())
     queue_requirement("rows without keys have an lse of -inf", (lse[:, blind] == FULLY_MASKED_LSE).all())
     queue_requirement("rows without keys get no query gradient", (gradients[0][blind] == 0).all())
-
-
-@pytest.mark.parametrize("head_dim", HEAD_DIMS)
-def test_every_forward_variant_matches_reference(head_dim, monkeypatch):
-    device_id = runtime.current_device().device_id
-    for variant, info in inter_sequence.forward_variants(device_id, head_dim):
-        monkeypatch.setattr(inter_sequence, "forward_variant", lambda *unused, chosen=(variant, info): chosen)
-        for layout_name in ("i2t_extend", "titi_extend", "titi"):
-            with case(variant=variant, layout=layout_name):
-                cuda_seed(11)
-                check_layout(build_layout(layout_name, 11), 6, 2, head_dim)
 
 
 @pytest.mark.parametrize("lengths_q, lengths_k", [([0, 0], [300, 256]), ([10, 30], [0, 0])])
@@ -282,19 +280,64 @@ def test_metadata_matches_its_definition(count):
     generator = torch.Generator().manual_seed(count)
     layout = random_layout(count, generator, separate_keys=True)
     cu_q, cu_k, bits, _ = layout_tensors(layout)
-    visible_bits_t, cu_visible_k, cu_visible_q, order = get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits)
+    visible_bits_t, cu_visible_k, cu_visible_q = get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits)
     lengths_q, lengths_k = torch.tensor(layout.lengths_q), torch.tensor(layout.lengths_k)
     visible = layout.visible.long()
-    visible_keys = visible @ lengths_k
-    expected_k = torch.cat([torch.zeros(1, dtype=torch.long), visible_keys.cumsum(0)])
+    expected_k = torch.cat([torch.zeros(1, dtype=torch.long), (visible @ lengths_k).cumsum(0)])
     expected_q = torch.cat([torch.zeros(1, dtype=torch.long), (visible.t() @ lengths_q).cumsum(0)])
     assert torch.equal(visible_bits_t.cpu(), visibility_bits_of(layout.visible.t()))
     assert torch.equal(cu_visible_k.cpu().long(), expected_k)
     assert torch.equal(cu_visible_q.cpu().long(), expected_q)
-    order = order.cpu().long()
-    assert torch.equal(order.sort().values, torch.arange(count))
-    classes = [length_class(int(keys)) for keys in visible_keys[order]]
-    assert classes == sorted(classes, reverse=True)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("count", [6, 31, 32, 33, 100, 300, 1100])
+def test_block_tables_match_their_definition(count, persistent):
+    device_id = runtime.current_device().device_id
+    head_dims = inter_sequence.persistent_head_dims(device_id) if persistent else SINGLE_TILE_HEAD_DIMS
+    if not head_dims:
+        pytest.skip("no kernel of this path runs on this GPU")
+    generator = torch.Generator().manual_seed(count)
+    layout = random_layout(count, generator, separate_keys=True)
+    layout.lengths_q[1::7] = [M64_MAX_ROWS - 70 + 37 * index for index in range(len(layout.lengths_q[1::7]))]
+    cu_q, cu_k, bits, window_sizes = layout_tensors(layout)
+    sequences = inter_sequence.Sequences(
+        cu_q, cu_k, bits, *get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits), window_sizes
+    )
+    q, k, v = (tensor.detach() for tensor in leaves(layout, 2, 2, head_dims[0]))
+    out, lse = torch.empty_like(q), torch.empty(q.shape[1], q.shape[0], dtype=torch.float32, device=q.device)
+    workspace = tuple(
+        torch.empty(shape, dtype=torch.int32, device=q.device)
+        for shape in inter_sequence.forward_workspace_shapes(tuple(q.shape), count)
+    )
+    inter_sequence.forward(q, k, v, out, lse, workspace, sequences)
+    capacity = inter_sequence.block_table_capacity(q.shape[0], count)
+    words = workspace[0].cpu().long()
+    lengths_q = torch.tensor(layout.lengths_q)
+    visible_keys = layout.visible.long() @ torch.tensor(layout.lengths_k)
+    last_block_rows = lengths_q % 128
+    m128 = (lengths_q > 64) & ((last_block_rows == 0) | (last_block_rows > 64) | (lengths_q >= M64_MAX_ROWS))
+    short = lengths_q <= SHORT_MAX_ROWS
+    group = torch.zeros_like(lengths_q) if persistent else torch.where(short, 2, torch.where(m128, 0, 1))
+    if persistent:
+        table_rows = inter_sequence.BLOCK_TABLE_ROWS
+    else:
+        table_rows = (inter_sequence.kernel_info(device_id, "fwd", head_dims[0]).cluster_block_m,)
+    for rows in table_rows:
+        table = inter_sequence.block_table(0, capacity, rows) // 4
+        blocks = (lengths_q + rows - 1) // rows
+        assert words[table] == int(blocks.sum())
+        first_entry = table + inter_sequence.BLOCK_TABLE_HEADER_BYTES // 4
+        entries = words[first_entry : first_entry + 2 * int(blocks.sum())].view(-1, 2)
+        sequences = entries[:, 0].unique_consecutive().tolist()
+        assert sorted(sequences) == [sequence for sequence in range(count) if blocks[sequence]]
+        first_block = 0
+        for sequence in sequences:
+            expected = torch.tensor([sequence, first_block]).expand(int(blocks[sequence]), 2)
+            assert torch.equal(entries[first_block : first_block + int(blocks[sequence])], expected)
+            first_block += int(blocks[sequence])
+        order = [(int(group[sequence]), -length_class(int(visible_keys[sequence])), sequence) for sequence in sequences]
+        assert order == sorted(order)
 
 
 def length_class(length):
@@ -336,8 +379,8 @@ def op_arguments():
 def test_ops_pass_opcheck():
     q, k, v, layout, scale = op_arguments()
     opcheck(inter_sequence_metadata, layout[:3], test_utils=OPCHECK_TESTS)
-    opcheck(inter_sequence_forward, (q, k, v, *layout, scale, -1, -1, q.shape[0]), test_utils=OPCHECK_TESTS)
-    out, lse = inter_sequence_forward(q, k, v, *layout, scale, -1, -1, q.shape[0])
+    opcheck(inter_sequence_forward, (q, k, v, *layout, scale, -1, -1), test_utils=OPCHECK_TESTS)
+    out, lse = inter_sequence_forward(q, k, v, *layout, scale, -1, -1)
     dout = torch.randn_like(out)
     arguments = (dout, q, k, v, out, lse, *layout, scale, -1, -1)
     opcheck(inter_sequence_backward, arguments, test_utils=OPCHECK_TESTS)
@@ -382,3 +425,29 @@ def test_long_image_and_text_sequences(head_dim):
         with case(layout=name):
             cuda_seed(len(name))
             check_layout(layout, 8, 2, head_dim)
+
+
+@pytest.mark.parametrize("head_dim", inter_sequence.persistent_head_dims(runtime.current_device().device_id))
+@pytest.mark.parametrize("packing", [1, 4])
+def test_persistent_slices_the_keys_of_single_warp_blocks(head_dim, packing):
+    device_id = runtime.current_device().device_id
+    instance = inter_sequence.persistent_instance(head_dim, packing)
+    ctas = inter_sequence.resident_ctas(device_id, instance)
+    image_rows = 384
+    num_head_kv = -(-ctas // (image_rows * packing // max(inter_sequence.BLOCK_TABLE_ROWS)))
+    cuda_seed(19)
+    seen = tuple((0, part) if part else (0,) for part in range(6))
+    layout = sample_layout([(image_rows, 1, 1, 3, 1, 2)], [DENSE] + [CAUSAL] * 5, seen)
+    check_layout(layout, packing * num_head_kv, num_head_kv, head_dim)
+
+
+@pytest.mark.parametrize("head_dim", inter_sequence.persistent_head_dims(runtime.current_device().device_id))
+def test_persistent_splits_the_last_round_of_long_blocks(head_dim):
+    device_id = runtime.current_device().device_id
+    instance = inter_sequence.persistent_instance(head_dim, 1)
+    ctas = inter_sequence.resident_ctas(device_id, instance)
+    image_rows = 1024
+    blocks = image_rows // max(inter_sequence.BLOCK_TABLE_ROWS)
+    heads = -(-(ctas + ctas // 4) // blocks)
+    cuda_seed(13)
+    check_layout(sample_layout([(37, image_rows)], [CAUSAL, DENSE]), heads, heads, head_dim)

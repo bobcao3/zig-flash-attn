@@ -19,12 +19,22 @@ TASKS = {
         ("text", CAUSAL, (TEXT, CLEAN_IMAGE, SECOND_TEXT)),
         ("image", DENSE, (TEXT, CLEAN_IMAGE, SECOND_TEXT, SECOND_IMAGE)),
     ),
+    "caption": (
+        ("text", CAUSAL, (0,)),
+        ("image", DENSE, (0, 1)),
+        ("image", DENSE, (0, 2)),
+        ("image", DENSE, (0, 3)),
+        ("text", CAUSAL, (0, 4)),
+        ("text", CAUSAL, (0, 5)),
+        ("text", CAUSAL, (0, 1, 2, 3, 4, 5, 6)),
+    ),
 }
 EXTEND_TASKS = {
     "i2t_extend": ("image", "text"),
     "titi_extend": ("text", "image", "text"),
     "it2i_generate": ("text", "image"),
     "titi_generate": ("text", "image", "text", "image"),
+    "caption_extend": ("text", "image", "image", "image", "text", "text", "text"),
 }
 NEW_TOKENS_AND_REQUESTS = ((1, 64), (128, 16), (1024, 4))
 IMAGE_REQUESTS = (1, 4)
@@ -36,6 +46,7 @@ MODELS = {
         ((32, 512), (256, 2048)),
     ),
     "qwen-image": (((24, 24, 128),), ("it2i", "titi", "it2i_generate", "titi_generate"), (1024, 4096), ((64, 512),)),
+    "gemma4-12b": (((16, 8, 256),), ("caption", "caption_extend"), (280,), ((32, 512),)),
 }
 
 

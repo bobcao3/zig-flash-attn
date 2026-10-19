@@ -119,7 +119,8 @@ pub fn Steps(
         ) void {
             const dq = queryGradientGemm(operands, {}, tiles_dq, 0);
             const gradient: QueryGradient(tiles_dq) = .init(params, work, step, dq, 0);
-            Backward.accumulateDkv(accumulators, load, iteration, operands, &gradient);
+            const rows = step.block_info.row_count;
+            Backward.accumulateDkv(accumulators, load, iteration, operands, &gradient, rows);
         }
 
         pub fn reduceDq(
@@ -130,6 +131,8 @@ pub fn Steps(
             a: DsFragments,
         ) void {
             const split_tiles = tiles_dq / schedule.dq_column_splits;
+            const warp_row = thread.warp() % warps_dq_m * 16 * row_tiles;
+            if (tiling.skips_padding_rows and step.block_info.row_count <= warp_row) return;
             inline for (0..schedule.dq_column_splits) |split| {
                 const dq = queryGradientGemm(operands, a, split_tiles, split * split_tiles);
                 const gradient: QueryGradient(split_tiles) =
@@ -142,10 +145,13 @@ pub fn Steps(
             accumulators: *DkvAccumulators,
             iteration: u32,
             operands: *const Operands,
+            rows: u32,
         ) void {
             inline for (0..block_m / 16) |k_step| {
-                const q_tile = Storage.qTile(iteration % query_stages);
-                keyGradientStep(&accumulators.dk, Storage.dsTile(), q_tile, operands, k_step);
+                if (!tiling.skips_padding_rows or k_step == 0 or k_step * 16 < rows) {
+                    const q_tile = Storage.qTile(iteration % query_stages);
+                    keyGradientStep(&accumulators.dk, Storage.dsTile(), q_tile, operands, k_step);
+                }
             }
         }
 
@@ -175,6 +181,7 @@ pub fn Steps(
             count: u32,
             work: *const Work,
             operands: *const Operands,
+            rows: u32,
         ) void {
             @setEvalBranchQuota(100_000);
             const k_steps_kv = block_m / 16;
@@ -182,7 +189,9 @@ pub fn Steps(
             comptime std.debug.assert(tiles_kv % 2 == 0);
             const do_tile = Storage.doTile(iteration % stages);
             inline for (0..k_steps_kv - release_k_steps) |k_step| {
-                keyGradientStep(&accumulators.dv, Storage.pTile(), do_tile, operands, k_step);
+                if (!tiling.skips_padding_rows or k_step == 0 or k_step * 16 < rows) {
+                    keyGradientStep(&accumulators.dv, Storage.pTile(), do_tile, operands, k_step);
+                }
             }
             var a: [release_k_steps][row_tiles]@Vector(4, u32) = undefined;
             var b: [release_k_steps][tiles_kv / 2]@Vector(4, u32) = undefined;
@@ -199,8 +208,9 @@ pub fn Steps(
                 );
             }
             load.release(iteration, count, work);
-            inline for (a, b) |step_a, step_b| {
-                inline for (step_b, 0..) |fragment, j| {
+            inline for (a, b, k_steps_kv - release_k_steps..) |step_a, step_b, k_step| {
+                const skips = tiling.skips_padding_rows and k_step * 16 >= rows;
+                if (!skips) inline for (step_b, 0..) |fragment, j| {
                     inline for (&accumulators.dv, step_a) |*row_accumulator, row_a| {
                         row_accumulator[2 * j] = nvptx.mmaSync(
                             fragments.mma_m16n8k16,
@@ -215,7 +225,7 @@ pub fn Steps(
                             row_accumulator[2 * j + 1],
                         );
                     }
-                }
+                };
             }
         }
 

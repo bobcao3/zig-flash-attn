@@ -725,25 +725,32 @@ pub fn FlashAttnBwdSm80(
             iteration: u32,
             operands: *const Operands,
             query_gradient: anytype,
+            rows: u32,
         ) void {
             @setEvalBranchQuota(100_000);
             const buffer = iteration % stages;
             const k_steps_kv = block_m / 16;
+            const interleaved = @TypeOf(query_gradient) != void;
             inline for (0..k_steps_kv) |k_step| {
-                var dv_a: [row_tiles]@Vector(4, u32) = undefined;
-                var dk_a: [row_tiles]@Vector(4, u32) = undefined;
-                inline for (&dv_a, &dk_a, 0..) |*p, *ds, tile| {
-                    const columns = operands.pds_columns;
-                    const row = k_step * 16;
-                    const column = tile * 2;
-                    p.* = nvptx.ldmatrix(.x4, true, columns.chunk(Storage.pTile(), row, column));
-                    ds.* = nvptx.ldmatrix(.x4, true, columns.chunk(Storage.dsTile(), row, column));
+                const skips = tiling.skips_padding_rows and !interleaved and k_step > 0;
+                if (!skips or k_step * 16 < rows) {
+                    var dv_a: [row_tiles]@Vector(4, u32) = undefined;
+                    var dk_a: [row_tiles]@Vector(4, u32) = undefined;
+                    inline for (&dv_a, &dk_a, 0..) |*p, *ds, tile| {
+                        const columns = operands.pds_columns;
+                        const row = k_step * 16;
+                        const column = tile * 2;
+                        const p_chunk = columns.chunk(Storage.pTile(), row, column);
+                        const ds_chunk = columns.chunk(Storage.dsTile(), row, column);
+                        p.* = nvptx.ldmatrix(.x4, true, p_chunk);
+                        ds.* = nvptx.ldmatrix(.x4, true, ds_chunk);
+                    }
+                    const gradient = operands.gradient;
+                    const do_tile = Storage.doTile(buffer);
+                    const q_tile = Storage.qTile(buffer);
+                    transposedGemm(&accumulators.dv, tiles_kv, dv_a, gradient, do_tile, k_step, 0);
+                    transposedGemm(&accumulators.dk, tiles_kv, dk_a, gradient, q_tile, k_step, 0);
                 }
-                const gradient = operands.gradient;
-                const do_tile = Storage.doTile(buffer);
-                const q_tile = Storage.qTile(buffer);
-                transposedGemm(&accumulators.dv, tiles_kv, dv_a, gradient, do_tile, k_step, 0);
-                transposedGemm(&accumulators.dk, tiles_kv, dk_a, gradient, q_tile, k_step, 0);
                 if (@TypeOf(query_gradient) != void) {
                     const reductions = @TypeOf(query_gradient.*).reductions;
                     const part = (reductions + k_steps_kv - 1) / k_steps_kv;

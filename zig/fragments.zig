@@ -193,6 +193,29 @@ pub fn Softmax(comptime block_n: comptime_int) type {
             };
         }
 
+        pub fn combine(
+            softmax: *@This(),
+            other: @This(),
+            scale_log2: f32,
+        ) struct { Accumulator, Accumulator } {
+            const row_max = @max(softmax.row_max, other.row_max);
+            const own_scale = combineScale(softmax.row_max, row_max, scale_log2);
+            const other_scale = combineScale(other.row_max, row_max, scale_log2);
+            softmax.row_max = row_max;
+            softmax.row_sum = softmax.row_sum * own_scale + other.row_sum * other_scale;
+            return .{
+                .{ own_scale[0], own_scale[0], own_scale[1], own_scale[1] },
+                .{ other_scale[0], other_scale[0], other_scale[1], other_scale[1] },
+            };
+        }
+
+        fn combineScale(row_max: RowPair, combined_max: RowPair, scale_log2: f32) RowPair {
+            const scale: RowPair = @splat(scale_log2);
+            const minus_infinity: RowPair = @splat(-std.math.inf(f32));
+            const exponent = row_max * scale - combined_max * scale;
+            return @select(f32, row_max == minus_infinity, @as(RowPair, @splat(0)), exp2(exponent));
+        }
+
         pub fn finalize(softmax: @This(), scale_log2: f32) Finalized {
             const sum = quadAllreduce(.sum, softmax.row_sum);
             const non_empty_row = sum > @as(RowPair, @splat(0));

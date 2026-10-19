@@ -65,7 +65,7 @@ def require_cu_seqlens(cu_seqlens_q, cu_seqlens_k):
         raise ValueError("cu_seqlens_q and cu_seqlens_k must have the same length")
 
 
-def validate_attention_inputs(q, k, v, cu_seqlens_q, cu_seqlens_k):
+def validate_attention_inputs(q, k, v, cu_seqlens_q, cu_seqlens_k, head_dims=None):
     varlen = cu_seqlens_q is not None
     if varlen != (cu_seqlens_k is not None):
         raise ValueError("cu_seqlens_q and cu_seqlens_k must be given together")
@@ -76,7 +76,7 @@ def validate_attention_inputs(q, k, v, cu_seqlens_q, cu_seqlens_k):
             raise ValueError(f"{name} must have {expected_dimensions} dimensions, got {tensor.dim()}")
     if k.shape != v.shape:
         raise ValueError("k and v must have the same shape")
-    require_supported_heads(q.shape, k.shape)
+    require_supported_heads(q.shape, k.shape, head_dims)
     if varlen:
         require_cu_seqlens(cu_seqlens_q, cu_seqlens_k)
     elif q.shape[0] != k.shape[0]:
@@ -827,7 +827,6 @@ class InterSequenceSchedulerMetadata(NamedTuple):
     visibility_bits_t: torch.Tensor
     cu_visible_k: torch.Tensor
     cu_visible_q: torch.Tensor
-    sequence_order: torch.Tensor
 
 
 def require_int32(name, tensor, shape):
@@ -857,7 +856,7 @@ def allocate_inter_sequence_metadata(cu_seqlens_q):
 @torch.library.custom_op("zigfa::inter_sequence_metadata", mutates_args=(), device_types="cuda")
 def inter_sequence_metadata(
     cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor, visibility_bits: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_inter_sequence_layout(cu_seqlens_q, cu_seqlens_k, visibility_bits)
     bind_current_device(visibility_bits)
     metadata = allocate_inter_sequence_metadata(cu_seqlens_q)
@@ -877,8 +876,7 @@ def get_inter_sequence_scheduler_metadata(cu_seqlens_q, cu_seqlens_k, visibility
 
 
 def inter_sequence_layout(
-    cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, sequence_order,
-    window_sizes,
+    cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, window_sizes
 ):
     return inter_sequence.Sequences(
         maybe_contiguous(cu_seqlens_q),
@@ -887,7 +885,6 @@ def inter_sequence_layout(
         visibility_bits_t,
         cu_visible_k,
         cu_visible_q,
-        sequence_order,
         window_sizes,
     )
 
@@ -903,21 +900,20 @@ def inter_sequence_forward(
     visibility_bits_t: torch.Tensor,
     cu_visible_k: torch.Tensor,
     cu_visible_q: torch.Tensor,
-    sequence_order: torch.Tensor,
     window_sizes: Optional[torch.Tensor],
     softmax_scale: float,
     window_size_left: int,
     window_size_right: int,
-    max_seqlen_q: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    validate_attention_inputs(q, k, v, cu_seqlens_q, cu_seqlens_k)
+    head_dims = inter_sequence.built_head_dims(q.device.index)
+    validate_attention_inputs(q, k, v, cu_seqlens_q, cu_seqlens_k, head_dims)
     num_sequences = validate_inter_sequence_layout(cu_seqlens_q, cu_seqlens_k, visibility_bits, window_sizes)
     bind_current_device(q)
     q, k, v = (clone_unless_kernel_ready(tensor) for tensor in (q, k, v))
     out, softmax_lse = allocate_forward_outputs(q, True)
     workspace = tuple(
         torch.empty(shape, dtype=torch.int32, device=q.device)
-        for shape in inter_sequence.forward_workspace_shapes(tuple(q.shape), num_sequences)
+        for shape in inter_sequence.forward_workspace_shapes(tuple(q.shape), num_sequences, k.shape[-2])
     )
     inter_sequence.forward(
         q,
@@ -927,10 +923,8 @@ def inter_sequence_forward(
         softmax_lse,
         workspace,
         inter_sequence_layout(
-            cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, sequence_order,
-            window_sizes
+            cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, window_sizes
         ),
-        max_seqlen_q=max_seqlen_q,
         softmax_scale=softmax_scale,
         window_size_left=window_size_left,
         window_size_right=window_size_right,
@@ -957,7 +951,6 @@ def inter_sequence_backward_into(
     visibility_bits_t,
     cu_visible_k,
     cu_visible_q,
-    sequence_order,
     window_sizes,
     softmax_scale,
     window_size_left,
@@ -990,8 +983,7 @@ def inter_sequence_backward_into(
         *gradients,
         workspace,
         inter_sequence_layout(
-            cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, sequence_order,
-            window_sizes
+            cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, window_sizes
         ),
         softmax_scale=softmax_scale,
         window_size_left=window_size_left,
@@ -1017,7 +1009,6 @@ def inter_sequence_backward(
     visibility_bits_t: torch.Tensor,
     cu_visible_k: torch.Tensor,
     cu_visible_q: torch.Tensor,
-    sequence_order: torch.Tensor,
     window_sizes: Optional[torch.Tensor],
     softmax_scale: float,
     window_size_left: int,
@@ -1037,7 +1028,6 @@ def inter_sequence_backward(
         visibility_bits_t,
         cu_visible_k,
         cu_visible_q,
-        sequence_order,
         window_sizes,
         softmax_scale,
         window_size_left,
@@ -1068,7 +1058,6 @@ def inter_sequence_backward_packed(
     visibility_bits_t: torch.Tensor,
     cu_visible_k: torch.Tensor,
     cu_visible_q: torch.Tensor,
-    sequence_order: torch.Tensor,
     window_sizes: Optional[torch.Tensor],
     softmax_scale: float,
     window_size_left: int,
@@ -1089,7 +1078,6 @@ def inter_sequence_backward_packed(
         visibility_bits_t,
         cu_visible_k,
         cu_visible_q,
-        sequence_order,
         window_sizes,
         softmax_scale,
         window_size_left,
@@ -1117,7 +1105,6 @@ def run_inter_sequence_forward(
     v,
     cu_seqlens_q,
     cu_seqlens_k,
-    max_seqlen_q,
     visibility_bits,
     softmax_scale,
     causal,
@@ -1133,7 +1120,7 @@ def run_inter_sequence_forward(
     if scheduler_metadata is None:
         scheduler_metadata = get_inter_sequence_scheduler_metadata(cu_seqlens_q, cu_seqlens_k, visibility_bits)
     layout = (cu_seqlens_q, cu_seqlens_k, visibility_bits, *scheduler_metadata, window_sizes)
-    out, softmax_lse = inter_sequence_forward(q, k, v, *layout, softmax_scale, *window, max_seqlen_q)
+    out, softmax_lse = inter_sequence_forward(q, k, v, *layout, softmax_scale, *window)
     ctx.save_for_backward(q, k, v, out, softmax_lse, *layout)
     ctx.softmax_scale = softmax_scale
     ctx.window = window
@@ -1168,8 +1155,8 @@ class FlashAttnInterSequenceFunc(torch.autograd.Function):
         return_softmax=False,
     ):
         return run_inter_sequence_forward(
-            ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, visibility_bits, softmax_scale, causal, window_size,
-            window_sizes, scheduler_metadata, deterministic, return_softmax,
+            ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, visibility_bits, softmax_scale, causal, window_size, window_sizes,
+            scheduler_metadata, deterministic, return_softmax,
         )
 
     @staticmethod
@@ -1199,8 +1186,8 @@ class FlashAttnInterSequenceKVPackedFunc(torch.autograd.Function):
     ):
         k, v = kv.unbind(dim=-3)
         return run_inter_sequence_forward(
-            ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, visibility_bits, softmax_scale, causal, window_size,
-            window_sizes, scheduler_metadata, deterministic, return_softmax,
+            ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, visibility_bits, softmax_scale, causal, window_size, window_sizes,
+            scheduler_metadata, deterministic, return_softmax,
         )
 
     @staticmethod

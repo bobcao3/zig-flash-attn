@@ -18,14 +18,28 @@ const elect = @import("elect.zig");
 const mbarrier = @import("mbarrier.zig");
 const thread = @import("thread.zig");
 const inter_sequence = @import("inter_sequence.zig");
-const inter_sequence_forward = @import("inter_sequence_forward.zig");
 const profile = @import("profile.zig");
 
 const Chunk = fragments.Chunk;
 const Accumulator = fragments.Accumulator;
 const chunk_elements = Sm80FwdTiling.chunk_elements;
 
-pub const Zone = enum(u7) { tile, load_q, scores, softmax, output, store, qk_mma, pv_mma };
+pub const Zone = enum(u7) {
+    tile,
+    load_q,
+    scores,
+    softmax,
+    output,
+    store,
+    qk_mma,
+    pv_mma,
+    setup,
+    locate,
+    get_next_work,
+    combine,
+    wait_k,
+    wait_v,
+};
 
 const Span = struct {
     first: u32,
@@ -178,7 +192,7 @@ pub fn SharedStorage(
             finalized: anytype,
             output: anytype,
         ) void {
-            comptime std.debug.assert(!specialization.pack_gqa and warps * 16 == block_m);
+            comptime std.debug.assert(warps * 16 == block_m);
             const warp_row = thread.warp() * 16;
             const lane = thread.lane();
             const bytes: [*]addrspace(.shared) u8 = @ptrCast(queryTile());
@@ -203,8 +217,9 @@ pub fn SharedStorage(
                 tile.head * params.o_head_stride;
             const row_bytes: u32 = @truncate(params.o_row_stride * element_bytes);
             const first_row = tile.first_row + warp_row;
-            const rows_left =
-                @as(i32, @bitCast(sequence.seqlen_q)) - @as(i32, @bitCast(first_row));
+            const row_limit =
+                if (specialization.pack_gqa) tile.pack_gqa.end_row else sequence.seqlen_q;
+            const rows_left = @as(i32, @bitCast(row_limit)) - @as(i32, @bitCast(first_row));
             const first = params.o + (origin + first_row * params.o_row_stride) * element_bytes +
                 lane * @sizeOf(Chunk);
             const staged = Rows.slot(warp_row, lane) * @sizeOf(Chunk);
@@ -214,19 +229,21 @@ pub fn SharedStorage(
                     const offset = @sizeOf(Rows.Tile(row));
                     const source: *addrspace(.shared) const Chunk =
                         @ptrCast(@alignCast(bytes + ((staged ^ (key * @sizeOf(Chunk))) + offset)));
-                    const destination: *addrspace(.global) Chunk =
-                        @ptrFromInt(first + @as(u64, row_bytes) * row);
+                    const packed_offset = if (specialization.pack_gqa) tile.pack_gqa.rowOffset(
+                        first_row + @as(u32, row),
+                        params.o_row_stride,
+                        params.o_head_stride,
+                    ) else 0;
+                    const address = if (specialization.pack_gqa)
+                        params.o + (origin + packed_offset) * element_bytes + lane * @sizeOf(Chunk)
+                    else
+                        first + @as(u64, row_bytes) * row;
+                    const destination: *addrspace(.global) Chunk = @ptrFromInt(address);
                     destination.* = source.*;
                 }
             }
             if (elect.groupLeader(4)) {
-                fragments.storeLse(
-                    params,
-                    tile,
-                    first_row + lane / 4,
-                    sequence.seqlen_q,
-                    finalized.lse,
-                );
+                fragments.storeLse(params, tile, first_row + lane / 4, row_limit, finalized.lse);
             }
         }
 
@@ -296,17 +313,6 @@ pub fn SharedStorage(
                         sequence.seqlen_k,
                     ),
                 };
-            }
-
-            pub fn reset() void {
-                nvptx.barrierSyncAligned(.work_group, null);
-                if (single_warp or stages == 1) return;
-                if (thread.warp() == 0 and elect.oneSync()) {
-                    inline for (&k_full, &v_full, &empty) |*k_stage, *v_stage, *empty_stage| {
-                        inline for (.{ k_stage, v_stage, empty_stage }) |barrier| barrier.inval();
-                    }
-                }
-                elect.reconverge();
             }
 
             pub fn restart(load: *Load, params: ForwardParams, work: anytype) void {
@@ -513,10 +519,35 @@ pub fn SharedStorage(
             fn startInParts(load: *const Load) void {
                 const query_rows: RowCopy = .init(load.q, load.q_stride, load.seqlen_q);
                 const first_key = load.firstKey(0);
+                const group = Rows.swizzle_columns;
+                const pass_rows = threads / group;
+                const thread_row = thread.id() / group;
+                const thread_slot = Rows.slot(thread_row, thread.id() % group);
                 inline for (0..prologue_parts) |part| {
                     const first = part * row_chunks / prologue_parts;
                     const end = (part + 1) * row_chunks / prologue_parts;
-                    query_rows.copyColumns(block_m, queryTile(), load.first_row, first, end);
+                    if (!specialization.pack_gqa) {
+                        query_rows.copyColumns(block_m, queryTile(), load.first_row, first, end);
+                    } else inline for (0..block_m / pass_rows) |pass| {
+                        const pass_row: u32 = pass * pass_rows;
+                        const row = load.first_row + thread_row + pass_row;
+                        const valid = row < load.pack_gqa.end_row;
+                        const offset = load.pack_gqa.rowOffset(
+                            if (valid) row else load.first_row,
+                            load.q_stride,
+                            load.q_head_stride,
+                        );
+                        const chunk = load.q + offset + thread.id() % group;
+                        inline for (first / group..end / group) |column_group| {
+                            const column: u32 = column_group * group;
+                            cp_async.copyZeroFill(
+                                .cache_global_level,
+                                &queryTile()[thread_slot + comptime Rows.slot(pass_row, column)],
+                                &chunk[column],
+                                if (valid) @sizeOf(Chunk) else 0,
+                            );
+                        }
+                    }
                     load.key_rows.copyColumns(block_n, kTile(0), first_key, first, end);
                     cp_async.commitGroup();
                 }
@@ -620,6 +651,8 @@ pub fn FlashAttnFwdSm80(
     else
         QueryLayout.Addresses;
     const register_steps = if (!tiling.q_in_regs) 0 else tiling.q_register_steps orelse k_steps;
+    const single_warp =
+        @hasDecl(Storage, "one_warp_per_scheduler") and Storage.one_warp_per_scheduler;
     const Tile = m_block_work.MBlockWork(block_m, block_n, .{
         .pack_gqa = specialization.pack_gqa,
         .inter_sequence = specialization.inter_sequence,
@@ -637,8 +670,6 @@ pub fn FlashAttnFwdSm80(
     const PersistentScheduler =
         tile_scheduler.PersistentScheduler(tiling.scheduling_mode, .{ .axis = .x, .ctas = 1 });
     const Online = fragments.Softmax(block_n);
-    const single_warp =
-        @hasDecl(Storage, "one_warp_per_scheduler") and Storage.one_warp_per_scheduler;
     const Trace = profile.Recorder(Zone, .{});
 
     return struct {
@@ -660,31 +691,45 @@ pub fn FlashAttnFwdSm80(
             pub const all_groups: Span = .{ .first = 0, .end = block_n / 16 };
 
             pub fn init(params: ForwardParams) ?Work {
+                if (specialization.inter_sequence) {
+                    const BlockTable = inter_sequence.BlockTable;
+                    const packing = if (specialization.pack_gqa) params.qhead_per_kvhead else 1;
+                    const heads = params.num_head / packing / nvptx.nctaid(1);
+                    const tile_idx = @workGroupId(0);
+                    if (tile_idx >= BlockTable.at(params.block_table).blocks * heads) return null;
+                    const block_entry = BlockTable.entries(params.block_table)[tile_idx / heads];
+                    const records = params.sequence_records;
+                    const record = inter_sequence.SequenceRecord.at(records, block_entry.sequence);
+                    const blocks = (record.rows * packing + block_m - 1) / block_m;
+                    const local = tile_idx - block_entry.first_block * heads;
+                    var work: Work = .{ .tile = .withSequence(params, .{
+                        .block = blocks - 1 - local % blocks,
+                        .head = local / blocks + @workGroupId(1) * heads,
+                        .batch = block_entry.sequence,
+                    }, .{
+                        .offset_q = record.first_query,
+                        .offset_k = 0,
+                        .seqlen_q = record.rows,
+                        .seqlen_k = 0,
+                    }, record) };
+                    _ = work.tile.nextRun(params);
+                    return work;
+                }
                 const scheduler = TileScheduler.create(tile_scheduler.forwardArguments(params));
                 const persistent_scheduler: PersistentScheduler = .create();
                 const tile = scheduler.getGridWork(
                     tile_scheduler.gridTile(.x, 1, persistent_scheduler.initialWorkTileInfo()),
                 ) orelse return null;
-                var work: Work = .{ .tile = Tile.init(params, tile) };
-                if (specialization.inter_sequence and !work.tile.takeOnlyRun(params)) return null;
-                return work;
-            }
-
-            pub fn initListed(params: ForwardParams, item: u32, listed_blocks: u32) Work {
-                const list: [*]addrspace(.global) const inter_sequence.ListedBlock =
-                    @ptrFromInt(params.run_list);
-                const listed = list[item % listed_blocks];
-                return .{ .tile = Tile.init(params, .{
-                    .block = listed.block,
-                    .head = item / listed_blocks,
-                    .batch = listed.sequence,
-                }) };
+                return .{ .tile = Tile.init(params, tile) };
             }
 
             pub fn visibleGroups(work: *const Work, n_block: u32) Span {
                 const first_key: i32 = @intCast(n_block * block_n);
                 const info = work.tile.block_info;
                 const row = work.tile.first_row + thread.warp() * warp_rows;
+                if (specialization.pack_gqa and row >= work.tile.pack_gqa.end_row) {
+                    return .{ .first = 0, .end = 0 };
+                }
                 const first_query: i32 =
                     @intCast(if (specialization.pack_gqa) work.tile.pack_gqa.mIdx(row) else row);
                 const last_query: i32 = if (specialization.pack_gqa) @intCast(
@@ -1030,57 +1075,12 @@ pub fn FlashAttnFwdSm80(
             var work = Work.init(params) orelse return;
             var trace: Trace = .init(params.profile);
             defer trace.finish();
-            process(params, args, &work, .first_run, &trace);
-        }
-
-        var claimed: [2]u32 addrspace(.shared) = undefined;
-
-        pub fn runListed(params: ForwardParams, args: Args) void {
-            const queue: *addrspace(.global) inter_sequence.RunQueue =
-                @ptrFromInt(params.run_queue);
-            const listed_blocks = queue.listed_blocks;
-            const items = listed_blocks * params.num_head;
-            var item = @workGroupId(0);
-            var slot: u1 = 0;
-            var trace: Trace = .init(params.profile);
-            defer trace.finish();
-            while (item < items) : (slot +%= 1) {
-                var work: Work = .initListed(params, item, listed_blocks);
-                work.tile.firstRun(params);
+            const more_runs = specialization.inter_sequence and
+                (work.tile.next_run < work.tile.record.key_run_count or
+                    work.tile.record.resume_from < params.num_batch);
+            if (more_runs) {
                 process(params, args, &work, .all_runs, &trace);
-                if (thread.id() == 0) {
-                    const claims = nvptx.atom(.gpu, .monotonic, .add, &queue.claims, 1);
-                    claimed[slot] = nvptx.nctaid(0) + claims;
-                }
-                Load.reset();
-                item = claimed[slot];
-            }
-        }
-
-        pub fn runPlanned(params: ForwardParams, args: Args) void {
-            const queue: *addrspace(.global) inter_sequence.RunQueue =
-                @ptrFromInt(params.run_queue);
-            const listed_blocks = queue.listed_blocks;
-            const items = listed_blocks * params.num_head;
-            var item = @workGroupId(0);
-            var slot: u1 = 0;
-            var trace: Trace = .init(params.profile);
-            defer trace.finish();
-            while (item < items) : (slot +%= 1) {
-                var work: Work = .initListed(params, item, listed_blocks);
-                if (work.tile.takeOnlyRun(params)) {
-                    process(params, args, &work, .first_run, &trace);
-                } else {
-                    work.tile.firstRun(params);
-                    process(params, args, &work, .all_runs, &trace);
-                }
-                if (thread.id() == 0) {
-                    const claims = nvptx.atom(.gpu, .monotonic, .add, &queue.claims, 1);
-                    claimed[slot] = nvptx.nctaid(0) + claims;
-                }
-                Load.reset();
-                item = claimed[slot];
-            }
+            } else process(params, args, &work, .first_run, &trace);
         }
 
         inline fn process(
@@ -1221,18 +1221,19 @@ pub fn FlashAttnFwdSm80(
             trace: *Trace,
         ) void {
             const tile_count = work.tile.n_block_max - work.tile.n_block_min;
+            const skips_groups = tiling.tma or block_m != block_n;
+            const idle = skips_groups and specialization.pack_gqa and
+                work.tile.first_row + thread.warp() * warp_rows >= work.tile.pack_gqa.end_row;
             var index: u32 = 0;
             while (index < tile_count) : (index += 1) {
                 const n_block = work.tile.n_block_min + index;
                 trace.begin(.scores);
                 const slot = load.acquireK(index);
-                if (work.tile.needsMask(n_block)) {
+                if (idle or work.tile.needsMask(n_block)) {
                     // With square tiles of `cp.async` copies, the warps multiply every key group
                     // of a masked tile, and the mask clears the groups that a warp cannot see.
-                    const visible = if (tiling.tma or block_m != block_n)
-                        work.visibleGroups(n_block)
-                    else
-                        Work.all_groups;
+                    const visible =
+                        if (skips_groups) work.visibleGroups(n_block) else Work.all_groups;
                     trace.begin(.qk_mma);
                     var scores = qkScores(query, slot, visible, lanes, null);
                     trace.end(.qk_mma);
@@ -1294,15 +1295,20 @@ const names = .{
     .{ "lse_batch_stride", "lse_head_stride", "num_batch" } ++
     (if (variant.specialization.scheduler_metadata) .{"scheduler_metadata"} else .{}) ++
     if (variant.specialization.inter_sequence) .{
-        "visibility_bits", "window_sizes", "run_table", "run_list", "run_queue", "num_head",
+        "visibility_bits",  "window_sizes", "block_table",
+        "sequence_records", "num_head",
     } else .{};
 const options: std.lang.CallingConvention.NvptxKernelOptions = .{
     .required_work_group_size = .{ .x = Forward.thread_count },
     .max_registers_per_work_item = Forward.max_registers,
 };
-const Entry = entry.Entry(ForwardParams, Forward.Args, names, options, launch);
-const ListedEntry = entry.Entry(ForwardParams, Forward.Args, names, options, Forward.runListed);
-const PlannedEntry = entry.Entry(ForwardParams, Forward.Args, names, options, Forward.runPlanned);
+const Entry = entry.Entry(
+    ForwardParams,
+    Forward.Args,
+    names,
+    options,
+    if (variant.specialization.inter_sequence) Forward.run else launch,
+);
 
 comptime {
     if (builtin.cpu.arch.isNvptx() and @import("root") == @This()) {
@@ -1314,31 +1320,9 @@ comptime {
             });
         }
         if (variant.specialization.inter_sequence) {
-            @export(&ListedEntry.entry, .{ .name = "flash_attn_fwd_runs" });
-            @export(&PlannedEntry.entry, .{ .name = "flash_attn_fwd_planned" });
-            @export(&inter_sequence.RunTable(forward_tiling.block_m).build, .{
-                .name = "inter_sequence_forward_runs",
-            });
             @export(&inter_sequence.transposeVisibility, .{ .name = "inter_sequence_transpose" });
-            @export(&inter_sequence.planBlocks, .{ .name = "inter_sequence_plan_blocks" });
-            if (variant.specialization.limits.max_seqlen_q == 0 and
-                configurations.inter_sequence_megakernel.supports(config.head_dim))
-            {
-                const Megakernel = inter_sequence_forward.Megakernel(config.head_dim);
-                std.debug.assert(Megakernel.shared_bytes == Forward.shared_bytes);
-                std.debug.assert(Megakernel.threads == Forward.thread_count);
-                const MegakernelEntry = entry.Entry(
-                    inter_sequence_forward.Params,
-                    inter_sequence_forward.Args,
-                    inter_sequence_forward.names,
-                    .{
-                        .required_work_group_size = .{ .x = Megakernel.threads },
-                        .max_registers_per_work_item = Forward.max_registers,
-                    },
-                    Megakernel.run,
-                );
-                @export(&MegakernelEntry.entry, .{ .name = "inter_sequence_forward_megakernel" });
-            }
+            const BlockTable = inter_sequence.TableKernel(&.{forward_tiling.block_m}, false);
+            @export(&BlockTable.build, .{ .name = "inter_sequence_block_table" });
             @export(&inter_sequence.countVisibleTokens, .{
                 .name = "inter_sequence_count_visible_tokens",
             });
