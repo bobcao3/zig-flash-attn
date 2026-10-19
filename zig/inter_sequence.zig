@@ -1,6 +1,7 @@
 const std = @import("std");
 const nvptx = std.nvptx;
 const thread = @import("thread.zig");
+const prepare_scheduler = @import("prepare_scheduler.zig");
 
 pub const Window = extern struct {
     left: i32,
@@ -117,6 +118,20 @@ pub const several_runs = std.math.maxInt(u32);
 pub const ListedBlock = extern struct { sequence: u32, block: u32 };
 pub const RunQueue = extern struct { listed_blocks: u32, claims: u32 };
 
+fn runEntry(runs: Runs, cu_seqlens_k: [*]addrspace(.global) const i32, count: u32) RunEntry {
+    const nothing: RunEntry = .{ .first_key = 0, .key_count = 0, .window = .unbounded };
+    const run = runs.next(0) orelse return nothing;
+    if (runs.row.find(run.end, true) < count) {
+        return .{ .first_key = 0, .key_count = several_runs, .window = .unbounded };
+    }
+    const first_key: u32 = @intCast(cu_seqlens_k[run.first]);
+    return .{
+        .first_key = first_key,
+        .key_count = @as(u32, @intCast(cu_seqlens_k[run.end])) - first_key,
+        .window = runs.windowOf(run),
+    };
+}
+
 pub fn RunTable(comptime block_m: u32) type {
     return struct {
         var listed: u32 addrspace(.shared) = undefined;
@@ -153,30 +168,16 @@ pub fn RunTable(comptime block_m: u32) type {
                     count,
                     sequence,
                 );
-                const run = runs.next(0) orelse {
-                    entries[sequence] = .{ .first_key = 0, .key_count = 0, .window = .unbounded };
-                    continue;
-                };
-                if (runs.row.find(run.end, true) < count) {
-                    entries[sequence] = .{
-                        .first_key = 0,
-                        .key_count = several_runs,
-                        .window = .unbounded,
-                    };
+                const entry = runEntry(runs, cu_k, count);
+                entries[sequence] = entry;
+                if (entry.key_count == several_runs) {
                     const rows: u32 = @intCast(cu_q[sequence + 1] - cu_q[sequence]);
                     const blocks = (rows + block_m - 1) / block_m;
                     const first = nvptx.atom(.cta, .monotonic, .add, &listed, blocks);
                     for (0..blocks) |block| {
                         list[first + block] = .{ .sequence = sequence, .block = @intCast(block) };
                     }
-                    continue;
                 }
-                const first_key: u32 = @intCast(cu_k[run.first]);
-                entries[sequence] = .{
-                    .first_key = first_key,
-                    .key_count = @as(u32, @intCast(cu_k[run.end])) - first_key,
-                    .window = runs.windowOf(run),
-                };
             }
             nvptx.barrierSyncAligned(.work_group, null);
             if (thread.id() == 0) {
@@ -261,6 +262,147 @@ fn blockInclusiveSums(values: [2]u32) BlockSums {
     }
     nvptx.barrierSyncAligned(.work_group, null);
     return result;
+}
+
+const classes = prepare_scheduler.length_classes;
+const BlockShape = enum(u1) { narrow, wide };
+var class_blocks: [2][classes]u32 addrspace(.shared) = undefined;
+var list_blocks: [2]u32 addrspace(.shared) = undefined;
+var wide_candidates: u32 addrspace(.shared) = undefined;
+
+fn ceilDiv(value: u32, divisor: u32) u32 {
+    return (value + divisor - 1) / divisor;
+}
+
+const PlannedSequence = struct {
+    shape: BlockShape,
+    blocks: u32,
+    class: u32,
+};
+
+const BlockRows = struct {
+    narrow: u32,
+    wide: u32,
+    wide_min_sequence: u32,
+
+    fn plan(
+        rows_per_block: BlockRows,
+        cu_seqlens_q: [*]addrspace(.global) const i32,
+        cu_visible_k: [*]addrspace(.global) const i32,
+        sequence: u32,
+    ) PlannedSequence {
+        const rows: u32 = @intCast(cu_seqlens_q[sequence + 1] - cu_seqlens_q[sequence]);
+        const keys: u32 = @intCast(cu_visible_k[sequence + 1] - cu_visible_k[sequence]);
+        const wide = rows >= rows_per_block.wide_min_sequence;
+        return .{
+            .shape = if (wide) .wide else .narrow,
+            .blocks = ceilDiv(rows, if (wide) rows_per_block.wide else rows_per_block.narrow),
+            .class = prepare_scheduler.lengthClass(keys),
+        };
+    }
+};
+
+pub fn planBlocks(
+    cu_seqlens_q: u64,
+    cu_seqlens_k: u64,
+    cu_visible_k: u64,
+    visibility_bits: u64,
+    window_sizes: u64,
+    window_size_left: i32,
+    window_size_right: i32,
+    run_table: u64,
+    narrow_list: u64,
+    wide_list: u64,
+    queues: u64,
+    count: u32,
+    narrow_rows: u32,
+    wide_rows: u32,
+    wide_min_rows: u32,
+    wide_min_blocks: u32,
+) callconv(.{ .nvptx_kernel = .{
+    .required_work_group_size = .{ .x = metadata_threads },
+} }) void {
+    const cu_q: [*]addrspace(.global) const i32 = @ptrFromInt(cu_seqlens_q);
+    const cu_k: [*]addrspace(.global) const i32 = @ptrFromInt(cu_seqlens_k);
+    const visible_k: [*]addrspace(.global) const i32 = @ptrFromInt(cu_visible_k);
+    const entries: [*]addrspace(.global) RunEntry = @ptrFromInt(run_table);
+    const lists: [2][*]addrspace(.global) ListedBlock = .{
+        @ptrFromInt(narrow_list), @ptrFromInt(wide_list),
+    };
+    const scalar_window: Window = .{ .left = window_size_left, .right = window_size_right };
+    var cleared = thread.id();
+    while (cleared < 2 * classes) : (cleared += metadata_threads) {
+        class_blocks[cleared / classes][cleared % classes] = 0;
+    }
+    if (thread.id() == 0) wide_candidates = 0;
+    nvptx.barrierSyncAligned(.work_group, null);
+    var sequence = thread.id();
+    while (sequence < count) : (sequence += metadata_threads) {
+        const runs: Runs = .init(
+            visibility_bits,
+            window_sizes,
+            scalar_window,
+            cu_q,
+            cu_k,
+            count,
+            sequence,
+        );
+        entries[sequence] = runEntry(runs, cu_k, count);
+        const rows: u32 = @intCast(cu_q[sequence + 1] - cu_q[sequence]);
+        if (rows >= wide_min_rows) {
+            _ = nvptx.atom(.cta, .monotonic, .add, &wide_candidates, ceilDiv(rows, wide_rows));
+        }
+    }
+    nvptx.barrierSyncAligned(.work_group, null);
+    const block_rows: BlockRows = .{
+        .narrow = narrow_rows,
+        .wide = wide_rows,
+        .wide_min_sequence = if (wide_candidates >= wide_min_blocks)
+            wide_min_rows
+        else
+            std.math.maxInt(u32),
+    };
+    sequence = thread.id();
+    while (sequence < count) : (sequence += metadata_threads) {
+        const planned = block_rows.plan(cu_q, visible_k, sequence);
+        if (planned.blocks == 0) continue;
+        const counter = &class_blocks[@backingInt(planned.shape)][planned.class];
+        _ = nvptx.atom(.cta, .monotonic, .add, counter, planned.blocks);
+    }
+    nvptx.barrierSyncAligned(.work_group, null);
+    if (thread.warp() < 2) {
+        const counters = &class_blocks[thread.warp()];
+        const per_lane = classes / 32;
+        var blocks: [per_lane]u32 = undefined;
+        var lane_blocks: u32 = 0;
+        inline for (&blocks, 0..) |*class_count, offset| {
+            class_count.* = counters[classes - 1 - (thread.lane() * per_lane + offset)];
+            lane_blocks += class_count.*;
+        }
+        const inclusive = warpInclusiveSum(lane_blocks);
+        var start = inclusive - lane_blocks;
+        inline for (blocks, 0..) |class_count, offset| {
+            counters[classes - 1 - (thread.lane() * per_lane + offset)] = start;
+            start += class_count;
+        }
+        if (thread.lane() == 31) list_blocks[thread.warp()] = inclusive;
+    }
+    nvptx.barrierSyncAligned(.work_group, null);
+    sequence = thread.id();
+    while (sequence < count) : (sequence += metadata_threads) {
+        const planned = block_rows.plan(cu_q, visible_k, sequence);
+        if (planned.blocks == 0) continue;
+        const list = @backingInt(planned.shape);
+        const counter = &class_blocks[list][planned.class];
+        const first = nvptx.atom(.cta, .monotonic, .add, counter, planned.blocks);
+        for (0..planned.blocks) |block| {
+            lists[list][first + block] = .{ .sequence = sequence, .block = @intCast(block) };
+        }
+    }
+    if (thread.id() < 2) {
+        const queue: [*]addrspace(.global) RunQueue = @ptrFromInt(queues);
+        queue[thread.id()] = .{ .listed_blocks = list_blocks[thread.id()], .claims = 0 };
+    }
 }
 
 pub fn countVisibleTokens(

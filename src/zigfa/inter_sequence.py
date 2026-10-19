@@ -1,5 +1,6 @@
 import functools
 import math
+import os
 from typing import NamedTuple, Optional
 
 from . import runtime, specialization
@@ -33,7 +34,12 @@ COUNT_THREADS = 1024
 FORWARD_SIGNATURE = "p" * 7 + "uuufii" + "p" * 14 + "u" + "p" * 6 + "u"
 RUN_TABLE_SIGNATURE = "pppp" + "ii" + "ppp" + "u"
 RUN_ENTRY_WORDS = 4
-RUN_QUEUE_WORDS = 2
+RUN_QUEUE_WORDS = 4
+QUEUE_BYTES = 8
+PLAN_SIGNATURE = "ppppp" + "ii" + "pppp" + "uuuuu"
+WIDE_MIN_ROWS = 768
+NO_WIDE_BLOCKS = 2**32 - 1
+PLANNED = os.environ.get("ZIGFA_INTER_SEQUENCE_PLAN") == "device"
 SMALL_BLOCK_MAX_SEQLEN_Q = 768
 SMALL_BLOCK_MAX_WAVES = 8
 INTER_SEQUENCE_BACKWARD_SIGNATURE = BACKWARD_SIGNATURE + "ppp"
@@ -190,6 +196,11 @@ def forward(
     _, run_table, run_list, run_queue = (view_of(t).pointer for t in workspace)
     if not q_view.shape[0]:
         return
+    if PLANNED:
+        return forward_planned(
+            q_view, k_view, v_view, out_view, lse_view, workspace, sequences, softmax_scale, window_size_left,
+            window_size_right, stream,
+        )
     hint = specialization.usable_max_seqlen(max_seqlen_q, q_view.shape[0])
     variant, _ = forward_variant(device_id, head_dim, hint, q_view.shape[0], q_view.shape[-2])
     load = functools.partial(runtime.load_for, device_id, "fwd", head_dim, variant=variant)
@@ -224,6 +235,46 @@ def forward(
     )
     listed_grid = (resident_ctas(device_id, head_dim, variant, "flash_attn_fwd_runs"), 1, 1)
     runtime.run(listed, listed_grid, info.threads, info.shared_bytes, FORWARD_SIGNATURE, values, stream)
+
+
+def forward_planned(
+    q_view, k_view, v_view, out_view, lse_view, workspace, sequences, softmax_scale, window_size_left,
+    window_size_right, stream,
+):
+    device_id = runtime.current_device().device_id
+    head_dim, num_head, rows = q_view.shape[-1], q_view.shape[-2], q_view.shape[0]
+    num_sequences = view_of(sequences.cu_seqlens_q).shape[0] - 1
+    variants = sorted(forward_variants(device_id, head_dim), key=lambda entry: entry[1].cluster_block_m)
+    (narrow, narrow_info), (wide, wide_info) = variants[0], variants[-1]
+    narrow_list, run_table, wide_list, queues = (view_of(t).pointer for t in workspace)
+    wide_workers = resident_ctas(device_id, head_dim, wide, "flash_attn_fwd_planned")
+    has_wide = wide_info.block_m > narrow_info.block_m and rows >= WIDE_MIN_ROWS
+    plan, _ = runtime.load_for(device_id, "fwd", head_dim, "inter_sequence_plan_blocks", wide, dynamic_shared=False)
+    cu_seqlens_q, cu_seqlens_k = (view_of(t).pointer for t in (sequences.cu_seqlens_q, sequences.cu_seqlens_k))
+    runtime.run(
+        plan, (1, 1, 1), COUNT_THREADS, 0, PLAN_SIGNATURE,
+        (
+            cu_seqlens_q, cu_seqlens_k, view_of(sequences.cu_visible_k).pointer,
+            view_of(sequences.visibility_bits).pointer, window_pointer(sequences), window_size_left, window_size_right,
+            run_table, narrow_list, wide_list, queues, num_sequences,
+            narrow_info.block_m, wide_info.block_m, WIDE_MIN_ROWS if has_wide else NO_WIDE_BLOCKS,
+            -(-SMALL_BLOCK_MAX_WAVES * wide_workers // num_head),
+        ),
+        stream,
+    )
+    workers = ((wide, wide_info, wide_list, queues + QUEUE_BYTES),) if has_wide else ()
+    for variant, info, run_list, run_queue in (*workers, (narrow, narrow_info, narrow_list, queues)):
+        values = (
+            q_view.pointer, k_view.pointer, v_view.pointer, out_view.pointer, lse_view.pointer, cu_seqlens_q,
+            cu_seqlens_k, 0, 0, num_head // k_view.shape[-2],
+            default_softmax_scale(softmax_scale, head_dim) * LOG2_E, window_size_left, window_size_right,
+            *row_strides(q_view), *row_strides(k_view), *row_strides(v_view), *row_strides(out_view),
+            0, lse_view.strides[0], num_sequences, 0, view_of(sequences.visibility_bits).pointer,
+            window_pointer(sequences), run_table, run_list, run_queue, num_head,
+        )
+        worker, _ = runtime.load_for(device_id, "fwd", head_dim, "flash_attn_fwd_planned", variant)
+        grid = (resident_ctas(device_id, head_dim, variant, "flash_attn_fwd_planned"), 1, 1)
+        runtime.run(worker, grid, info.threads, info.shared_bytes, FORWARD_SIGNATURE, values, stream)
 
 
 def backward(

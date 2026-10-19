@@ -7,7 +7,7 @@ const configurations = @import("configurations.zig");
 pub const Entry = @Vector(2, u32);
 
 const mantissa_bits = 2;
-const length_classes = @bitSizeOf(u32) << mantissa_bits;
+pub const length_classes = @bitSizeOf(u32) << mantissa_bits;
 
 pub fn lookup(scheduler_metadata: u64, num_batch: u32, block: u32) ?Entry {
     const table: [*]addrspace(.global) const Entry = @ptrFromInt(scheduler_metadata);
@@ -15,7 +15,7 @@ pub fn lookup(scheduler_metadata: u64, num_batch: u32, block: u32) ?Entry {
     return if (entry[0] < num_batch) entry else null;
 }
 
-fn lengthClass(length: u32) u32 {
+pub fn lengthClass(length: u32) u32 {
     if (length == 0) return 0;
     const exponent: u5 = @intCast(31 - @clz(length));
     const mantissa: u32 =
