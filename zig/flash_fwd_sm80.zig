@@ -18,6 +18,7 @@ const elect = @import("elect.zig");
 const mbarrier = @import("mbarrier.zig");
 const thread = @import("thread.zig");
 const inter_sequence = @import("inter_sequence.zig");
+const inter_sequence_forward = @import("inter_sequence_forward.zig");
 
 const Chunk = fragments.Chunk;
 const Accumulator = fragments.Accumulator;
@@ -1253,6 +1254,24 @@ comptime {
             });
             @export(&inter_sequence.transposeVisibility, .{ .name = "inter_sequence_transpose" });
             @export(&inter_sequence.planBlocks, .{ .name = "inter_sequence_plan_blocks" });
+            if (variant.specialization.limits.max_seqlen_q == 0 and
+                configurations.inter_sequence_megakernel.supports(config.head_dim))
+            {
+                const Megakernel = inter_sequence_forward.Megakernel(config.head_dim);
+                std.debug.assert(Megakernel.shared_bytes == Forward.shared_bytes);
+                std.debug.assert(Megakernel.threads == Forward.thread_count);
+                const MegakernelEntry = entry.Entry(
+                    inter_sequence_forward.Params,
+                    inter_sequence_forward.Args,
+                    inter_sequence_forward.names,
+                    .{
+                        .required_work_group_size = .{ .x = Megakernel.threads },
+                        .max_registers_per_work_item = Forward.max_registers,
+                    },
+                    Megakernel.run,
+                );
+                @export(&MegakernelEntry.entry, .{ .name = "inter_sequence_forward_megakernel" });
+            }
             @export(&inter_sequence.countVisibleTokens, .{
                 .name = "inter_sequence_count_visible_tokens",
             });

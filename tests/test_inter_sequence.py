@@ -282,14 +282,26 @@ def test_metadata_matches_its_definition(count):
     generator = torch.Generator().manual_seed(count)
     layout = random_layout(count, generator, separate_keys=True)
     cu_q, cu_k, bits, _ = layout_tensors(layout)
-    visible_bits_t, cu_visible_k, cu_visible_q = get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits)
+    visible_bits_t, cu_visible_k, cu_visible_q, order = get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits)
     lengths_q, lengths_k = torch.tensor(layout.lengths_q), torch.tensor(layout.lengths_k)
     visible = layout.visible.long()
-    expected_k = torch.cat([torch.zeros(1, dtype=torch.long), (visible @ lengths_k).cumsum(0)])
+    visible_keys = visible @ lengths_k
+    expected_k = torch.cat([torch.zeros(1, dtype=torch.long), visible_keys.cumsum(0)])
     expected_q = torch.cat([torch.zeros(1, dtype=torch.long), (visible.t() @ lengths_q).cumsum(0)])
     assert torch.equal(visible_bits_t.cpu(), visibility_bits_of(layout.visible.t()))
     assert torch.equal(cu_visible_k.cpu().long(), expected_k)
     assert torch.equal(cu_visible_q.cpu().long(), expected_q)
+    order = order.cpu().long()
+    assert torch.equal(order.sort().values, torch.arange(count))
+    classes = [length_class(int(keys)) for keys in visible_keys[order]]
+    assert classes == sorted(classes, reverse=True)
+
+
+def length_class(length):
+    if length == 0:
+        return 0
+    exponent = length.bit_length() - 1
+    return exponent << 2 | (length << 2 >> exponent) & 3
 
 
 def test_invalid_arguments_raise():

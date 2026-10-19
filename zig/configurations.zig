@@ -118,6 +118,25 @@ fn interSequenceSorted(limits: SequenceLimits) Specialization {
     return specialization;
 }
 
+pub const inter_sequence_megakernel = struct {
+    pub const block_n = 64;
+    pub const wide_warps = 2 * warps_per_warp_group;
+    pub const narrow_warps = warps_per_warp_group;
+    pub const supported_head_dims = [_]u32{ 64, 128 };
+
+    pub fn supports(head_dim: u32) bool {
+        return std.mem.indexOfScalar(u32, &supported_head_dims, head_dim) != null;
+    }
+
+    pub fn sharedBytes(head_dim: u32) u32 {
+        const row_bytes = pitchChunks(head_dim / Sm80FwdTiling.chunk_elements) *
+            Sm80FwdTiling.chunk_bytes;
+        const wide = (wide_warps * 16 + 2 * block_n) * row_bytes;
+        const narrow = (narrow_warps * 16 + 2 * block_n) * row_bytes;
+        return @max(wide, 2 * narrow);
+    }
+};
+
 fn hasInterSequence(head_dim: u32) bool {
     return std.mem.indexOfScalar(u32, &inter_sequence_head_dims, head_dim) != null;
 }

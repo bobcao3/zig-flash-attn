@@ -34,12 +34,15 @@ COUNT_THREADS = 1024
 FORWARD_SIGNATURE = "p" * 7 + "uuufii" + "p" * 14 + "u" + "p" * 6 + "u"
 RUN_TABLE_SIGNATURE = "pppp" + "ii" + "ppp" + "u"
 RUN_ENTRY_WORDS = 4
-RUN_QUEUE_WORDS = 4
+RUN_QUEUE_WORDS = 8
 QUEUE_BYTES = 8
 PLAN_SIGNATURE = "ppppp" + "ii" + "pppp" + "uuuuu"
 WIDE_MIN_ROWS = 768
 NO_WIDE_BLOCKS = 2**32 - 1
 PLANNED = os.environ.get("ZIGFA_INTER_SEQUENCE_PLAN") == "device"
+MEGAKERNEL = os.environ.get("ZIGFA_INTER_SEQUENCE_PLAN") == "megakernel"
+MEGAKERNEL_NAME = "inter_sequence_forward_megakernel"
+MEGAKERNEL_SIGNATURE = "p" * 19 + "iif" + "uuu" + "p" + "uu"
 SMALL_BLOCK_MAX_SEQLEN_Q = 768
 SMALL_BLOCK_MAX_WAVES = 8
 INTER_SEQUENCE_BACKWARD_SIGNATURE = BACKWARD_SIGNATURE + "ppp"
@@ -53,6 +56,7 @@ class Sequences(NamedTuple):
     visibility_bits_t: object
     cu_visible_k: object
     cu_visible_q: object
+    sequence_order: object
     window_sizes: Optional[object] = None
 
 
@@ -61,7 +65,7 @@ def words_per_row(num_sequences):
 
 
 def metadata_shapes(num_sequences):
-    return (num_sequences, words_per_row(num_sequences)), (num_sequences + 1,), (num_sequences + 1,)
+    return (num_sequences, words_per_row(num_sequences)), (num_sequences + 1,), (num_sequences + 1,), (num_sequences,)
 
 
 @functools.cache
@@ -90,7 +94,8 @@ def kernel_info(device_id, direction, head_dim):
 
 
 def prepare_metadata(
-    cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, stream=None
+    cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, sequence_order,
+    stream=None,
 ):
     num_sequences = view_of(cu_seqlens_q).shape[0] - 1
     device_id = runtime.current_device().device_id
@@ -109,10 +114,11 @@ def prepare_metadata(
     )
     count, _ = load(kernel_name="inter_sequence_count_visible_tokens")
     runtime.run(
-        count, (1, 1, 1), COUNT_THREADS, 0, "pppppp" + "u",
+        count, (1, 1, 1), COUNT_THREADS, 0, "ppppppp" + "u",
         (
             bits, bits_t, view_of(cu_seqlens_q).pointer, view_of(cu_seqlens_k).pointer,
-            view_of(cu_visible_k).pointer, view_of(cu_visible_q).pointer, num_sequences,
+            view_of(cu_visible_k).pointer, view_of(cu_visible_q).pointer, view_of(sequence_order).pointer,
+            num_sequences,
         ),
         stream,
     )
@@ -128,6 +134,19 @@ def forward_variants(device_id, head_dim):
         (variant, entries[instance]) for variant, instance in instances
         if variant.startswith(VARIANT) and instance in entries
     )
+
+
+@functools.cache
+def megakernel_head_dims(device_id):
+    entries = runtime.manifest()[1]
+    supported = []
+    for head_dim in head_dims(device_id):
+        try:
+            runtime.load_for(device_id, "fwd", head_dim, MEGAKERNEL_NAME, VARIANT)
+        except Exception:
+            continue
+        supported.append(head_dim)
+    return tuple(supported) if entries else ()
 
 
 @functools.cache
@@ -196,6 +215,11 @@ def forward(
     _, run_table, run_list, run_queue = (view_of(t).pointer for t in workspace)
     if not q_view.shape[0]:
         return
+    if MEGAKERNEL and head_dim in megakernel_head_dims(device_id):
+        return forward_megakernel(
+            q_view, k_view, v_view, out_view, lse_view, workspace, sequences, softmax_scale, window_size_left,
+            window_size_right, stream,
+        )
     if PLANNED:
         return forward_planned(
             q_view, k_view, v_view, out_view, lse_view, workspace, sequences, softmax_scale, window_size_left,
@@ -275,6 +299,28 @@ def forward_planned(
         worker, _ = runtime.load_for(device_id, "fwd", head_dim, "flash_attn_fwd_planned", variant)
         grid = (resident_ctas(device_id, head_dim, variant, "flash_attn_fwd_planned"), 1, 1)
         runtime.run(worker, grid, info.threads, info.shared_bytes, FORWARD_SIGNATURE, values, stream)
+
+
+def forward_megakernel(
+    q_view, k_view, v_view, out_view, lse_view, workspace, sequences, softmax_scale, window_size_left,
+    window_size_right, stream,
+):
+    device_id = runtime.current_device().device_id
+    head_dim, num_head = q_view.shape[-1], q_view.shape[-2]
+    num_sequences = view_of(sequences.cu_seqlens_q).shape[0] - 1
+    kernel, info = runtime.load_for(device_id, "fwd", head_dim, MEGAKERNEL_NAME, VARIANT)
+    grid = resident_ctas(device_id, head_dim, VARIANT, MEGAKERNEL_NAME)
+    values = (
+        q_view.pointer, k_view.pointer, v_view.pointer, out_view.pointer, lse_view.pointer,
+        *row_strides(q_view)[1:], *row_strides(k_view)[1:], *row_strides(v_view)[1:], *row_strides(out_view)[1:],
+        lse_view.strides[0], view_of(sequences.cu_seqlens_q).pointer, view_of(sequences.cu_seqlens_k).pointer,
+        view_of(sequences.cu_visible_k).pointer, view_of(sequences.visibility_bits).pointer,
+        window_pointer(sequences), window_size_left, window_size_right,
+        default_softmax_scale(softmax_scale, head_dim) * LOG2_E, num_sequences, num_head,
+        num_head // k_view.shape[-2], view_of(sequences.sequence_order).pointer,
+        WIDE_MIN_ROWS, -(-SMALL_BLOCK_MAX_WAVES * grid // num_head),
+    )
+    runtime.run(kernel, (grid, 1, 1), info.threads, info.shared_bytes, MEGAKERNEL_SIGNATURE, values, stream)
 
 
 def backward(
