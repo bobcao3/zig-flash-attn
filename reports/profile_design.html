@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Warp Range Profiler</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chivo:wght@700;800&family=JetBrains+Mono:wght@400;700&family=Public+Sans:wght@400;700;800&display=swap">
+<link rel="stylesheet" href="assets/report.css">
+<script src="assets/theme.js"></script>
+<style>
+:root { --sheet-width: 800px; }
+header.top .toprow { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; }
+
+.code { display: grid; grid-template-columns: minmax(0, 1.85fr) minmax(0, 1fr); }
+.code pre { margin: 0; padding: 10px 12px; font: 10px/1.5 var(--font-mono); overflow-x: auto; }
+.code pre + pre { border-left: var(--border-thin); }
+.kw { color: var(--tone-1); font-weight: 700; }
+.str { color: var(--tone-2); }
+.cm { color: var(--muted); }
+.fn { color: var(--tone-5); }
+
+.fig { padding: 8px 10px; }
+.fig svg { display: block; width: 100%; min-width: 520px; height: auto; }
+svg text { fill: var(--ink); }
+svg .m { font-family: var(--font-mono); }
+svg .s8 { font-size: 8px; font-weight: 700; letter-spacing: .06em; fill: var(--label); }
+svg .s9 { font-size: 9px; }
+svg .s10 { font-size: 10px; }
+svg .s11 { font-size: 11px; }
+svg .b { font-weight: 700; }
+svg .mut { fill: var(--muted); }
+svg .mid { text-anchor: middle; }
+svg .end { text-anchor: end; }
+svg .edge { fill: none; stroke: var(--line); stroke-width: 1.5; }
+svg .dashed { stroke-dasharray: 3 2; }
+svg .rule { fill: none; stroke: var(--line); stroke-width: 1; }
+svg .faint { fill: none; stroke: var(--line); stroke-width: 1; opacity: .3; }
+svg .gridl { fill: none; stroke: var(--grid); stroke-width: 1; }
+svg .flow { fill: none; stroke: var(--line); stroke-width: 1.5; marker-end: url(#ah); }
+svg .flow-d { fill: none; stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 3 3; marker-end: url(#ah); }
+svg .ah { fill: var(--line); }
+svg .cell { fill: var(--canvas); stroke: var(--line); stroke-width: 1; }
+svg .k1, svg .k2, svg .k3, svg .k4, svg .k5, svg .k6 { stroke-width: 1.5; }
+svg .k1 { fill: var(--block-1); stroke: var(--e1); }
+svg .k2 { fill: var(--block-2); stroke: var(--e2); }
+svg .k3 { fill: var(--block-3); stroke: var(--e3); }
+svg .k4 { fill: var(--block-4); stroke: var(--e4); }
+svg .k5 { fill: var(--block-5); stroke: var(--e5); }
+svg .k6 { fill: var(--block-6); stroke: var(--e6); }
+svg .thin { stroke-width: 1; }
+svg .hatch { fill: url(#hatch); stroke: var(--line); stroke-width: 1.5; }
+svg .hatch-bg { fill: var(--canvas); }
+svg .hatch-ln { stroke: var(--tone-1); stroke-width: 1.5; }
+svg .dot { fill: var(--canvas); stroke: var(--tone-1); stroke-width: 1.5; }
+svg .now { fill: var(--marker); stroke: var(--line); stroke-width: 1.5; }
+svg .close-tick { fill: var(--tone-2); }
+svg .sel { fill: var(--selected); stroke: var(--line); stroke-width: 1.5; }
+svg .on-sel { fill: var(--on-selected); }
+svg .halo { paint-order: stroke; stroke: var(--block-4); stroke-width: 6px; }
+svg .halo-c { paint-order: stroke; stroke: var(--canvas); stroke-width: 5px; }
+svg .t8 { font-size: 8px; }
+svg .hover { fill: none; stroke: var(--ink); stroke-width: 2; }
+svg .tip { fill: var(--canvas); stroke: var(--line); stroke-width: 1.5; }
+svg .tip-shadow { fill: var(--shadow-ink); }
+svg .window { fill: none; stroke: var(--selected); stroke-width: 2; }
+svg .mini { fill: var(--tone-1); opacity: .5; }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="ah" viewBox="0 0 8 8" refX="7.5" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path class="ah" d="M0,0 L8,4 L0,8 z"/></marker>
+    <pattern id="hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect class="hatch-bg" width="5" height="5"/><line class="hatch-ln" x1="0" y1="0" x2="0" y2="5"/></pattern>
+  </defs>
+</svg>
+<div class="wrap">
+<header class="top">
+  <div class="toprow">
+    <div class="eyebrow">zigfa · kernel profiler design</div>
+    <div class="themeswitch" role="group" aria-label="Theme"><button type="button" data-theme-choice="light">Light</button><button type="button" data-theme-choice="dark">Dark</button><button type="button" data-theme-choice="auto">Auto</button></div>
+  </div>
+  <h1>Warp Range Profiler</h1>
+  <p>Each warp logs zone begins and ends as 4-byte records.</p>
+</header>
+
+<section id="use">
+  <h2>Mark and capture</h2>
+  <div class="frame code">
+<pre><span class="kw">const</span> Zone = <span class="kw">enum</span>(u7) { tile, load, mma, softmax };
+<span class="kw">const</span> Trace = profile.<span class="fn">Recorder</span>(Zone, .{ .sink = .lanes });
+<span class="kw">fn</span> <span class="fn">runConsumer</span>(params: Params, args: Args) <span class="kw">void</span> {
+    <span class="kw">var</span> trace: Trace = .<span class="fn">init</span>(params.profile);
+    <span class="kw">defer</span> trace.<span class="fn">finish</span>();
+    trace.<span class="fn">begin</span>(.softmax);
+    <span class="kw">defer</span> trace.<span class="fn">end</span>(.softmax);
+    <span class="fn">softmaxTile</span>(params, args);
+}</pre>
+<pre><span class="cm"># zig build -Dprofile</span>
+<span class="kw">from</span> zigfa <span class="kw">import</span> profile
+<span class="kw">with</span> profile.<span class="fn">capture</span>() <span class="kw">as</span> cap:
+    <span class="fn">flash_attn_func</span>(q, k, v)
+cap.<span class="fn">save</span>(<span class="str">"fwd.jsonl.gz"</span>)
+cap.<span class="fn">save</span>(<span class="str">"fwd.html"</span>)
+cap.<span class="fn">summary</span>(by=<span class="str">"sm"</span>)</pre>
+  </div>
+  <p class="note">All 32 lanes of a warp call <code>begin</code> and <code>end</code> together; without <code>-Dprofile</code>, both compile to nothing.</p>
+  <div class="frame fig">
+    <svg viewBox="0 0 580 136" role="img" aria-label="Example of the exported viewer in its dark theme: group-by tiles, a legend, one track per warp with nested zone bars, a hover tooltip on a softmax zone, a time axis and an overview strip whose bracket marks the visible window.">
+      <defs><pattern id="mini" width="9" height="14" patternUnits="userSpaceOnUse"><rect class="mini" x="0" y="3" width="6" height="8"/></pattern></defs>
+      <text class="s8" x="0" y="13">GROUP BY</text>
+      <rect class="sel" x="44" y="2" width="30" height="16"/><text class="m s9 b mid on-sel" x="59" y="13">SM</text>
+      <rect class="cell dashed" x="76" y="2" width="50" height="16"/><text class="m s9 b mid" x="101" y="13">CLUSTER</text>
+      <rect class="cell" x="128" y="2" width="30" height="16"/><text class="m s9 b mid" x="143" y="13">CTA</text>
+      <rect class="cell" x="160" y="2" width="30" height="16"/><text class="m s9 b mid" x="175" y="13">WG</text>
+      <rect class="cell" x="192" y="2" width="38" height="16"/><text class="m s9 b mid" x="211" y="13">WARP</text>
+      <rect class="k6 thin" x="306" y="6" width="8" height="8"/><text class="m s9" x="317" y="13.5">tile</text>
+      <rect class="k5 thin" x="346" y="6" width="8" height="8"/><text class="m s9" x="357" y="13.5">load</text>
+      <rect class="k3 thin" x="390" y="6" width="8" height="8"/><text class="m s9" x="401" y="13.5">mma</text>
+      <rect class="k1 thin" x="430" y="6" width="8" height="8"/><text class="m s9" x="441" y="13.5">softmax</text>
+      <rect class="close-tick" x="492" y="4" width="2" height="12"/><text class="m s9" x="498" y="13.5">chunk close</text>
+
+      <path class="gridl" d="M176 24v56M275 24v56M374 24v56M473 24v56M572 24v56"/>
+      <text class="m s9 b" x="0" y="34">SM 2</text><text class="m s9 mut end" x="170" y="34">CTA 2</text>
+      <text class="m s9" x="8" y="50">WG0 · W0</text>
+      <path class="k5 thin" d="M186 41h40v12h-40zM240 41h40v12h-40zM294 41h40v12h-40zM348 41h40v12h-40zM402 41h40v12h-40zM456 41h40v12h-40zM510 41h40v12h-40z"/>
+      <text class="m s9" x="8" y="67">WG1 · W4</text>
+      <path class="k6 thin" d="M226 57h108v3h-108zM334 57h108v3h-108zM442 57h108v3h-108z"/>
+      <path class="k3 thin" d="M226 61h30v9h-30zM334 61h30v9h-30zM442 61h30v9h-30z"/>
+      <path class="k1 thin" d="M256 61h74v9h-74zM364 61h74v9h-74zM472 61h74v9h-74z"/>
+      <rect class="close-tick" x="397" y="39" width="2" height="16"/>
+      <rect class="close-tick" x="439" y="56" width="2" height="16"/>
+      <rect class="hover" x="364" y="61" width="74" height="9"/>
+      <rect class="tip-shadow" x="424" y="38" width="146" height="30"/>
+      <rect class="tip" x="420" y="34" width="146" height="30"/>
+      <text class="m s9 b" x="428" y="46">softmax · SM 2 · W4</text>
+      <text class="m s9 mut" x="428" y="58">3.80 µs + 1.49 µs</text>
+      <path class="rule" d="M176 80h396"/>
+      <text class="m s9 mut mid" x="176" y="92">0</text><text class="m s9 mut mid" x="275" y="92">2</text><text class="m s9 mut mid" x="374" y="92">4</text><text class="m s9 mut mid" x="473" y="92">6</text><text class="m s9 mut end" x="572" y="92">8 µs</text>
+      <text class="s9 mut" x="0" y="92">wheel zooms · drag pans</text>
+      <text class="s9 mut" x="0" y="113">overview</text>
+      <rect class="cell" x="176" y="102" width="396" height="16"/>
+      <rect fill="url(#mini)" x="178" y="103" width="392" height="14"/>
+      <rect class="window" x="176" y="101" width="99" height="18"/>
+      <text class="m s9 mut mid" x="176" y="130">0</text><text class="m s9 mut end" x="572" y="130">32 µs</text>
+      <text class="s9 mut" x="0" y="130">example</text>
+    </svg>
+  </div>
+</section>
+
+<section id="record">
+  <h2>How it records</h2>
+  <div class="frame fig">
+    <svg viewBox="0 0 580 73" role="img" aria-label="Bit layout of a record: bits 31 to 25 hold the zone, bit 24 the end flag, bits 23 to 0 the clock ticks modulo 2 to the 24.">
+      <text class="m s9 mut mid" x="22.5" y="9">31</text>
+      <text class="m s9 mut mid" x="124.5" y="9">25</text>
+      <text class="m s9 mut mid" x="141.5" y="9">24</text>
+      <text class="m s9 mut mid" x="158.5" y="9">23</text>
+      <text class="m s9 mut mid" x="549.5" y="9">0</text>
+      <rect class="k1" x="14" y="13" width="119" height="26"/>
+      <rect class="k2" x="133" y="13" width="17" height="26"/>
+      <rect class="k4" x="150" y="13" width="408" height="26"/>
+      <path class="faint" d="M31 13v26M48 13v26M65 13v26M82 13v26M99 13v26M116 13v26M167 13v26M184 13v26M201 13v26M218 13v26M235 13v26M252 13v26M269 13v26M286 13v26M303 13v26M320 13v26M337 13v26M354 13v26M371 13v26M388 13v26M405 13v26M422 13v26M439 13v26M456 13v26M473 13v26M490 13v26M507 13v26M524 13v26M541 13v26"/>
+      <text class="m s11 b mid" x="73.5" y="30">zone · u7</text>
+      <text class="m s10 b mid" x="141.5" y="30">e</text>
+      <text class="m s11 b mid halo" x="354" y="30">ticks = (%clock64 &gt;&gt; shift) mod 2²⁴</text>
+      <text class="m s10" x="14" y="56">Zone.softmax = 3: begin <tspan class="b">0x06</tspan>······</text>
+      <text class="s9 mut" x="14" y="69">e = 1 ends the zone: <tspan class="m">0x07</tspan>······</text>
+      <text class="m s10" x="300" y="56">wraps every 2²⁴ &lt;&lt; shift cycles</text>
+      <text class="s9 mut" x="300" y="69">8.4 ms at 2 GHz with shift 0</text>
+    </svg>
+  </div>
+  <div class="frame fig">
+    <svg viewBox="0 0 580 124" role="img" aria-label="Each warp reads the clock and packs a record. The default sink keeps record k in a register of lane k and stores all 32 with one 128-byte store; the global sink stores each record directly. Every 32 records the warp closes the chunk.">
+      <rect class="edge" x="10" y="4" width="82" height="20"/>
+      <text class="m s10 b mid" x="51" y="18">%clock64</text>
+      <path class="flow" d="M51 25v10"/>
+      <rect class="k1 thin" x="10" y="37" width="18" height="20"/>
+      <rect class="k2 thin" x="28" y="37" width="3" height="20"/>
+      <rect class="k4 thin" x="31" y="37" width="61" height="20"/>
+      <text class="m s9 b" x="35" y="50.5">u32</text>
+      <path class="flow" d="M92 47h10V27h6"/>
+      <path class="flow" d="M92 47h406"/>
+
+      <text class="m s10 b" x="112" y="10">.lanes</text>
+      <text class="s9 mut" x="152" y="10">default · lane k keeps record k in a register</text>
+      <path class="k1 thin" d="M112 16h10v10h-10zM124 16h10v10h-10zM136 16h10v10h-10zM148 16h10v10h-10zM160 16h10v10h-10zM172 16h10v10h-10zM184 16h10v10h-10zM196 16h10v10h-10zM208 16h10v10h-10zM220 16h10v10h-10zM232 16h10v10h-10zM244 16h10v10h-10zM256 16h10v10h-10z"/>
+      <rect class="k3 thin" x="268" y="16" width="10" height="10"/>
+      <path class="cell" d="M280 16h10v10h-10zM292 16h10v10h-10zM112 28h10v10h-10zM124 28h10v10h-10zM136 28h10v10h-10zM148 28h10v10h-10zM160 28h10v10h-10zM172 28h10v10h-10zM184 28h10v10h-10zM196 28h10v10h-10zM208 28h10v10h-10zM220 28h10v10h-10zM232 28h10v10h-10zM244 28h10v10h-10zM256 28h10v10h-10zM268 28h10v10h-10zM280 28h10v10h-10zM292 28h10v10h-10z"/>
+      <path class="flow" d="M308 27h190"/>
+      <text class="s9 mut mid" x="403" y="21">every 32 records</text>
+      <text class="s9 mut mid" x="403" y="40">one 128-B store</text>
+
+      <text class="m s10 b" x="112" y="64">.global</text>
+      <text class="s9 mut" x="160" y="64">lane 0 stores each record, 4 B</text>
+      <text class="s9 mut" x="112" y="77">for warp roles with no spare register</text>
+
+      <text class="s8" x="500" y="10">CHUNK</text>
+      <rect class="cell" x="500" y="14" width="70" height="66"/>
+      <rect class="k1 thin" x="500" y="14" width="70" height="26.8"/>
+      <path class="faint" d="M500 22.25h70M500 30.5h70M500 38.75h70M500 47h70M500 55.25h70M500 63.5h70M500 71.75h70"/>
+      <text class="m s9 b mid halo-c" x="535" y="64">32 × u32</text>
+
+      <path class="rule" d="M10 88h560"/>
+      <text class="s8" x="10" y="105">EVERY 32 RECORDS</text>
+      <rect class="k3" x="104" y="95" width="40" height="18"/>
+      <text class="m s9 b mid" x="124" y="107.5">close</text>
+      <path class="flow" d="M144 104h10"/>
+      <text class="m s9" x="158" y="107.5">headers[chunk] ← clock64, globaltimer, cta, origin</text>
+      <text class="m s9" x="158" y="120">chunk ← next, next ← atom.add</text>
+    </svg>
+  </div>
+  <div class="frame fig">
+    <svg viewBox="0 0 580 132" role="img" aria-label="Buffer layout: a 16-byte control block, an array of 24-byte chunk headers and an array of 128-byte record chunks; the last chunk takes the writes past capacity.">
+      <text class="s8" x="10" y="10">ONE BUFFER PER LAUNCH · NOT TO SCALE</text>
+      <rect class="k6" x="10" y="16" width="56" height="22"/>
+      <text class="m s10 b mid" x="38" y="31">control</text>
+      <rect class="k5" x="66" y="16" width="150" height="22"/>
+      <rect class="hatch" x="200" y="16" width="16" height="22"/>
+      <text class="m s10 b" x="72" y="31">headers[C+1]</text>
+      <rect class="k1" x="216" y="16" width="354" height="22"/>
+      <rect class="hatch" x="548" y="16" width="22" height="22"/>
+      <text class="m s10 b" x="222" y="31">records[C+1]</text>
+      <text class="m s9 mut" x="10" y="49">0</text>
+      <text class="m s9 mut" x="66" y="49">64</text>
+      <text class="m s9 mut" x="216" y="49">H, 128-B aligned</text>
+      <text class="s9 mut end" x="570" y="49">hatched: chunk C takes writes past capacity</text>
+
+      <text class="s8" x="10" y="67">CONTROL · 16 B</text>
+      <rect class="k6" x="10" y="72" width="60" height="20"/><text class="m s9 b mid" x="40" y="85.5">next_chunk</text>
+      <rect class="k6" x="70" y="72" width="60" height="20"/><text class="m s9 b mid" x="100" y="85.5">capacity</text>
+      <rect class="k6" x="130" y="72" width="60" height="20"/><text class="m s9 b mid" x="160" y="85.5">dropped</text>
+      <rect class="k6" x="190" y="72" width="60" height="20"/><text class="m s9 b mid" x="220" y="85.5">format</text>
+      <text class="s9 mut" x="10" y="108">dropped counts the records written past capacity</text>
+      <text class="s9 mut" x="10" y="120">format holds the tick shift and the sink</text>
+
+      <text class="s8" x="290" y="67">CHUNK HEADER k · 24 B</text>
+      <rect class="k5" x="290" y="72" width="90" height="20"/><text class="m s9 b mid" x="335" y="85.5">clock64</text>
+      <rect class="k5" x="380" y="72" width="90" height="20"/><text class="m s9 b mid" x="425" y="85.5">globaltimer</text>
+      <rect class="k5" x="470" y="72" width="45" height="20"/><text class="m s9 b mid" x="492.5" y="85.5">cta</text>
+      <rect class="k5" x="515" y="72" width="55" height="20"/><text class="m s9 b mid" x="542.5" y="85.5">origin</text>
+      <path class="faint" style="opacity:.6" d="M515 92L290 102M570 92V102"/>
+      <rect class="k5 thin" x="290" y="102" width="68" height="18"/><text class="m s9 b mid" x="324" y="114.5">sm:8</text>
+      <rect class="k5 thin" x="358" y="102" width="42" height="18"/><text class="m s9 b mid" x="379" y="114.5">warp:5</text>
+      <rect class="k5 thin" x="400" y="102" width="51" height="18"/><text class="m s9 b mid" x="425.5" y="114.5">count:6</text>
+      <rect class="cell" x="451" y="102" width="119" height="18"/><text class="m s9 mut mid" x="510.5" y="114.5">spare:13</text>
+    </svg>
+  </div>
+  <div class="frame fig">
+    <svg viewBox="0 0 580 112" role="img" aria-label="The host takes SM, CTA and warp from the chunk header, computes the warpgroup as warp divided by 4, and derives the cluster only for launches whose clusters hold two or more CTAs. Ticks are unwrapped backward from the 64-bit clock in the header and converted to nanoseconds with one linear fit per SM.">
+      <rect class="k1" x="10" y="4" width="44" height="17"/><text class="m s9 b mid" x="32" y="16">SM</text>
+      <text class="m s9 mut mid" x="62" y="16">▸</text>
+      <rect class="k1" x="70" y="4" width="44" height="17"/><text class="m s9 b mid" x="92" y="16">CTA</text>
+      <text class="m s9 mut mid" x="122" y="16">▸</text>
+      <rect class="k5" x="130" y="4" width="44" height="17"/><text class="m s9 b mid" x="152" y="16">WG</text>
+      <text class="m s9 mut mid" x="182" y="16">▸</text>
+      <rect class="k1" x="190" y="4" width="44" height="17"/><text class="m s9 b mid" x="212" y="16">WARP</text>
+      <text class="m s9" x="10" y="34">origin.sm</text>
+      <text class="m s9" x="70" y="34">header.cta</text>
+      <text class="m s9" x="130" y="34">warp / 4</text>
+      <text class="m s9" x="190" y="34">origin.warp</text>
+      <rect class="k5 dashed" x="300" y="4" width="60" height="17"/><text class="m s9 b mid" x="330" y="16">CLUSTER</text>
+      <text class="s9 mut" x="370" y="16">only for clusters of 2+ CTAs</text>
+      <text class="m s9" x="300" y="34">cta and the launch's cluster shape</text>
+
+      <path class="rule" d="M10 46h560"/>
+      <text class="s8" x="10" y="62">UNWRAP BACKWARD</text>
+      <text class="m s9 b end" x="300" y="62">header.clock64</text>
+      <path class="rule" d="M10 90h290"/>
+      <path class="flow-d" d="M286 86Q262 68 240 84"/>
+      <path class="flow-d" d="M232 86Q206 70 182 84"/>
+      <path class="flow-d" d="M174 86Q150 70 128 84"/>
+      <path class="flow-d" d="M120 86Q96 70 74 84"/>
+      <path class="flow-d" d="M66 86Q44 70 24 84"/>
+      <circle class="dot" cx="20" cy="90" r="3.5"/><circle class="dot" cx="70" cy="90" r="3.5"/><circle class="dot" cx="124" cy="90" r="3.5"/><circle class="dot" cx="178" cy="90" r="3.5"/><circle class="dot" cx="236" cy="90" r="3.5"/>
+      <path class="rule" style="stroke-width:1.5" d="M290 66v32"/>
+      <circle class="now" cx="290" cy="90" r="4.5"/>
+      <text class="m s9 mut" x="10" y="108">Δ = (a − r) mod 2²⁴; every gap under one wrap</text>
+      <text class="s8" x="330" y="62">CLOCK TO NANOSECONDS</text>
+      <text class="m s10 b" x="330" y="80">ns = a + clock / f</text>
+      <text class="s9 mut" x="330" y="94">one fit per SM over the (clock64,</text>
+      <text class="s9 mut" x="330" y="106">globaltimer) pair of each header</text>
+    </svg>
+  </div>
+</section>
+
+<section id="export">
+  <h2>Export</h2>
+  <div class="frame fig">
+    <svg viewBox="0 0 580 148" role="img" aria-label="Decoded zones are saved either as fwd.jsonl.gz, a gzip file with one JSON value per line, or as fwd.html, one file that holds the shared styles pinned to the dark theme, the viewer script and the same gzip bytes in base64.">
+      <rect class="k4" x="10" y="40" width="110" height="24"/><text class="m s9 b mid" x="65" y="55.5">decoded zones</text>
+      <path class="flow" d="M120 52H140V22H158"/>
+      <path class="flow" d="M140 52V88H158"/>
+      <rect class="k3" x="160" y="10" width="150" height="24"/><text class="m s10 b" x="168" y="26">fwd.jsonl.gz</text>
+      <text class="s9 mut" x="320" y="26">gzip of one JSON value per line</text>
+      <rect class="edge" x="160" y="48" width="410" height="80"/>
+      <text class="m s10 b" x="168" y="63">fwd.html</text>
+      <text class="s9 mut" x="226" y="63">one file, no network, dark theme</text>
+      <rect class="k6 thin" x="168" y="70" width="394" height="16"/><text class="m s9 b" x="174" y="81.5">&lt;style&gt;</text><text class="s9" x="360" y="81.5">report.css with color-scheme: dark</text>
+      <rect class="k5 thin" x="168" y="88" width="394" height="16"/><text class="m s9 b" x="174" y="99.5">&lt;script&gt;</text><text class="s9" x="360" y="99.5">viewer: DecompressionStream, canvas</text>
+      <rect class="k3 thin" x="168" y="106" width="394" height="16"/><text class="m s9 b" x="174" y="117.5">&lt;script type="application/gzip"&gt;</text><text class="s9" x="360" y="117.5">base64 of fwd.jsonl.gz</text>
+      <text class="s9 mut" x="10" y="144">template: reports/trace_viewer.html; setup.py copies it and report.css into the package</text>
+    </svg>
+  </div>
+  <div class="frame fig">
+    <svg viewBox="0 0 580 206" role="img" aria-label="Schema of the five line kinds: the header object, launch lines L, track lines T, zone lines Z and chunk-close lines C, with the fields and types of each.">
+      <text class="s8" x="10" y="10">ONE JSON VALUE PER LINE</text>
+      <rect class="k6" x="10" y="16" width="26" height="18"/><text class="m s9 b mid" x="23" y="28.5">{ }</text>
+      <rect class="k6 thin" x="42" y="16" width="62" height="18"/><text class="m s9 b mid" x="73" y="28.5">format</text><text class="m t8 mut mid" x="73" y="45">str</text><rect class="k6 thin" x="106" y="16" width="62" height="18"/><text class="m s9 b mid" x="137" y="28.5">version</text><text class="m t8 mut mid" x="137" y="45">u32</text><rect class="k6 thin" x="170" y="16" width="62" height="18"/><text class="m s9 b mid" x="201" y="28.5">t0</text><text class="m t8 mut mid" x="201" y="45">ns</text>
+      <text class="m s9 mut" x="240" y="28.5">{"format":"zigfa.zones","version":1,…}</text>
+      <rect class="k3" x="10" y="54" width="26" height="18"/><text class="m s9 b mid" x="23" y="66.5">L</text>
+      <rect class="k3 thin" x="42" y="54" width="62" height="18"/><text class="m s9 b mid" x="73" y="66.5">id</text><text class="m t8 mut mid" x="73" y="83">u32</text><rect class="k3 thin" x="106" y="54" width="62" height="18"/><text class="m s9 b mid" x="137" y="66.5">kernel</text><text class="m t8 mut mid" x="137" y="83">str</text><rect class="k3 thin" x="170" y="54" width="62" height="18"/><text class="m s9 b mid" x="201" y="66.5">grid</text><text class="m t8 mut mid" x="201" y="83">[3]u32</text><rect class="k3 thin" x="234" y="54" width="62" height="18"/><text class="m s9 b mid" x="265" y="66.5">cluster</text><text class="m t8 mut mid" x="265" y="83">[3]u32</text><rect class="k3 thin" x="298" y="54" width="62" height="18"/><text class="m s9 b mid" x="329" y="66.5">threads</text><text class="m t8 mut mid" x="329" y="83">u32</text><rect class="k3 thin" x="362" y="54" width="62" height="18"/><text class="m s9 b mid" x="393" y="66.5">zones</text><text class="m t8 mut mid" x="393" y="83">[]str</text><rect class="k3 thin" x="426" y="54" width="62" height="18"/><text class="m s9 b mid" x="457" y="66.5">dropped</text><text class="m t8 mut mid" x="457" y="83">u32</text>
+      <rect class="k5" x="10" y="92" width="26" height="18"/><text class="m s9 b mid" x="23" y="104.5">T</text>
+      <rect class="k5 thin" x="42" y="92" width="62" height="18"/><text class="m s9 b mid" x="73" y="104.5">id</text><text class="m t8 mut mid" x="73" y="121">u32</text><rect class="k5 thin" x="106" y="92" width="62" height="18"/><text class="m s9 b mid" x="137" y="104.5">launch</text><text class="m t8 mut mid" x="137" y="121">L id</text><rect class="k5 thin" x="170" y="92" width="62" height="18"/><text class="m s9 b mid" x="201" y="104.5">sm</text><text class="m t8 mut mid" x="201" y="121">u32</text><rect class="k5 thin" x="234" y="92" width="62" height="18"/><text class="m s9 b mid" x="265" y="104.5">cta</text><text class="m t8 mut mid" x="265" y="121">u32</text><rect class="k5 thin" x="298" y="92" width="62" height="18"/><text class="m s9 b mid" x="329" y="104.5">warp</text><text class="m t8 mut mid" x="329" y="121">u32</text>
+      <text class="m s9 mut" x="372" y="104.5">["T",12,0,2,2,4]</text>
+      <rect class="k1" x="10" y="130" width="26" height="18"/><text class="m s9 b mid" x="23" y="142.5">Z</text>
+      <rect class="k1 thin" x="42" y="130" width="62" height="18"/><text class="m s9 b mid" x="73" y="142.5">track</text><text class="m t8 mut mid" x="73" y="159">T id</text><rect class="k1 thin" x="106" y="130" width="62" height="18"/><text class="m s9 b mid" x="137" y="142.5">zone</text><text class="m t8 mut mid" x="137" y="159">L.zones idx</text><rect class="k1 thin" x="170" y="130" width="62" height="18"/><text class="m s9 b mid" x="201" y="142.5">start</text><text class="m t8 mut mid" x="201" y="159">ns</text><rect class="k1 thin" x="234" y="130" width="62" height="18"/><text class="m s9 b mid" x="265" y="142.5">dur</text><text class="m t8 mut mid" x="265" y="159">ns</text><rect class="k1 thin" x="298" y="130" width="62" height="18"/><text class="m s9 b mid" x="329" y="142.5">depth</text><text class="m t8 mut mid" x="329" y="159">u32</text>
+      <text class="m s9 mut" x="372" y="142.5">["Z",12,3,3798,1490,1]</text>
+      <rect class="k2" x="10" y="168" width="26" height="18"/><text class="m s9 b mid" x="23" y="180.5">C</text>
+      <rect class="k2 thin" x="42" y="168" width="62" height="18"/><text class="m s9 b mid" x="73" y="180.5">track</text><text class="m t8 mut mid" x="73" y="197">T id</text><rect class="k2 thin" x="106" y="168" width="62" height="18"/><text class="m s9 b mid" x="137" y="180.5">t</text><text class="m t8 mut mid" x="137" y="197">ns</text>
+      <text class="m s9 mut" x="180" y="180.5">["C",12,5313]</text>
+    </svg>
+  </div>
+  <p class="note">Line 1 is an object, and every later line is an array whose first element names its kind. A line refers only to ids on earlier lines, and times are integer nanoseconds from <code>t0</code>.</p>
+</section>
+</div>
+</body>
+</html>

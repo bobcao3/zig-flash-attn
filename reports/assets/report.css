@@ -1,0 +1,144 @@
+/* Each colour token is a light-dark() pair, so the color-scheme of the root element picks the
+   mode: theme.js sets data-theme from the Light and Dark buttons, and Auto follows the system. */
+:root {
+  color-scheme: light dark;
+  --ink-900: #0c1115; --ink-500: #46515d;
+  --paper-100: #f7f4e8; --paper-200: #e7e1cf; --paper-300: #cbc2ad;
+  --violet-300: #d8d2f2; --violet-500: #9189cc; --violet-700: #514a86;
+  --rose-300: #f2c9d9; --rose-700: #7a405d;
+  --amber-300: #ffd58a; --amber-500: #b5681f; --amber-700: #754214;
+  --sage-300: #c8dfce; --sage-700: #3d6a4c;
+  --teal-300: #c3dedd; --teal-700: #2f6566;
+  --orchid-300: #e6cfe3;
+  --charcoal-950: #0c0c0e; --charcoal-800: #25232c; --charcoal-500: #736c82; --charcoal-300: #b5adba;
+  --lavender: #d2cbf0; --rose: #f0c1d3; --amber: #ffcf78; --sage: #add1ad;
+  --teal: #a2cfc7; --orchid: #d4aacf;
+
+  --desktop: light-dark(var(--violet-300), var(--charcoal-800));
+  --canvas: light-dark(var(--paper-100), var(--charcoal-950));
+  --raised: light-dark(var(--violet-300), var(--charcoal-800));
+  --surface-2: light-dark(var(--paper-200), var(--charcoal-800));
+  --ink: light-dark(var(--ink-900), var(--paper-100));
+  --muted: light-dark(var(--ink-500), var(--charcoal-300));
+  --label: light-dark(var(--violet-700), var(--charcoal-300));
+  --line: light-dark(var(--ink-900), var(--charcoal-500));
+  --selected: light-dark(var(--violet-700), var(--lavender));
+  --on-selected: light-dark(var(--paper-100), var(--charcoal-950));
+  --accent: var(--selected);
+  --on-accent: var(--on-selected);
+  --hover: light-dark(var(--amber-300), var(--paper-100));
+  --on-hover: light-dark(var(--ink-900), var(--charcoal-950));
+  --positive: light-dark(var(--violet-700), var(--sage));
+  --negative: light-dark(var(--rose-700), var(--rose));
+  --neutral: light-dark(var(--amber-700), var(--amber));
+  --stripe: light-dark(var(--rose-300), color-mix(in srgb, var(--rose) 55%, var(--charcoal-500)));
+  --marker: var(--amber-300);
+  --focus: light-dark(var(--amber-500), var(--lavender));
+  --shadow-ink: light-dark(var(--ink-900), var(--charcoal-500));
+  --tone-1: light-dark(var(--violet-700), var(--lavender));
+  --tone-2: light-dark(var(--rose-700), var(--rose));
+  --tone-3: light-dark(var(--amber-500), var(--amber));
+  --tone-4: light-dark(var(--sage-700), var(--sage));
+  --tone-5: light-dark(var(--teal-700), var(--teal));
+  --tone-6: light-dark(var(--violet-500), var(--orchid));
+  --block-1: light-dark(var(--violet-300), color-mix(in srgb, var(--lavender) 14%, var(--charcoal-950)));
+  --block-2: light-dark(var(--rose-300), color-mix(in srgb, var(--rose) 14%, var(--charcoal-950)));
+  --block-3: light-dark(var(--amber-300), color-mix(in srgb, var(--amber) 12%, var(--charcoal-950)));
+  --block-4: light-dark(var(--sage-300), color-mix(in srgb, var(--sage) 14%, var(--charcoal-950)));
+  --block-5: light-dark(var(--teal-300), color-mix(in srgb, var(--teal) 14%, var(--charcoal-950)));
+  --block-6: light-dark(var(--orchid-300), color-mix(in srgb, var(--orchid) 14%, var(--charcoal-950)));
+  --e1: light-dark(var(--ink-900), var(--tone-1));
+  --e2: light-dark(var(--ink-900), var(--tone-2));
+  --e3: light-dark(var(--ink-900), var(--tone-3));
+  --e4: light-dark(var(--ink-900), var(--tone-4));
+  --e5: light-dark(var(--ink-900), var(--tone-5));
+  --e6: light-dark(var(--ink-900), var(--tone-6));
+  --on-block: light-dark(var(--ink-900), var(--paper-100));
+  --series-1: var(--tone-1);
+  --series-2: var(--tone-3);
+  --series-3: var(--tone-5);
+  --series-4: var(--tone-4);
+  --series-5: var(--tone-2);
+  --series-6: var(--tone-6);
+  --grid: light-dark(var(--paper-200), var(--charcoal-800));
+
+  --border-thin: 1px solid var(--line);
+  --border-strong: 2px solid var(--line);
+  --shadow-control: 2px 2px 0 var(--shadow-ink);
+  --shadow-card: 6px 6px 0 var(--shadow-ink);
+  --press: translate(2px, 2px);
+  --stripe-width: 10px;
+  --bar-height: 8px;
+  --leading-body: 1.5;
+  --leading-heading: 1;
+  --font-sans: "Public Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-title: "Chivo", "Public Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Nerd Font", "JetBrains Mono", ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  --sheet-margin: 12px;
+  --sheet-width: 1200px;
+}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+
+* { box-sizing: border-box; }
+html { font-family: var(--font-sans); font-synthesis: none; }
+body {
+  margin: 0; padding: var(--sheet-margin); background: var(--desktop); color: var(--ink);
+  font-size: 14px; line-height: var(--leading-body);
+}
+h1, h2, h3 { margin: 0; font-family: var(--font-title); text-wrap: balance; line-height: var(--leading-heading); }
+h1 { font-size: clamp(2rem, 5vw, 3.2rem); font-weight: 800; letter-spacing: -0.02em; }
+h2 { font-size: 1.6rem; font-weight: 800; letter-spacing: -0.01em; }
+h3 { font-size: 1rem; font-weight: 700; }
+p { margin: 0; }
+button, input, select, textarea { font: inherit; color: inherit; border-radius: 0; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+[hidden] { display: none !important; }
+code { font-family: var(--font-mono); font-size: 0.86em; }
+a { color: var(--selected); }
+.eyebrow {
+  font-family: var(--font-sans); font-weight: 800; font-size: 0.68rem; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--label);
+}
+
+.wrap {
+  max-width: var(--sheet-width); margin-inline: auto; background: var(--canvas);
+  border: var(--border-strong); box-shadow: var(--shadow-card);
+  padding: 0 24px 40px;
+}
+.themeswitch { margin-left: auto; display: flex; }
+.themeswitch button {
+  border: var(--border-thin); margin-left: -1px; background: var(--canvas); color: var(--ink);
+  padding: 4px 10px; cursor: pointer; font-size: 0.72rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase;
+}
+.themeswitch button[aria-pressed="true"] { background: var(--selected); color: var(--on-selected); }
+.themeswitch button:hover:not([aria-pressed="true"]) { background: var(--hover); color: var(--on-hover); }
+.themeswitch button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; position: relative; z-index: 1; }
+
+header.top {
+  margin: 24px 0 8px; padding: 22px 24px 24px calc(24px + var(--stripe-width)); display: grid; gap: 10px;
+  background: var(--raised); border: var(--border-strong); position: relative;
+}
+header.top::before { content: ""; position: absolute; inset: 0 auto 0 0; width: var(--stripe-width); background: var(--stripe); }
+
+section { padding-block: 32px 4px; scroll-margin-top: 60px; display: grid; gap: 16px; }
+section > h2 { padding-bottom: 10px; border-bottom: var(--border-strong); }
+section > h2::before { content: "[ "; color: var(--muted); font-weight: 400; }
+section > h2::after { content: " ]"; color: var(--muted); font-weight: 400; }
+.sub { display: grid; gap: 12px; }
+section > *, .sub > * { min-width: 0; }
+.sub > h3 { padding-top: 8px; }
+.note { font-size: 0.82rem; color: var(--muted); max-width: 100ch; }
+footer { margin-top: 32px; color: var(--muted); font-size: 0.8rem; max-width: 100ch; }
+.frame { background: var(--canvas); border: var(--border-strong); border-radius: 0; overflow-x: auto; }
+svg text { font-family: var(--font-sans); }
+
+@media (max-width: 760px) {
+  :root { --sheet-margin: 6px; --shadow-card: 4px 4px 0 var(--shadow-ink); }
+  .wrap { padding-inline: 16px; }
+  .themeswitch { margin-left: 0; }
+}
+@media (max-width: 560px) {
+  h2 { font-size: 1.35rem; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
