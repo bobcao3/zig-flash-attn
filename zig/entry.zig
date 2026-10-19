@@ -1,5 +1,6 @@
 const std = @import("std");
 const tma = @import("tma.zig");
+const profile = @import("profile.zig");
 
 pub const backward_sequence = .{
     "cu_seqlens_q",      "cu_seqlens_k",       "seqlen_q",      "seqlen_k",
@@ -16,11 +17,14 @@ pub fn strides(comptime tensor: []const u8) [3][]const u8 {
 pub fn Entry(
     comptime Params: type,
     comptime Args: type,
-    comptime names: anytype,
+    comptime kernel_names: anytype,
     comptime options: std.lang.CallingConvention.NvptxKernelOptions,
     comptime launch: fn (Params, Args) void,
 ) type {
     return struct {
+        const names = kernel_names ++
+            if (profile.enabled and @hasField(Params, "profile")) .{"profile"} else .{};
+
         const map: [max_arguments]bool = mapped: {
             var result: [max_arguments]bool = @splat(false);
             for (0..names.len) |index| result[index] = isMap(index);

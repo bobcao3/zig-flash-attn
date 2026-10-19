@@ -19,10 +19,13 @@ const mbarrier = @import("mbarrier.zig");
 const thread = @import("thread.zig");
 const inter_sequence = @import("inter_sequence.zig");
 const inter_sequence_forward = @import("inter_sequence_forward.zig");
+const profile = @import("profile.zig");
 
 const Chunk = fragments.Chunk;
 const Accumulator = fragments.Accumulator;
 const chunk_elements = Sm80FwdTiling.chunk_elements;
+
+pub const Zone = enum(u7) { tile, load_q, scores, softmax, output, store, qk_mma, pv_mma };
 
 const Span = struct {
     first: u32,
@@ -636,6 +639,7 @@ pub fn FlashAttnFwdSm80(
     const Online = fragments.Softmax(block_n);
     const single_warp =
         @hasDecl(Storage, "one_warp_per_scheduler") and Storage.one_warp_per_scheduler;
+    const Trace = profile.Recorder(Zone, .{});
 
     return struct {
         pub const thread_count = threads;
@@ -1024,7 +1028,9 @@ pub fn FlashAttnFwdSm80(
 
         pub fn run(params: ForwardParams, args: Args) void {
             var work = Work.init(params) orelse return;
-            process(params, args, &work, .first_run);
+            var trace: Trace = .init(params.profile);
+            defer trace.finish();
+            process(params, args, &work, .first_run, &trace);
         }
 
         var claimed: [2]u32 addrspace(.shared) = undefined;
@@ -1036,10 +1042,12 @@ pub fn FlashAttnFwdSm80(
             const items = listed_blocks * params.num_head;
             var item = @workGroupId(0);
             var slot: u1 = 0;
+            var trace: Trace = .init(params.profile);
+            defer trace.finish();
             while (item < items) : (slot +%= 1) {
                 var work: Work = .initListed(params, item, listed_blocks);
                 work.tile.firstRun(params);
-                process(params, args, &work, .all_runs);
+                process(params, args, &work, .all_runs, &trace);
                 if (thread.id() == 0) {
                     const claims = nvptx.atom(.gpu, .monotonic, .add, &queue.claims, 1);
                     claimed[slot] = nvptx.nctaid(0) + claims;
@@ -1056,13 +1064,15 @@ pub fn FlashAttnFwdSm80(
             const items = listed_blocks * params.num_head;
             var item = @workGroupId(0);
             var slot: u1 = 0;
+            var trace: Trace = .init(params.profile);
+            defer trace.finish();
             while (item < items) : (slot +%= 1) {
                 var work: Work = .initListed(params, item, listed_blocks);
                 if (work.tile.takeOnlyRun(params)) {
-                    process(params, args, &work, .first_run);
+                    process(params, args, &work, .first_run, &trace);
                 } else {
                     work.tile.firstRun(params);
-                    process(params, args, &work, .all_runs);
+                    process(params, args, &work, .all_runs, &trace);
                 }
                 if (thread.id() == 0) {
                     const claims = nvptx.atom(.gpu, .monotonic, .add, &queue.claims, 1);
@@ -1078,10 +1088,14 @@ pub fn FlashAttnFwdSm80(
             args: Args,
             work: *Work,
             comptime runs: enum { first_run, all_runs },
+            trace: *Trace,
         ) void {
+            trace.begin(.tile);
             var load = Load.init(params, args, work);
             load.start();
+            trace.begin(.load_q);
             const query = loadQuery(&load);
+            trace.end(.load_q);
             load.queryConsumed();
             var softmax: Running = undefined;
             inline for (&softmax) |*rows| rows.* = Online.init();
@@ -1103,23 +1117,43 @@ pub fn FlashAttnFwdSm80(
             } else if (single_warp and runs == .all_runs) {
                 {
                     const n_block = work.tile.n_block_min;
+                    trace.begin(.scores);
+                    trace.begin(.qk_mma);
                     var scores = qkScores(query, 0, Work.all_groups, lanes, &load);
+                    trace.end(.qk_mma);
                     load.releaseKeys(0);
                     if (work.tile.needsMask(n_block)) maskScores(&scores, n_block, work);
+                    trace.end(.scores);
+                    trace.begin(.softmax);
                     const step = softmaxStep(&softmax, scores, params.softmax_scale_log2);
+                    trace.end(.softmax);
+                    trace.begin(.output);
+                    trace.begin(.pv_mma);
                     accumulateOutput(&output, step, 0, Work.all_groups, lanes);
+                    trace.end(.pv_mma);
                     load.releaseValues(0);
+                    trace.end(.output);
                 }
                 index = 1;
                 while (true) : (index = 0) {
                     while (index < work.tile.n_block_max - work.tile.n_block_min) : (index += 1) {
                         const n_block = work.tile.n_block_min + index;
+                        trace.begin(.scores);
+                        trace.begin(.qk_mma);
                         var scores = qkScores(query, 0, Work.all_groups, lanes, null);
+                        trace.end(.qk_mma);
                         load.releaseKeys(index);
                         if (work.tile.needsMask(n_block)) maskScores(&scores, n_block, work);
+                        trace.end(.scores);
+                        trace.begin(.softmax);
                         const step = softmaxStep(&softmax, scores, params.softmax_scale_log2);
+                        trace.end(.softmax);
+                        trace.begin(.output);
+                        trace.begin(.pv_mma);
                         accumulateOutput(&output, step, 0, Work.all_groups, lanes);
+                        trace.end(.pv_mma);
                         load.releaseValues(index);
+                        trace.end(.output);
                     }
                     if (!work.tile.nextRun(params)) break;
                     load.restart(params, work);
@@ -1144,23 +1178,36 @@ pub fn FlashAttnFwdSm80(
                         const n_block = first_block + index;
                         const masked = phase_masked orelse work.tile.needsMask(n_block);
                         const prologue = if (phase_masked == null) &load else null;
+                        trace.begin(.scores);
+                        trace.begin(.qk_mma);
                         var scores = qkScores(query, 0, Work.all_groups, lanes, prologue);
+                        trace.end(.qk_mma);
                         load.releaseKeys(index);
                         if (masked) maskScores(&scores, n_block, work);
+                        trace.end(.scores);
+                        trace.begin(.softmax);
                         const step = softmaxStep(&softmax, scores, params.softmax_scale_log2);
+                        trace.end(.softmax);
+                        trace.begin(.output);
+                        trace.begin(.pv_mma);
                         accumulateOutput(&output, step, 0, Work.all_groups, lanes);
+                        trace.end(.pv_mma);
                         load.releaseValues(index);
+                        trace.end(.output);
                     }
                 }
                 if (tile_count == 0) load.drain();
             } else if (runs == .all_runs) {
                 while (true) {
-                    runTiles(params, work, &load, query, &softmax, &output, lanes);
+                    runTiles(params, work, &load, query, &softmax, &output, lanes, trace);
                     if (!work.tile.nextRun(params)) break;
                     load.restart(params, work);
                 }
-            } else runTiles(params, work, &load, query, &softmax, &output, lanes);
+            } else runTiles(params, work, &load, query, &softmax, &output, lanes, trace);
+            trace.begin(.store);
             storeOutput(params, work, softmax, output);
+            trace.end(.store);
+            trace.end(.tile);
         }
 
         inline fn runTiles(
@@ -1171,11 +1218,13 @@ pub fn FlashAttnFwdSm80(
             softmax: *Running,
             output: *Output,
             lanes: anytype,
+            trace: *Trace,
         ) void {
             const tile_count = work.tile.n_block_max - work.tile.n_block_min;
             var index: u32 = 0;
             while (index < tile_count) : (index += 1) {
                 const n_block = work.tile.n_block_min + index;
+                trace.begin(.scores);
                 const slot = load.acquireK(index);
                 if (work.tile.needsMask(n_block)) {
                     // With square tiles of `cp.async` copies, the warps multiply every key group
@@ -1184,21 +1233,38 @@ pub fn FlashAttnFwdSm80(
                         work.visibleGroups(n_block)
                     else
                         Work.all_groups;
+                    trace.begin(.qk_mma);
                     var scores = qkScores(query, slot, visible, lanes, null);
+                    trace.end(.qk_mma);
                     if (separate_v_empty) load.releaseKeys(index);
                     maskScores(&scores, n_block, work);
+                    trace.end(.scores);
+                    trace.begin(.softmax);
                     const step = softmaxStep(softmax, scores, params.softmax_scale_log2);
+                    trace.end(.softmax);
+                    trace.begin(.output);
                     load.acquireV(index);
+                    trace.begin(.pv_mma);
                     accumulateOutput(output, step, slot, visible, lanes);
+                    trace.end(.pv_mma);
                 } else {
                     const visible = Work.all_groups;
+                    trace.begin(.qk_mma);
                     const scores = qkScores(query, slot, visible, lanes, null);
+                    trace.end(.qk_mma);
                     if (separate_v_empty) load.releaseKeys(index);
+                    trace.end(.scores);
+                    trace.begin(.softmax);
                     const step = softmaxStep(softmax, scores, params.softmax_scale_log2);
+                    trace.end(.softmax);
+                    trace.begin(.output);
                     load.acquireV(index);
+                    trace.begin(.pv_mma);
                     accumulateOutput(output, step, slot, visible, lanes);
+                    trace.end(.pv_mma);
                 }
                 if (separate_v_empty) load.releaseValues(index) else load.release(index);
+                trace.end(.output);
             }
         }
     };
@@ -1241,6 +1307,7 @@ const PlannedEntry = entry.Entry(ForwardParams, Forward.Args, names, options, Fo
 comptime {
     if (builtin.cpu.arch.isNvptx() and @import("root") == @This()) {
         @export(&Entry.entry, .{ .name = "flash_attn_fwd" });
+        profile.exportZones(Zone);
         if (variant.specialization.scheduler_metadata) {
             @export(&Forward.PrepareScheduler.prepareVarlenNumBlocks, .{
                 .name = "flash_attn_fwd_prepare_varlen_num_blocks",

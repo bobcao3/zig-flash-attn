@@ -66,6 +66,25 @@ svg .tip { fill: var(--canvas); stroke: var(--line); stroke-width: 1.5; }
 svg .tip-shadow { fill: var(--shadow-ink); }
 svg .window { fill: none; stroke: var(--selected); stroke-width: 2; }
 svg .mini { fill: var(--tone-1); opacity: .5; }
+svg .hdr { fill: var(--surface-2); }
+svg .band1 { fill: color-mix(in srgb, var(--surface-2) 40%, var(--canvas)); }
+svg .cell0 { fill: color-mix(in srgb, var(--surface-2) 22%, var(--canvas)); }
+svg .cell1 { fill: color-mix(in srgb, var(--surface-2) 60%, var(--canvas)); }
+svg .tri { fill: var(--ink); }
+svg .e1 { fill: var(--e1); }
+svg .e3 { fill: var(--e3); }
+svg .e6 { fill: var(--e6); }
+svg .e4 { fill: var(--e4); }
+svg .e5 { fill: var(--e5); }
+svg .z1 { fill: var(--tone-1); }
+svg .z2 { fill: var(--tone-2); }
+svg .z3 { fill: var(--tone-3); }
+svg .z4 { fill: var(--tone-4); }
+svg .z5 { fill: var(--tone-5); }
+svg .z6 { fill: var(--tone-6); }
+svg .zc { fill: color-mix(in srgb, var(--tone-2) 50%, var(--tone-3)); }
+svg .zv { fill: color-mix(in srgb, var(--tone-1) 50%, var(--tone-6)); }
+svg .zt { font-family: var(--font-mono); font-size: 8px; fill: light-dark(var(--paper-100), var(--ink-900)); }
 </style>
 </head>
 <body>
@@ -88,63 +107,125 @@ svg .mini { fill: var(--tone-1); opacity: .5; }
 <section id="use">
   <h2>Mark and capture</h2>
   <div class="frame code">
-<pre><span class="kw">const</span> Zone = <span class="kw">enum</span>(u7) { tile, load, mma, softmax };
+<pre><span class="kw">const</span> Zone = <span class="kw">enum</span>(u7) { tile, scores, qk_mma };
 <span class="kw">const</span> Trace = profile.<span class="fn">Recorder</span>(Zone, .{ .sink = .lanes });
-<span class="kw">fn</span> <span class="fn">runConsumer</span>(params: Params, args: Args) <span class="kw">void</span> {
+<span class="kw">fn</span> <span class="fn">scoreTile</span>(params: Params, args: Args) <span class="kw">void</span> {
     <span class="kw">var</span> trace: Trace = .<span class="fn">init</span>(params.profile);
     <span class="kw">defer</span> trace.<span class="fn">finish</span>();
-    trace.<span class="fn">begin</span>(.softmax);
-    <span class="kw">defer</span> trace.<span class="fn">end</span>(.softmax);
-    <span class="fn">softmaxTile</span>(params, args);
+    trace.<span class="fn">begin</span>(.scores);
+    <span class="kw">defer</span> trace.<span class="fn">end</span>(.scores);
+    <span class="kw">const</span> slot = <span class="fn">acquireKeys</span>(args);
+    trace.<span class="fn">begin</span>(.qk_mma);
+    <span class="kw">defer</span> trace.<span class="fn">end</span>(.qk_mma);
+    <span class="fn">multiplyScores</span>(args, slot);
 }</pre>
 <pre><span class="cm"># zig build -Dprofile</span>
 <span class="kw">from</span> zigfa <span class="kw">import</span> profile
 <span class="kw">with</span> profile.<span class="fn">capture</span>() <span class="kw">as</span> cap:
     <span class="fn">flash_attn_func</span>(q, k, v)
 cap.<span class="fn">save</span>(<span class="str">"fwd.jsonl.gz"</span>)
-cap.<span class="fn">save</span>(<span class="str">"fwd.html"</span>)
-cap.<span class="fn">summary</span>(by=<span class="str">"sm"</span>)</pre>
+<span class="fn">print</span>(cap.<span class="fn">summary</span>(by=<span class="str">"sm"</span>))</pre>
   </div>
   <p class="note">All 32 lanes of a warp call <code>begin</code> and <code>end</code> together; without <code>-Dprofile</code>, both compile to nothing.</p>
   <div class="frame fig">
-    <svg viewBox="0 0 580 136" role="img" aria-label="Example of the exported viewer in its dark theme: group-by tiles, a legend, one track per warp with nested zone bars, a hover tooltip on a softmax zone, a time axis and an overview strip whose bracket marks the visible window.">
-      <defs><pattern id="mini" width="9" height="14" patternUnits="userSpaceOnUse"><rect class="mini" x="0" y="3" width="6" height="8"/></pattern></defs>
+    <svg viewBox="0 0 580 284" role="img" aria-label="Example of the trace viewer: group-by and fold-all buttons, a legend of the eight zones of the SM80 forward kernel, a time axis, then a table of rows with one lane per nesting depth. Folded SM 1 shows three CTAs back to back; SM 2 is open, CTA 9 is open, WG0 is folded and WG1 is open over the warp rows W4 and W5. In each warp row the tile lane sits on top, the scores, softmax and output lane below it, and the qk_mma and pv_mma lane at the bottom, each zone a labeled box. A tooltip names a qk_mma zone of W4. An overview strip closes the table.">
+      <defs>
+        <pattern id="mini" width="9" height="16" patternUnits="userSpaceOnUse"><rect class="mini" x="0" y="4" width="6" height="8"/></pattern>
+        <pattern id="lane1" width="10" height="1" patternUnits="userSpaceOnUse"><rect class="z5" width="3" height="1"/><rect class="z2" x="4" width="2" height="1"/><rect class="z4" x="7" width="3" height="1"/></pattern>
+        <pattern id="lane2" width="9" height="1" patternUnits="userSpaceOnUse"><rect class="zc" width="3" height="1"/><rect class="zv" x="5" width="3" height="1"/></pattern>
+      </defs>
       <text class="s8" x="0" y="13">GROUP BY</text>
       <rect class="sel" x="44" y="2" width="30" height="16"/><text class="m s9 b mid on-sel" x="59" y="13">SM</text>
       <rect class="cell dashed" x="76" y="2" width="50" height="16"/><text class="m s9 b mid" x="101" y="13">CLUSTER</text>
       <rect class="cell" x="128" y="2" width="30" height="16"/><text class="m s9 b mid" x="143" y="13">CTA</text>
       <rect class="cell" x="160" y="2" width="30" height="16"/><text class="m s9 b mid" x="175" y="13">WG</text>
       <rect class="cell" x="192" y="2" width="38" height="16"/><text class="m s9 b mid" x="211" y="13">WARP</text>
-      <rect class="k6 thin" x="306" y="6" width="8" height="8"/><text class="m s9" x="317" y="13.5">tile</text>
-      <rect class="k5 thin" x="346" y="6" width="8" height="8"/><text class="m s9" x="357" y="13.5">load</text>
-      <rect class="k3 thin" x="390" y="6" width="8" height="8"/><text class="m s9" x="401" y="13.5">mma</text>
-      <rect class="k1 thin" x="430" y="6" width="8" height="8"/><text class="m s9" x="441" y="13.5">softmax</text>
-      <rect class="close-tick" x="492" y="4" width="2" height="12"/><text class="m s9" x="498" y="13.5">chunk close</text>
+      <text class="s8" x="240" y="13">ALL</text>
+      <rect class="cell" x="258" y="2" width="48" height="16"/><text class="m s9 b mid" x="282" y="13">EXPAND</text>
+      <rect class="cell" x="308" y="2" width="36" height="16"/><text class="m s9 b mid" x="326" y="13">FOLD</text>
+      <rect class="z1" x="0" y="25" width="8" height="8"/><text class="m s9" x="11" y="32.5">tile</text>
+      <rect class="z3" x="46" y="25" width="8" height="8"/><text class="m s9" x="57" y="32.5">load_q</text>
+      <rect class="z5" x="110" y="25" width="8" height="8"/><text class="m s9" x="121" y="32.5">scores</text>
+      <rect class="z2" x="174" y="25" width="8" height="8"/><text class="m s9" x="185" y="32.5">softmax</text>
+      <rect class="z4" x="244" y="25" width="8" height="8"/><text class="m s9" x="255" y="32.5">output</text>
+      <rect class="z6" x="308" y="25" width="8" height="8"/><text class="m s9" x="319" y="32.5">store</text>
+      <rect class="zc" x="364" y="25" width="8" height="8"/><text class="m s9" x="375" y="32.5">qk_mma</text>
+      <rect class="zv" x="428" y="25" width="8" height="8"/><text class="m s9" x="439" y="32.5">pv_mma</text>
 
-      <path class="gridl" d="M176 24v56M275 24v56M374 24v56M473 24v56M572 24v56"/>
-      <text class="m s9 b" x="0" y="34">SM 2</text><text class="m s9 mut end" x="170" y="34">CTA 2</text>
-      <text class="m s9" x="8" y="50">WG0 · W0</text>
-      <path class="k5 thin" d="M186 41h40v12h-40zM240 41h40v12h-40zM294 41h40v12h-40zM348 41h40v12h-40zM402 41h40v12h-40zM456 41h40v12h-40zM510 41h40v12h-40z"/>
-      <text class="m s9" x="8" y="67">WG1 · W4</text>
-      <path class="k6 thin" d="M226 57h108v3h-108zM334 57h108v3h-108zM442 57h108v3h-108z"/>
-      <path class="k3 thin" d="M226 61h30v9h-30zM334 61h30v9h-30zM442 61h30v9h-30z"/>
-      <path class="k1 thin" d="M256 61h74v9h-74zM364 61h74v9h-74zM472 61h74v9h-74z"/>
-      <rect class="close-tick" x="397" y="39" width="2" height="16"/>
-      <rect class="close-tick" x="439" y="56" width="2" height="16"/>
-      <rect class="hover" x="364" y="61" width="74" height="9"/>
-      <rect class="tip-shadow" x="424" y="38" width="146" height="30"/>
-      <rect class="tip" x="420" y="34" width="146" height="30"/>
-      <text class="m s9 b" x="428" y="46">softmax · SM 2 · W4</text>
-      <text class="m s9 mut" x="428" y="58">3.80 µs + 1.49 µs</text>
-      <path class="rule" d="M176 80h396"/>
-      <text class="m s9 mut mid" x="176" y="92">0</text><text class="m s9 mut mid" x="275" y="92">2</text><text class="m s9 mut mid" x="374" y="92">4</text><text class="m s9 mut mid" x="473" y="92">6</text><text class="m s9 mut end" x="572" y="92">8 µs</text>
-      <text class="s9 mut" x="0" y="92">wheel zooms · drag pans</text>
-      <text class="s9 mut" x="0" y="113">overview</text>
-      <rect class="cell" x="176" y="102" width="396" height="16"/>
-      <rect fill="url(#mini)" x="178" y="103" width="392" height="14"/>
-      <rect class="window" x="176" y="101" width="99" height="18"/>
-      <text class="m s9 mut mid" x="176" y="130">0</text><text class="m s9 mut end" x="572" y="130">32 µs</text>
-      <text class="s9 mut" x="0" y="130">example</text>
+      <rect class="hdr" x="0" y="36" width="580" height="14"/>
+      <text class="m s9 mut" x="179" y="46">0 µs</text><text class="m s9 mut" x="278" y="46">2 µs</text><text class="m s9 mut" x="377" y="46">4 µs</text><text class="m s9 mut" x="476" y="46">6 µs</text>
+      <rect class="cell0" x="0" y="50" width="172" height="37"/><rect class="cell0" x="0" y="115" width="172" height="37"/><rect class="cell0" x="0" y="166" width="172" height="37"/>
+      <rect class="cell1" x="0" y="203" width="172" height="37"/><rect class="band1" x="172" y="203" width="408" height="37"/>
+      <path class="gridl" d="M176 50v190M275 50v190M374 50v190M473 50v190"/>
+      <rect class="hdr" x="0" y="87" width="580" height="14"/><rect class="hdr" x="0" y="101" width="580" height="14"/><rect class="hdr" x="0" y="152" width="580" height="14"/>
+      <path class="rule" d="M172 50v190"/>
+
+      <path class="tri" d="M9.5 54l4 3.5-4 3.5zM8 92h7l-3.5 4.5zM20 106h7l-3.5 4.5zM33.5 119l4 3.5-4 3.5zM32 157h7l-3.5 4.5z"/>
+      <text class="m s9 b" x="20" y="60.5">SM 1</text>
+      <text class="m s9 b" x="20" y="97">SM 2</text>
+      <text class="m s9 b" x="32" y="111">CTA 9</text>
+      <text class="m s9 b" x="44" y="125.5">WG0</text>
+      <text class="m s9 b" x="44" y="162">WG1</text>
+      <text class="m s9 mut" x="56" y="175.5">W4</text>
+      <text class="m s9 mut" x="56" y="212.5">W5</text>
+
+      <rect class="z1" x="176" y="52" width="124" height="10"/><text class="zt" x="179" y="59.5">tile</text>
+      <rect class="z1" x="304" y="52" width="126" height="10"/><text class="zt" x="307" y="59.5">tile</text>
+      <rect class="z1" x="434" y="52" width="132" height="10"/><text class="zt" x="437" y="59.5">tile</text>
+      <path fill="url(#lane1)" d="M180 63h118v10h-118zM308 63h120v10h-120zM438 63h126v10h-126z"/>
+      <path fill="url(#lane2)" d="M184 74h112v10h-112zM312 74h114v10h-114zM442 74h120v10h-120z"/>
+      <rect class="z1" x="254" y="117" width="312" height="10"/><text class="zt" x="257" y="124.5">tile</text>
+      <path fill="url(#lane1)" d="M272 128h294v10h-294z"/>
+      <path fill="url(#lane2)" d="M276 139h290v10h-290z"/>
+      <rect class="z1" x="254" y="168" width="312" height="10"/><text class="zt" x="257" y="175.5">tile 6.31 µs</text>
+      <rect class="z3" x="256" y="179" width="14" height="10"/>
+      <rect class="z5" x="272" y="179" width="50" height="10"/>
+      <text class="zt" x="275" y="186.5">scores</text>
+      <rect class="z2" x="324" y="179" width="18" height="10"/>
+      <rect class="z4" x="344" y="179" width="44" height="10"/><text class="zt" x="347" y="186.5">output</text>
+      <rect class="zv" x="348" y="190" width="38" height="10"/><text class="zt" x="351" y="197.5">pv_mma</text>
+      <rect class="zc" x="284" y="190" width="36" height="10"/><text class="zt" x="287" y="197.5">qk_mma</text>
+      <rect class="z5" x="392" y="179" width="50" height="10"/>
+      <text class="zt" x="395" y="186.5">scores</text>
+      <rect class="z2" x="444" y="179" width="18" height="10"/>
+      <rect class="z4" x="464" y="179" width="44" height="10"/><text class="zt" x="467" y="186.5">output</text>
+      <rect class="zv" x="468" y="190" width="38" height="10"/><text class="zt" x="471" y="197.5">pv_mma</text>
+      <rect class="zc" x="404" y="190" width="36" height="10"/><text class="zt" x="407" y="197.5">qk_mma</text>
+      <rect class="z5" x="512" y="179" width="50" height="10"/>
+      <text class="zt" x="515" y="186.5">scores</text>
+      <rect class="z2" x="564" y="179" width="2" height="10"/>
+      <rect class="zc" x="524" y="190" width="36" height="10"/><text class="zt" x="527" y="197.5">qk_mma</text>
+      <rect class="z1" x="257" y="205" width="309" height="10"/><text class="zt" x="260" y="212.5">tile 6.31 µs</text>
+      <rect class="z3" x="259" y="216" width="14" height="10"/>
+      <rect class="z5" x="275" y="216" width="50" height="10"/>
+      <text class="zt" x="278" y="223.5">scores</text>
+      <rect class="z2" x="327" y="216" width="18" height="10"/>
+      <rect class="z4" x="347" y="216" width="44" height="10"/><text class="zt" x="350" y="223.5">output</text>
+      <rect class="zv" x="351" y="227" width="38" height="10"/><text class="zt" x="354" y="234.5">pv_mma</text>
+      <rect class="zc" x="287" y="227" width="36" height="10"/><text class="zt" x="290" y="234.5">qk_mma</text>
+      <rect class="z5" x="395" y="216" width="50" height="10"/>
+      <text class="zt" x="398" y="223.5">scores</text>
+      <rect class="z2" x="447" y="216" width="18" height="10"/>
+      <rect class="z4" x="467" y="216" width="44" height="10"/><text class="zt" x="470" y="223.5">output</text>
+      <rect class="zv" x="471" y="227" width="38" height="10"/><text class="zt" x="474" y="234.5">pv_mma</text>
+      <rect class="zc" x="407" y="227" width="36" height="10"/><text class="zt" x="410" y="234.5">qk_mma</text>
+      <rect class="z5" x="515" y="216" width="50" height="10"/>
+      <text class="zt" x="518" y="223.5">scores</text>
+      <rect class="zc" x="527" y="227" width="36" height="10"/><text class="zt" x="530" y="234.5">qk_mma</text>
+      <rect class="close-tick" x="358" y="199" width="2" height="4"/>
+      <rect class="close-tick" x="436" y="236" width="2" height="4"/>
+      <rect class="hover" x="404" y="190" width="36" height="10"/>
+      <rect class="tip-shadow" x="420" y="134" width="150" height="28"/>
+      <rect class="tip" x="416" y="130" width="150" height="28"/>
+      <text class="m s9 b" x="422" y="141">qk_mma · SM 2 · CTA 9 · W4</text>
+      <text class="m s9 mut" x="422" y="153">3.80 µs + 0.62 µs</text>
+
+      <rect class="hdr" x="0" y="240" width="580" height="22"/>
+      <path class="rule" d="M0 240h580"/>
+      <text class="m s9 mut" x="8" y="254">overview</text>
+      <rect fill="url(#mini)" x="178" y="243" width="392" height="16"/>
+      <rect class="window" x="176" y="242" width="99" height="18"/>
+      <text class="s9 mut" x="0" y="278">Each depth gets a lane. Everything starts folded; a folded row merges its warps. Click a label to fold, shift+click a subtree.</text>
     </svg>
   </div>
 </section>
@@ -172,7 +253,7 @@ cap.<span class="fn">summary</span>(by=<span class="str">"sm"</span>)</pre>
     </svg>
   </div>
   <div class="frame fig">
-    <svg viewBox="0 0 580 124" role="img" aria-label="Each warp reads the clock and packs a record. The default sink keeps record k in a register of lane k and stores all 32 with one 128-byte store; the global sink stores each record directly. Every 32 records the warp closes the chunk.">
+    <svg viewBox="0 0 580 176" role="img" aria-label="Each warp reads the clock and packs a record. The default sink keeps record k in a register of lane k and stores all 32 with one 128-byte store; the global sink stores each record directly. At init lane 0 claims two chunks; every 32 records the warp closes its chunk, moves to the claimed one and claims the next; finish closes a chunk that holds records.">
       <rect class="edge" x="10" y="4" width="82" height="20"/>
       <text class="m s10 b mid" x="51" y="18">%clock64</text>
       <path class="flow" d="M51 25v10"/>
@@ -203,16 +284,26 @@ cap.<span class="fn">summary</span>(by=<span class="str">"sm"</span>)</pre>
       <text class="m s9 b mid halo-c" x="535" y="64">32 × u32</text>
 
       <path class="rule" d="M10 88h560"/>
-      <text class="s8" x="10" y="105">EVERY 32 RECORDS</text>
+      <text class="s8" x="10" y="107.5">INIT</text>
       <rect class="k3" x="104" y="95" width="40" height="18"/>
-      <text class="m s9 b mid" x="124" y="107.5">close</text>
+      <text class="m s9 b mid" x="124" y="107.5">claim</text>
       <path class="flow" d="M144 104h10"/>
-      <text class="m s9" x="158" y="107.5">headers[chunk] ← clock64, globaltimer, cta, origin</text>
-      <text class="m s9" x="158" y="120">chunk ← next, next ← atom.add</text>
+      <text class="m s9" x="158" y="107.5">first ← atom.add(next_chunk, 2); chunk ← first; next ← first + 1</text>
+      <text class="s8" x="10" y="133.5">EVERY 32 RECORDS</text>
+      <rect class="k3" x="104" y="121" width="40" height="18"/>
+      <text class="m s9 b mid" x="124" y="133.5">close</text>
+      <path class="flow" d="M144 130h10"/>
+      <text class="m s9" x="158" y="133.5">headers[chunk] ← clock64, globaltimer, cta, origin</text>
+      <text class="m s9" x="158" y="146">chunk ← next; next ← atom.add(next_chunk, 1)</text>
+      <text class="s8" x="10" y="167.5">FINISH</text>
+      <rect class="k3" x="104" y="155" width="40" height="18"/>
+      <text class="m s9 b mid" x="124" y="167.5">close</text>
+      <path class="flow" d="M144 164h10"/>
+      <text class="s9" x="158" y="167.5">only when the open chunk holds records</text>
     </svg>
   </div>
   <div class="frame fig">
-    <svg viewBox="0 0 580 132" role="img" aria-label="Buffer layout: a 16-byte control block, an array of 24-byte chunk headers and an array of 128-byte record chunks; the last chunk takes the writes past capacity.">
+    <svg viewBox="0 0 580 252" role="img" aria-label="Buffer layout: a 16-byte control block, an array of 24-byte chunk headers and an array of 128-byte record chunks; the last chunk takes the writes past capacity. By default a capture gives each launch 2 to the 18 chunks: 6 MiB of headers and 32 MiB of records, 38 MiB in all, for 2 to the 23 records.">
       <text class="s8" x="10" y="10">ONE BUFFER PER LAUNCH · NOT TO SCALE</text>
       <rect class="k6" x="10" y="16" width="56" height="22"/>
       <text class="m s10 b mid" x="38" y="31">control</text>
@@ -233,7 +324,7 @@ cap.<span class="fn">summary</span>(by=<span class="str">"sm"</span>)</pre>
       <rect class="k6" x="130" y="72" width="60" height="20"/><text class="m s9 b mid" x="160" y="85.5">dropped</text>
       <rect class="k6" x="190" y="72" width="60" height="20"/><text class="m s9 b mid" x="220" y="85.5">format</text>
       <text class="s9 mut" x="10" y="108">dropped counts the records written past capacity</text>
-      <text class="s9 mut" x="10" y="120">format holds the tick shift and the sink</text>
+      <text class="s9 mut" x="10" y="120">format holds the layout version, 1</text>
 
       <text class="s8" x="290" y="67">CHUNK HEADER k · 24 B</text>
       <rect class="k5" x="290" y="72" width="90" height="20"/><text class="m s9 b mid" x="335" y="85.5">clock64</text>
@@ -241,14 +332,28 @@ cap.<span class="fn">summary</span>(by=<span class="str">"sm"</span>)</pre>
       <rect class="k5" x="470" y="72" width="45" height="20"/><text class="m s9 b mid" x="492.5" y="85.5">cta</text>
       <rect class="k5" x="515" y="72" width="55" height="20"/><text class="m s9 b mid" x="542.5" y="85.5">origin</text>
       <path class="faint" style="opacity:.6" d="M515 92L290 102M570 92V102"/>
-      <rect class="k5 thin" x="290" y="102" width="68" height="18"/><text class="m s9 b mid" x="324" y="114.5">sm:8</text>
-      <rect class="k5 thin" x="358" y="102" width="42" height="18"/><text class="m s9 b mid" x="379" y="114.5">warp:5</text>
-      <rect class="k5 thin" x="400" y="102" width="51" height="18"/><text class="m s9 b mid" x="425.5" y="114.5">count:6</text>
-      <rect class="cell" x="451" y="102" width="119" height="18"/><text class="m s9 mut mid" x="510.5" y="114.5">spare:13</text>
+      <rect class="k5 thin" x="290" y="102" width="70" height="18"/><text class="m s9 b mid" x="325" y="114.5">sm:8</text>
+      <rect class="k5 thin" x="360" y="102" width="44" height="18"/><text class="m s9 b mid" x="382" y="114.5">warp:5</text>
+      <rect class="k5 thin" x="404" y="102" width="52" height="18"/><text class="m s9 b mid" x="430" y="114.5">count:6</text>
+      <rect class="k5 thin" x="456" y="102" width="44" height="18"/><text class="m s9 b mid" x="478" y="114.5">shift:4</text>
+      <rect class="cell" x="500" y="102" width="70" height="18"/><text class="m s9 mut mid" x="535" y="114.5">spare:9</text>
+
+      <path class="rule" d="M10 132h560"/>
+      <text class="s8" x="10" y="149">CAPACITY · capture(chunks=2¹⁸) BY DEFAULT</text>
+      <rect class="cell" x="10" y="156" width="112" height="20"/><text class="m s9 b mid" x="66" y="169.5">C = 2¹⁸ chunks</text>
+      <rect class="k5" x="122" y="156" width="104" height="20"/><text class="m s9 b mid" x="174" y="169.5">headers 6 MiB</text>
+      <rect class="k1" x="226" y="156" width="112" height="20"/><text class="m s9 b mid" x="282" y="169.5">records 32 MiB</text>
+      <rect class="cell" x="338" y="156" width="118" height="20"/><text class="m s9 b mid" x="397" y="169.5">38 MiB per launch</text>
+      <rect class="cell" x="456" y="156" width="114" height="20"/><text class="m s9 b mid" x="513" y="169.5">2²³ records</text>
+      <text class="s9" x="10" y="192">A warp with n records claims ⌊n/32⌋ + 2 chunks: two at init and one at each full chunk.</text>
+      <text class="s9 mut" x="10" y="205">Example: 8192 warps × 390 records claim 114,688 chunks, a 16.6 MiB buffer.</text>
+      <text class="s9" x="10" y="220">A claim past C lands in chunk C, so a warp drops only its newest records, and dropped counts them.</text>
+      <text class="s9 mut" x="10" y="233">next_chunk counts every claim, so capture() warns with capture(chunks=next_chunk), which holds them all.</text>
+      <text class="s9 mut" x="10" y="246">Without a capture, launches share one buffer with C = 0, whose records all count as dropped.</text>
     </svg>
   </div>
   <div class="frame fig">
-    <svg viewBox="0 0 580 112" role="img" aria-label="The host takes SM, CTA and warp from the chunk header, computes the warpgroup as warp divided by 4, and derives the cluster only for launches whose clusters hold two or more CTAs. Ticks are unwrapped backward from the 64-bit clock in the header and converted to nanoseconds with one linear fit per SM.">
+    <svg viewBox="0 0 580 228" role="img" aria-label="The host takes SM, CTA and warp from the chunk header, computes the warpgroup as warp divided by 4, and derives the cluster only for launches whose clusters hold two or more CTAs. Ticks are unwrapped backward from the 64-bit clock in the header. One linear spline that all SMs share, plus a clock offset per SM, maps clock ticks to globaltimer nanoseconds. An end closes the latest open begin of the same zone, and depth counts the zones open at the begin.">
       <rect class="k1" x="10" y="4" width="44" height="17"/><text class="m s9 b mid" x="32" y="16">SM</text>
       <text class="m s9 mut mid" x="62" y="16">▸</text>
       <rect class="k1" x="70" y="4" width="44" height="17"/><text class="m s9 b mid" x="92" y="16">CTA</text>
@@ -278,9 +383,28 @@ cap.<span class="fn">summary</span>(by=<span class="str">"sm"</span>)</pre>
       <circle class="now" cx="290" cy="90" r="4.5"/>
       <text class="m s9 mut" x="10" y="108">Δ = (a − r) mod 2²⁴; every gap under one wrap</text>
       <text class="s8" x="330" y="62">CLOCK TO NANOSECONDS</text>
-      <text class="m s10 b" x="330" y="80">ns = a + clock / f</text>
-      <text class="s9 mut" x="330" y="94">one fit per SM over the (clock64,</text>
-      <text class="s9 mut" x="330" y="106">globaltimer) pair of each header</text>
+      <path class="rule" d="M336 70v42h234"/>
+      <text class="m s9 mut" x="340" y="78">ns</text>
+      <text class="m s9 mut end" x="570" y="124">clock − offset[sm]</text>
+      <path class="edge" d="M338 110L384 102L424 82L474 76L524 70L566 60"/>
+      <circle class="dot" cx="338" cy="110" r="2.5"/><circle class="dot" cx="384" cy="102" r="2.5"/><circle class="dot" cx="424" cy="82" r="2.5"/><circle class="dot" cx="474" cy="76" r="2.5"/><circle class="dot" cx="524" cy="70" r="2.5"/><circle class="dot" cx="566" cy="60" r="2.5"/>
+      <path class="k1 thin" d="M352 105h3v3h-3zM400 92h3v3h-3zM448 77h3v3h-3zM500 71h3v3h-3zM548 62h3v3h-3z"/>
+      <path class="k3 thin" d="M366 104h3v3h-3zM412 89h3v3h-3zM460 79h3v3h-3zM512 70h3v3h-3z"/>
+      <path class="k5 thin" d="M374 100h3v3h-3zM432 82h3v3h-3zM488 75h3v3h-3zM538 67h3v3h-3z"/>
+      <text class="s9 mut" x="432" y="101">steep: slow clock</text>
+
+      <path class="rule" d="M10 134h560"/>
+      <text class="m s10 b" x="10" y="150">ns = spline(clock − offset[sm])</text>
+      <text class="s9" x="10" y="164">SMs share one clock rate that changes within a launch.</text>
+      <text class="s9 mut" x="10" y="177">Knots sit ≥ 5 µs and ≥ 16 headers apart.</text>
+      <text class="s9 mut" x="300" y="150">A second-difference penalty bridges empty knots.</text>
+      <text class="s9 mut" x="300" y="164">Six rounds refit the spline and offset[sm].</text>
+      <text class="s9 mut" x="300" y="177">No timer step: the rate is CU_DEVICE_ATTRIBUTE_CLOCK_RATE.</text>
+
+      <path class="rule" d="M10 190h560"/>
+      <text class="s8" x="10" y="207">PAIRING</text>
+      <text class="s9" x="70" y="207">An end closes the latest open begin of the same zone on its warp, so zones may nest or overlap.</text>
+      <text class="s9 mut" x="70" y="220">Depth counts the zones open at the begin; where zones overlap without nesting, a zone takes the lowest free depth.</text>
     </svg>
   </div>
 </section>
@@ -288,19 +412,21 @@ cap.<span class="fn">summary</span>(by=<span class="str">"sm"</span>)</pre>
 <section id="export">
   <h2>Export</h2>
   <div class="frame fig">
-    <svg viewBox="0 0 580 148" role="img" aria-label="Decoded zones are saved either as fwd.jsonl.gz, a gzip file with one JSON value per line, or as fwd.html, one file that holds the shared styles pinned to the dark theme, the viewer script and the same gzip bytes in base64.">
-      <rect class="k4" x="10" y="40" width="110" height="24"/><text class="m s9 b mid" x="65" y="55.5">decoded zones</text>
-      <path class="flow" d="M120 52H140V22H158"/>
-      <path class="flow" d="M140 52V88H158"/>
-      <rect class="k3" x="160" y="10" width="150" height="24"/><text class="m s10 b" x="168" y="26">fwd.jsonl.gz</text>
-      <text class="s9 mut" x="320" y="26">gzip of one JSON value per line</text>
-      <rect class="edge" x="160" y="48" width="410" height="80"/>
-      <text class="m s10 b" x="168" y="63">fwd.html</text>
-      <text class="s9 mut" x="226" y="63">one file, no network, dark theme</text>
-      <rect class="k6 thin" x="168" y="70" width="394" height="16"/><text class="m s9 b" x="174" y="81.5">&lt;style&gt;</text><text class="s9" x="360" y="81.5">report.css with color-scheme: dark</text>
-      <rect class="k5 thin" x="168" y="88" width="394" height="16"/><text class="m s9 b" x="174" y="99.5">&lt;script&gt;</text><text class="s9" x="360" y="99.5">viewer: DecompressionStream, canvas</text>
-      <rect class="k3 thin" x="168" y="106" width="394" height="16"/><text class="m s9 b" x="174" y="117.5">&lt;script type="application/gzip"&gt;</text><text class="s9" x="360" y="117.5">base64 of fwd.jsonl.gz</text>
-      <text class="s9 mut" x="10" y="144">template: reports/trace_viewer.html; setup.py copies it and report.css into the package</text>
+    <svg viewBox="0 0 580 160" role="img" aria-label="Decoded zones are saved as fwd.jsonl.gz, a gzip file with one JSON value per line. python -m zigfa.view serves reports/profile_viewer.html and the trace on localhost and prints a link that opens the trace; the viewer also opens a trace dropped onto it.">
+      <rect class="k4" x="10" y="28" width="110" height="24"/><text class="m s9 b mid" x="65" y="43.5">decoded zones</text>
+      <path class="flow" d="M120 40H158"/>
+      <rect class="k3" x="160" y="28" width="110" height="24"/><text class="m s10 b mid" x="215" y="44">fwd.jsonl.gz</text>
+      <text class="s9 mut" x="160" y="68">gzip of one JSON value per line</text>
+      <path class="flow" d="M270 40H338"/><text class="s9 mut mid" x="304" y="34">link or drop</text>
+      <rect class="edge" x="340" y="16" width="230" height="48"/>
+      <text class="m s10 b" x="348" y="32">reports/profile_viewer.html</text>
+      <text class="s9 mut" x="348" y="46">report.css, dark theme, no network</text>
+      <text class="s9 mut" x="348" y="58">DecompressionStream, canvas</text>
+      <text class="m s9 b" x="10" y="90">python -m zigfa.view fwd.jsonl.gz --open</text>
+      <text class="m s9" x="10" y="104">http://127.0.0.1:8732/?trace=traces/0/fwd.jsonl.gz&amp;group=sm&amp;start=100&amp;end=140&amp;expand=sm2,sm2/cta9</text>
+      <text class="s9 mut" x="10" y="117">group: sm, cluster, cta, wg or warp · start, end: µs · expand: group paths, or all with fold listing exceptions</text>
+      <text class="s9 mut" x="10" y="130">The address follows pan, zoom and folding; --host serves another interface, such as a tailnet name.</text>
+      <text class="s9 mut" x="10" y="150">zone names: the profile_zones table that each cubin exports, read with cuLibraryGetGlobal</text>
     </svg>
   </div>
   <div class="frame fig">

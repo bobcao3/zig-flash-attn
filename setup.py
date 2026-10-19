@@ -14,6 +14,8 @@ def zig_arguments():
     arguments = ["build", "--summary", "all"]
     if os.environ.get("ZIGFA_VERBOSE") == "1":
         arguments.append("--verbose")
+    if os.environ.get("ZIGFA_PROFILE") == "1":
+        arguments.append("-Dprofile")
     for option, variable in (
         ("ptxas", "PTXAS"),
         ("sm", "ZIGFA_SM"),
@@ -55,6 +57,10 @@ class BuildKernels(build_py):
             shutil.copy(cubin, destination)
         for listing in ("kernels.manifest", "kernels.declared"):
             shutil.copy(installed / listing, destination)
+        viewer = Path(self.build_lib) / "zigfa" / "viewer"
+        (viewer / "assets").mkdir(parents=True, exist_ok=True)
+        for page in ("profile_viewer.html", "assets/report.css"):
+            shutil.copy(ROOT / "reports" / page, viewer / page)
 
 
 setup(cmdclass={"build_py": BuildKernels})

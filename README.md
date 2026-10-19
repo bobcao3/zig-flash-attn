@@ -27,6 +27,30 @@ In `flash_attn_inter_sequence_func`, bit `j` of row `i` lets query sequence
 `i` see key sequence `j`; a query sequence may be empty or shorter than its
 keys, as when extending a KV cache.
 
+## Profiling
+
+Kernels built with `zig build -Dprofile`, or packaged with `ZIGFA_PROFILE=1`,
+record the begin and end of named zones in each warp. Builds without the
+option compile the same code as before:
+
+```python
+from zigfa import profile
+
+with profile.capture() as cap:
+    out = flash_attn_func(q, k, v)
+cap.save("fwd.jsonl.gz")
+print(cap.summary(by="sm"))
+```
+
+The SM80 and SM120 forward kernels mark their zones. `python -m zigfa.view
+fwd.jsonl.gz --open` serves the trace viewer on localhost and opens the trace;
+without `--open`, it prints the link. A link takes `group` (`sm`, `cluster`,
+`cta`, `wg` or `warp`), `start` and `end` in microseconds, and `expand`, the
+groups to unfold (or `all`, with `fold` naming the exceptions), for example
+`http://127.0.0.1:8732/?trace=traces/0/fwd.jsonl.gz&group=sm&start=100&end=140&expand=sm2`.
+`reports/profile_viewer.html` also opens a trace that you drop onto it, and
+`reports/profile_design.html` describes the record and file formats.
+
 ## Build from source
 
 `pip install .` needs the Zig compiler with the self-hosted PTX backend from
