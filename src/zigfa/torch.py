@@ -827,6 +827,7 @@ class InterSequenceSchedulerMetadata(NamedTuple):
     visibility_bits_t: torch.Tensor
     cu_visible_k: torch.Tensor
     cu_visible_q: torch.Tensor
+    sequence_order: torch.Tensor
 
 
 def require_int32(name, tensor, shape):
@@ -856,7 +857,7 @@ def allocate_inter_sequence_metadata(cu_seqlens_q):
 @torch.library.custom_op("zigfa::inter_sequence_metadata", mutates_args=(), device_types="cuda")
 def inter_sequence_metadata(
     cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor, visibility_bits: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     validate_inter_sequence_layout(cu_seqlens_q, cu_seqlens_k, visibility_bits)
     bind_current_device(visibility_bits)
     metadata = allocate_inter_sequence_metadata(cu_seqlens_q)
@@ -876,7 +877,8 @@ def get_inter_sequence_scheduler_metadata(cu_seqlens_q, cu_seqlens_k, visibility
 
 
 def inter_sequence_layout(
-    cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, window_sizes
+    cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, sequence_order,
+    window_sizes,
 ):
     return inter_sequence.Sequences(
         maybe_contiguous(cu_seqlens_q),
@@ -885,6 +887,7 @@ def inter_sequence_layout(
         visibility_bits_t,
         cu_visible_k,
         cu_visible_q,
+        sequence_order,
         window_sizes,
     )
 
@@ -900,6 +903,7 @@ def inter_sequence_forward(
     visibility_bits_t: torch.Tensor,
     cu_visible_k: torch.Tensor,
     cu_visible_q: torch.Tensor,
+    sequence_order: torch.Tensor,
     window_sizes: Optional[torch.Tensor],
     softmax_scale: float,
     window_size_left: int,
@@ -923,7 +927,8 @@ def inter_sequence_forward(
         softmax_lse,
         workspace,
         inter_sequence_layout(
-            cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, window_sizes
+            cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, sequence_order,
+            window_sizes
         ),
         max_seqlen_q=max_seqlen_q,
         softmax_scale=softmax_scale,
@@ -952,6 +957,7 @@ def inter_sequence_backward_into(
     visibility_bits_t,
     cu_visible_k,
     cu_visible_q,
+    sequence_order,
     window_sizes,
     softmax_scale,
     window_size_left,
@@ -984,7 +990,8 @@ def inter_sequence_backward_into(
         *gradients,
         workspace,
         inter_sequence_layout(
-            cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, window_sizes
+            cu_seqlens_q, cu_seqlens_k, visibility_bits, visibility_bits_t, cu_visible_k, cu_visible_q, sequence_order,
+            window_sizes
         ),
         softmax_scale=softmax_scale,
         window_size_left=window_size_left,
@@ -1010,6 +1017,7 @@ def inter_sequence_backward(
     visibility_bits_t: torch.Tensor,
     cu_visible_k: torch.Tensor,
     cu_visible_q: torch.Tensor,
+    sequence_order: torch.Tensor,
     window_sizes: Optional[torch.Tensor],
     softmax_scale: float,
     window_size_left: int,
@@ -1029,6 +1037,7 @@ def inter_sequence_backward(
         visibility_bits_t,
         cu_visible_k,
         cu_visible_q,
+        sequence_order,
         window_sizes,
         softmax_scale,
         window_size_left,
@@ -1059,6 +1068,7 @@ def inter_sequence_backward_packed(
     visibility_bits_t: torch.Tensor,
     cu_visible_k: torch.Tensor,
     cu_visible_q: torch.Tensor,
+    sequence_order: torch.Tensor,
     window_sizes: Optional[torch.Tensor],
     softmax_scale: float,
     window_size_left: int,
@@ -1079,6 +1089,7 @@ def inter_sequence_backward_packed(
         visibility_bits_t,
         cu_visible_k,
         cu_visible_q,
+        sequence_order,
         window_sizes,
         softmax_scale,
         window_size_left,

@@ -186,7 +186,7 @@ def stream_of(stream):
     return current_device().create_stream(stream)
 
 
-def run(kernel, grid, threads, shared_bytes, signature, values, stream, pdl=False, cluster_dims=None):
+def run(kernel, grid, threads, shared_bytes, signature, values, stream, pdl=False, cluster_dims=None, cooperative=False):
     verify_parameters(kernel, signature)
     options = {}
     if cluster_dims is not None:
@@ -197,6 +197,7 @@ def run(kernel, grid, threads, shared_bytes, signature, values, stream, pdl=Fals
         block=(threads, 1, 1),
         shmem_size=shared_bytes,
         programmatic_stream_serialization=bool(pdl),
+        is_cooperative=cooperative,
         **options,
     )
     arguments = []
