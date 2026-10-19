@@ -12,6 +12,7 @@ from . import profile
 ARCHS = {8: "sm80", 9: "sm90", 10: "sm100", 12: "sm120"}
 INTER_SEQUENCE_ARCHS = {8: "sm80", 12: "sm80"}
 INTER_SEQUENCE = "inter_sequence"
+PERSISTENT_PREFIX = "flash_fwd_persistent_"
 SCALAR_TYPES = {"p": np.uint64, "u": np.uint32, "i": np.int32, "f": np.float32}
 FLOAT_CODES = {code for code, scalar in SCALAR_TYPES.items() if np.issubdtype(scalar, np.floating)}
 TENSOR_MAP_BYTES = driver.CU_TENSOR_MAP_NUM_QWORDS * np.dtype(np.uint64).itemsize
@@ -108,8 +109,14 @@ def num_sm(device_id):
 
 
 @functools.cache
+def l2_bytes(device_id):
+    return Device(device_id).properties.l2_cache_size
+
+
+@functools.cache
 def head_dims():
-    return tuple(sorted({int(info.name.rsplit("_hd", 1)[1]) for info in manifest()[1].values()}))
+    names = (name for name in manifest()[1] if not name.startswith(PERSISTENT_PREFIX))
+    return tuple(sorted({int(name.rsplit("_hd", 1)[1]) for name in names}))
 
 
 @functools.cache
@@ -128,8 +135,8 @@ def instance_name(device_id, direction, head_dim, variant=""):
 
 
 @functools.cache
-def variant_names(device_id, direction, head_dim, inter_sequence=False):
-    prefix, suffix = f"flash_{direction}_{arch_name(device_id, inter_sequence)}", f"_hd{head_dim}"
+def variant_names(device_id, direction, head_dim):
+    prefix, suffix = f"flash_{direction}_{arch_name(device_id)}", f"_hd{head_dim}"
     _, names = declared()
     return tuple(
         name[len(prefix) : -len(suffix)]
@@ -140,11 +147,16 @@ def variant_names(device_id, direction, head_dim, inter_sequence=False):
 
 @functools.cache
 def load_for(device_id, direction, head_dim, kernel_name, variant="", dynamic_shared=True):
-    directory, entries = manifest()
-    major = Device(device_id).compute_capability.major
     instance = instance_name(device_id, direction, head_dim, variant)
+    return load_instance(device_id, instance, kernel_name, dynamic_shared)
+
+
+@functools.cache
+def load_instance(device_id, instance, kernel_name, dynamic_shared=True):
+    directory, entries = manifest()
     if instance not in entries:
-        raise RuntimeError(f"{instance} is not built for head_dim={head_dim} on sm_{major}x")
+        major = Device(device_id).compute_capability.major
+        raise RuntimeError(f"{instance} is not built on sm_{major}x")
     for cubin_directory in (directory / "cubin", directory):
         path = cubin_directory / f"{instance}.cubin"
         if not path.exists():

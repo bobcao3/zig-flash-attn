@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
     manifest.writer.writeByte('\n') catch @panic("OOM");
     @setEvalBranchQuota(300_000);
     inline for (comptime std.enums.values(Source)) |source| {
-        inline for (configurations.head_dims) |head_dim| {
+        inline for (comptime source.headDims()) |head_dim| {
             const variants = comptime configurations.variants(source, head_dim);
             inline for (0..variants.len) |index| {
                 const variant = comptime variants[index].specialization.name();

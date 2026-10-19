@@ -46,6 +46,7 @@ pub fn FlashAttnBwdSm80Kernel(comptime Components: type) type {
             var iteration: u32 = 0;
             while (iteration < iterations) : (iteration += 1) {
                 const step = work.branchedStep(iteration);
+                const rows = step.block_info.row_count;
                 load.prefetch(iteration + 1, iterations, work);
                 const probabilities =
                     Components.computeProbabilities(
@@ -77,9 +78,9 @@ pub fn FlashAttnBwdSm80Kernel(comptime Components: type) type {
                     thread.warp() >= Components.thread_count / 64)
                 {
                     Components.accumulateDq(params, work, step, load, iteration, operands);
-                    Components.accumulateDkv(gradients, load, iteration, operands, {});
+                    Components.accumulateDkv(gradients, load, iteration, operands, {}, rows);
                 } else if (Components.alternate_gradient_order) {
-                    Components.accumulateDkv(gradients, load, iteration, operands, {});
+                    Components.accumulateDkv(gradients, load, iteration, operands, {}, rows);
                     Components.accumulateDq(params, work, step, load, iteration, operands);
                 } else if (scheduled and Steps.schedule.double_buffered_query) {
                     Steps.accumulateDvAndRelease(
@@ -89,11 +90,12 @@ pub fn FlashAttnBwdSm80Kernel(comptime Components: type) type {
                         iterations,
                         work,
                         operands,
+                        rows,
                     );
                     Components.accumulateDq(params, work, step, load, iteration, operands);
-                    Steps.accumulateDk(gradients, iteration, operands);
+                    Steps.accumulateDk(gradients, iteration, operands, rows);
                 } else {
-                    Components.accumulateDkv(gradients, load, iteration, operands, {});
+                    Components.accumulateDkv(gradients, load, iteration, operands, {}, rows);
                     load.release(iteration, iterations, work);
                     Components.accumulateDq(params, work, step, load, iteration, operands);
                 }

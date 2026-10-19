@@ -39,8 +39,8 @@ pub fn MBlockWork(comptime block_m: u32, comptime block_n: u32, comptime options
     const PackGqaRows =
         if (!options.pack_gqa) void else if (options.divmod_pack) PackGqaDivmod else PackGqa;
     comptime {
-        if (options.inter_sequence and (options.pack_gqa or options.bottom_aligned))
-            @compileError("the runs of keys need unpacked rows that start at the top");
+        if (options.inter_sequence and (options.bottom_aligned or options.divmod_pack))
+            @compileError("the runs of keys need rows that start at the top and a packing count");
     }
 
     return struct {
@@ -54,8 +54,11 @@ pub fn MBlockWork(comptime block_m: u32, comptime block_n: u32, comptime options
         col_limit_bounds: BlockInfo.ColLimitBounds,
         first_row: u32,
         pack_gqa: PackGqaRows,
+        record: if (options.inter_sequence) *addrspace(.global) const SequenceRecord else void,
+        next_run: if (options.inter_sequence) u32 else void,
 
         const Work = @This();
+        const SequenceRecord = inter_sequence.SequenceRecord;
 
         pub fn init(params: ForwardParams, tile: tile_scheduler.WorkTileInfo) Work {
             const sequence: SeqlenInfoQK = .resolve(
@@ -65,6 +68,15 @@ pub fn MBlockWork(comptime block_m: u32, comptime block_n: u32, comptime options
                 params.seqlen_k,
                 tile.batch,
             );
+            return .withSequence(params, tile, sequence, {});
+        }
+
+        pub fn withSequence(
+            params: ForwardParams,
+            tile: tile_scheduler.WorkTileInfo,
+            sequence: SeqlenInfoQK,
+            record: @FieldType(Work, "record"),
+        ) Work {
             const sequence_rows = if (options.pack_gqa) sequence.seqlen_q *
                 params.qhead_per_kvhead else sequence.seqlen_q;
             const num_m_blocks = (sequence_rows + block_m - 1) / block_m;
@@ -103,17 +115,9 @@ pub fn MBlockWork(comptime block_m: u32, comptime block_n: u32, comptime options
                 .col_limit_bounds = info.colLimitBounds(),
                 .first_row = first_row,
                 .pack_gqa = pack_gqa,
+                .record = record,
+                .next_run = if (options.inter_sequence) 0 else {},
             };
-        }
-
-        pub fn takeOnlyRun(work: *Work, params: ForwardParams) bool {
-            comptime std.debug.assert(options.inter_sequence);
-            const entries: [*]addrspace(.global) const inter_sequence.RunEntry =
-                @ptrFromInt(params.run_table);
-            const entry = entries[work.batch];
-            if (entry.key_count == inter_sequence.several_runs) return false;
-            work.setRun(entry.first_key, entry.key_count, entry.window);
-            return true;
         }
 
         fn setRun(work: *Work, first_key: u32, key_count: u32, window: inter_sequence.Window) void {
@@ -126,27 +130,36 @@ pub fn MBlockWork(comptime block_m: u32, comptime block_n: u32, comptime options
             work.col_limit_bounds = work.block_info.colLimitBounds();
         }
 
-        pub fn firstRun(work: *Work, params: ForwardParams) void {
-            if (!work.findRun(params, 0)) {
-                work.n_block_min = 0;
-                work.n_block_max = 0;
-            }
+        fn takeTiles(work: *const Work) bool {
+            return work.n_block_max > work.n_block_min;
         }
 
         pub fn nextRun(work: *Work, params: ForwardParams) bool {
+            const record = work.record;
+            const key_run_count = record.key_run_count;
+            while (work.next_run < key_run_count) {
+                const run = record.key_runs[work.next_run];
+                work.next_run += 1;
+                const window: inter_sequence.Window = if (run.banded) record.window else .unbounded;
+                work.setRun(run.first_key, run.keys, window);
+                if (work.takeTiles()) return true;
+            }
+            const searched_all = record.resume_from >= params.num_batch;
+            if (work.next_run == key_run_count and searched_all) return false;
             const cu_seqlens_k: [*]addrspace(.global) const i32 = @ptrFromInt(params.cu_seqlens_k);
-            const end_key = work.sequence.offset_k + work.sequence.seqlen_k;
-            return work.findRun(params, inter_sequence.lastBoundaryAtOrBefore(
-                cu_seqlens_k,
-                params.num_batch,
-                end_key,
-            ));
-        }
-
-        fn findRun(work: *Work, params: ForwardParams, from: u32) bool {
-            comptime std.debug.assert(options.inter_sequence);
-            const cu_seqlens_k: [*]addrspace(.global) const i32 = @ptrFromInt(params.cu_seqlens_k);
-            const runs: inter_sequence.Runs = .init(
+            var next_sequence = if (work.next_run == key_run_count) record.resume_from else from: {
+                const end_key = work.sequence.offset_k + work.sequence.seqlen_k;
+                var low: u32 = 0;
+                var high: u32 = params.num_batch + 1;
+                while (low < high) {
+                    const middle = (low + high) / 2;
+                    const boundary: u32 = @intCast(cu_seqlens_k[middle]);
+                    if (boundary <= end_key) low = middle + 1 else high = middle;
+                }
+                break :from low - 1;
+            };
+            work.next_run = key_run_count + 1;
+            const runs: inter_sequence.SequenceRuns = .init(
                 params.visibility_bits,
                 params.window_sizes,
                 .{ .left = params.window_size_left, .right = params.window_size_right },
@@ -155,13 +168,12 @@ pub fn MBlockWork(comptime block_m: u32, comptime block_n: u32, comptime options
                 params.num_batch,
                 work.batch,
             );
-            var next_sequence = from;
             while (runs.next(next_sequence)) |run| {
                 next_sequence = run.end;
                 const first_key: u32 = @intCast(cu_seqlens_k[run.first]);
                 const key_count = @as(u32, @intCast(cu_seqlens_k[run.end])) - first_key;
                 work.setRun(first_key, key_count, runs.windowOf(run));
-                if (work.n_block_max > work.n_block_min) return true;
+                if (work.takeTiles()) return true;
             }
             return false;
         }

@@ -127,9 +127,10 @@ def require_aligned(name, view, head_dim):
         )
 
 
-def require_supported_heads(q_shape, k_shape):
-    if q_shape[-1] != k_shape[-1] or q_shape[-1] not in runtime.head_dims():
-        raise ValueError(f"head_dim must be one of {list(runtime.head_dims())} and equal for q and k")
+def require_supported_heads(q_shape, k_shape, head_dims=None):
+    supported = runtime.head_dims() if head_dims is None else head_dims
+    if q_shape[-1] != k_shape[-1] or q_shape[-1] not in supported:
+        raise ValueError(f"head_dim must be one of {list(supported)} and equal for q and k")
     if q_shape[-2] % k_shape[-2]:
         raise ValueError("the query head count must be a multiple of the key head count")
 
