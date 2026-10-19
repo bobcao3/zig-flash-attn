@@ -669,13 +669,11 @@ pub fn FlashAttnFwdSm80(
                 const list: [*]addrspace(.global) const inter_sequence.ListedBlock =
                     @ptrFromInt(params.run_list);
                 const listed = list[item % listed_blocks];
-                var work: Work = .{ .tile = Tile.init(params, .{
+                return .{ .tile = Tile.init(params, .{
                     .block = listed.block,
                     .head = item / listed_blocks,
                     .batch = listed.sequence,
                 }) };
-                work.tile.firstRun(params);
-                return work;
             }
 
             pub fn visibleGroups(work: *const Work, n_block: u32) Span {
@@ -1039,7 +1037,32 @@ pub fn FlashAttnFwdSm80(
             var slot: u1 = 0;
             while (item < items) : (slot +%= 1) {
                 var work: Work = .initListed(params, item, listed_blocks);
+                work.tile.firstRun(params);
                 process(params, args, &work, .all_runs);
+                if (thread.id() == 0) {
+                    const claims = nvptx.atom(.gpu, .monotonic, .add, &queue.claims, 1);
+                    claimed[slot] = nvptx.nctaid(0) + claims;
+                }
+                Load.reset();
+                item = claimed[slot];
+            }
+        }
+
+        pub fn runPlanned(params: ForwardParams, args: Args) void {
+            const queue: *addrspace(.global) inter_sequence.RunQueue =
+                @ptrFromInt(params.run_queue);
+            const listed_blocks = queue.listed_blocks;
+            const items = listed_blocks * params.num_head;
+            var item = @workGroupId(0);
+            var slot: u1 = 0;
+            while (item < items) : (slot +%= 1) {
+                var work: Work = .initListed(params, item, listed_blocks);
+                if (work.tile.takeOnlyRun(params)) {
+                    process(params, args, &work, .first_run);
+                } else {
+                    work.tile.firstRun(params);
+                    process(params, args, &work, .all_runs);
+                }
                 if (thread.id() == 0) {
                     const claims = nvptx.atom(.gpu, .monotonic, .add, &queue.claims, 1);
                     claimed[slot] = nvptx.nctaid(0) + claims;
@@ -1212,6 +1235,7 @@ const options: std.lang.CallingConvention.NvptxKernelOptions = .{
 };
 const Entry = entry.Entry(ForwardParams, Forward.Args, names, options, launch);
 const ListedEntry = entry.Entry(ForwardParams, Forward.Args, names, options, Forward.runListed);
+const PlannedEntry = entry.Entry(ForwardParams, Forward.Args, names, options, Forward.runPlanned);
 
 comptime {
     if (builtin.cpu.arch.isNvptx() and @import("root") == @This()) {
@@ -1223,10 +1247,12 @@ comptime {
         }
         if (variant.specialization.inter_sequence) {
             @export(&ListedEntry.entry, .{ .name = "flash_attn_fwd_runs" });
+            @export(&PlannedEntry.entry, .{ .name = "flash_attn_fwd_planned" });
             @export(&inter_sequence.RunTable(forward_tiling.block_m).build, .{
                 .name = "inter_sequence_forward_runs",
             });
             @export(&inter_sequence.transposeVisibility, .{ .name = "inter_sequence_transpose" });
+            @export(&inter_sequence.planBlocks, .{ .name = "inter_sequence_plan_blocks" });
             @export(&inter_sequence.countVisibleTokens, .{
                 .name = "inter_sequence_count_visible_tokens",
             });
