@@ -29,6 +29,7 @@ pub fn build(b: *std.Build) void {
     const optimize =
         b.option(std.lang.Optimize, "kernel-optimize", "Kernel optimization mode") orelse .fast;
     const ptxas_option = b.option([]const u8, "ptxas", "Path to ptxas");
+    const profile = b.option(bool, "profile", "Record kernel zones into a profile buffer") orelse false;
     const sources = b.option([]const []const u8, "source", "Only build these kernel sources");
     const targets = b.option([]const []const u8, "sm", "Only assemble cubins for these targets");
     const head_dims = b.option([]const []const u8, "head-dim", "Only build these head dimensions");
@@ -77,7 +78,7 @@ pub fn build(b: *std.Build) void {
                         }
                     }
                     manifest.writer.writeByte('\n') catch @panic("OOM");
-                    addInstance(b, source, index, head_dim, optimize, ptxas, fatbinary, targets);
+                    addInstance(b, source, index, head_dim, optimize, profile, ptxas, fatbinary, targets);
                 }
             }
         }
@@ -90,7 +91,7 @@ pub fn build(b: *std.Build) void {
             .dependOn(&b.addInstallFile(files.add(output[0], output[1].written()), output[0]).step);
     }
 
-    const tests = b.step("test", "Run the tile scheduler and sequence table tests");
+    const tests = b.step("test", "Run the host unit tests");
     inline for (.{
         "zig/tile_scheduler.zig", "zig/prepare_scheduler.zig", "zig/mbarrier.zig",
     }) |root| {
@@ -100,6 +101,14 @@ pub fn build(b: *std.Build) void {
         }) });
         tests.dependOn(&b.addRunArtifact(unit_tests).step);
     }
+    const profile_config = b.addOptions();
+    profile_config.addOption(bool, "profile", true);
+    const profile_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/profile.zig"),
+        .target = b.graph.host,
+        .imports = &.{.{ .name = "config", .module = profile_config.createModule() }},
+    }) });
+    tests.dependOn(&b.addRunArtifact(profile_tests).step);
 }
 
 fn selected(filter: ?[]const []const u8, name: []const u8) bool {
@@ -122,6 +131,7 @@ fn addInstance(
     comptime index: usize,
     comptime head_dim: u32,
     optimize: std.lang.Optimize,
+    profile: bool,
     ptxas: []const u8,
     fatbinary: []const u8,
     targets: ?[]const []const u8,
@@ -131,6 +141,7 @@ fn addInstance(
     const config = b.addOptions();
     config.addOption(u32, "head_dim", head_dim);
     config.addOption(usize, "variant", index);
+    config.addOption(bool, "profile", profile);
     const kernel = b.addExecutable(.{
         .name = name,
         .use_llvm = false,

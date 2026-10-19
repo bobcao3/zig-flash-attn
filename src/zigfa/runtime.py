@@ -7,12 +7,15 @@ import numpy as np
 from cuda.bindings import driver
 from cuda.core import Device, LaunchConfig, ObjectCode, Stream, launch
 
+from . import profile
+
 ARCHS = {8: "sm80", 9: "sm90", 10: "sm100", 12: "sm120"}
 INTER_SEQUENCE_ARCHS = {8: "sm80", 12: "sm80"}
 INTER_SEQUENCE = "inter_sequence"
 SCALAR_TYPES = {"p": np.uint64, "u": np.uint32, "i": np.int32, "f": np.float32}
 FLOAT_CODES = {code for code, scalar in SCALAR_TYPES.items() if np.issubdtype(scalar, np.floating)}
 TENSOR_MAP_BYTES = driver.CU_TENSOR_MAP_NUM_QWORDS * np.dtype(np.uint64).itemsize
+kernel_labels = {}
 
 
 @dataclass(frozen=True)
@@ -147,6 +150,7 @@ def load_for(device_id, direction, head_dim, kernel_name, variant="", dynamic_sh
         if not path.exists():
             continue
         kernel = ObjectCode.from_cubin(path.read_bytes()).get_kernel(kernel_name)
+        kernel_labels[kernel] = f"{instance}.{kernel_name}"
         if dynamic_shared:
             attribute = driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
             shared_bytes = entries[instance].shared_bytes
@@ -158,13 +162,23 @@ def load_for(device_id, direction, head_dim, kernel_name, variant="", dynamic_sh
 
 
 @functools.cache
-def verify_parameters(kernel, signature):
+def parameter_sizes(kernel):
     sizes = []
     while True:
         status, _, size = driver.cuKernelGetParamInfo(kernel.handle, len(sizes))
         if status != driver.CUresult.CUDA_SUCCESS:
-            break
+            return tuple(sizes)
         sizes.append(size)
+
+
+def takes_profile(kernel, signature):
+    sizes = parameter_sizes(kernel)
+    return len(sizes) == len(signature) + 1 and sizes[-1] == np.dtype(np.uint64).itemsize
+
+
+@functools.cache
+def verify_parameters(kernel, signature):
+    sizes = list(parameter_sizes(kernel))
     expected = [
         TENSOR_MAP_BYTES if code == "m" else np.dtype(SCALAR_TYPES[code]).itemsize for code in signature
     ]
@@ -187,6 +201,11 @@ def stream_of(stream):
 
 
 def run(kernel, grid, threads, shared_bytes, signature, values, stream, pdl=False, cluster_dims=None, cooperative=False):
+    if takes_profile(kernel, signature):
+        label = kernel_labels.get(kernel, "kernel")
+        address = profile.launch_argument(kernel, label, grid, threads, cluster_dims, stream_of(stream).handle)
+        signature += "p"
+        values = (*values, address)
     verify_parameters(kernel, signature)
     options = {}
     if cluster_dims is not None:

@@ -1,2 +1,3 @@
 include build.zig
 recursive-include zig *.zig
+include reports/profile_viewer.html reports/assets/report.css

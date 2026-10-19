@@ -6,6 +6,7 @@ const tma = @import("tma.zig");
 const sm80 = @import("flash_fwd_sm80.zig");
 const entry = @import("entry.zig");
 const ForwardParams = @import("ForwardParams.zig");
+const profile = @import("profile.zig");
 
 const variant = configurations.variants(.flash_fwd_sm120, config.head_dim)[config.variant];
 const forward_tiling = variant.tiling;
@@ -36,6 +37,7 @@ const Entry = entry.Entry(ForwardParams, Forward.Args, .{
 comptime {
     if (builtin.cpu.arch.isNvptx() and @import("root") == @This()) {
         @export(&Entry.entry, .{ .name = "flash_attn_fwd" });
+        profile.exportZones(sm80.Zone);
         if (variant.specialization.scheduler_metadata) {
             @export(&Forward.PrepareScheduler.prepareVarlenNumBlocks, .{
                 .name = "flash_attn_fwd_prepare_varlen_num_blocks",
