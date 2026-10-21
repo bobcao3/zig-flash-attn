@@ -55,6 +55,7 @@ class KernelInfo:
     inputs: str
     grouped: int
     inter_sequence: int
+    split_kv: int
     arch: int
 
     @property

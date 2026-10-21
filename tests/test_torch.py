@@ -10,6 +10,8 @@ from torch.library import opcheck
 
 from checks import queue_forward_checks, queue_gradient_checks
 from conftest import clear_selection
+from zigfa import runtime
+from zigfa.forward import forward_variant
 from reference import attention_ref, varlen_attention_ref
 from shapes import HEAD_DIM, HEAD_DIMS, HEAD_LAYOUTS, cu_seqlens_of, cuda_seed, uniform_lengths, window_for
 from zigfa.torch import (
@@ -266,6 +268,27 @@ def test_causal_ignores_the_right_window_bound(variant, window):
     cuda_seed(window[0])
     num_head, num_head_kv = HEAD_LAYOUTS["gqa"]
     check_case(VARIANTS[variant](2, 256, 256, num_head, num_head_kv, HEAD_DIM, True, window), return_attn_probs=True)
+
+
+SPLIT_KV_SHAPES = {
+    "gqa_decode": ((1, 1, 4096, 8, 2), (-1, 0)),
+    "mha_decode": ((2, 1, 2048, 4, 4), (-1, -1)),
+    "windowed_extend": ((1, 16, 2048, 8, 2), (512, 0)),
+    "uneven_lengths": ((1, 100, 3001, 4, 1), (-1, 0)),
+}
+
+
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("shape_name", SPLIT_KV_SHAPES)
+def test_split_kv_matches_reference(head_dim, shape_name):
+    (batch, seqlen_q, seqlen_k, num_head, num_head_kv), window = SPLIT_KV_SHAPES[shape_name]
+    cuda_seed(head_dim + seqlen_q)
+    q_shape, k_shape = (batch, seqlen_q, num_head, head_dim), (batch, seqlen_k, num_head_kv, head_dim)
+    variant = forward_variant(runtime.current_device().device_id, q_shape, k_shape, None, None, None, window)
+    assert "split_kv" in variant
+    causal = window[1] == 0
+    case = batched_case(batch, seqlen_q, seqlen_k, num_head, num_head_kv, head_dim, causal, window)
+    check_case(case, return_attn_probs=True)
 
 
 @pytest.mark.parametrize(
