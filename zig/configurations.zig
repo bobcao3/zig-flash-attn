@@ -40,6 +40,7 @@ pub const Specialization = struct {
     sort_batches: bool = false,
     pack_gqa: bool = false,
     head_split: bool = false,
+    split_kv: bool = false,
     limits: SequenceLimits = .{},
 
     pub fn name(comptime specialization: Specialization) []const u8 {
@@ -51,6 +52,7 @@ pub const Specialization = struct {
                 @tagName(specialization.inputs);
             if (specialization.grouped) result = result ++ "_gqa";
             if (specialization.inter_sequence) result = result ++ "_inter_sequence";
+            if (specialization.split_kv) result = result ++ "_split_kv";
             if (limits.two_sided_window) result = result ++ "_local_two_sided";
             if (!limits.masks.eql(.full)) {
                 var separator: []const u8 = "_";
@@ -99,6 +101,18 @@ fn varlenSorted(limits: SequenceLimits) Specialization {
 }
 
 const grouped_pack: Specialization = .{ .inputs = .batched, .grouped = true, .pack_gqa = true };
+const split_kv: Specialization = .{
+    .inputs = .batched,
+    .split_kv = true,
+    .limits = .{ .max_seqlen_q = 256 },
+};
+const grouped_split_kv: Specialization = .{
+    .inputs = .batched,
+    .grouped = true,
+    .pack_gqa = true,
+    .split_kv = true,
+    .limits = .{ .max_seqlen_q = 256 },
+};
 const grouped_head_split: Specialization = .{
     .inputs = .batched,
     .grouped = true,
@@ -132,7 +146,6 @@ pub const inter_sequence_persistent = struct {
 
     pub const tile_buffers = 6;
     pub const stages = 3;
-    pub const cta_tile_min_waves = 1;
 
     pub fn sharedBytes(head_dim: u32) u32 {
         const row_bytes = pitchChunks(head_dim / Sm80FwdTiling.chunk_elements) *
@@ -172,7 +185,11 @@ pub const PersistentTiling = struct {
 
 fn persistentVariants(comptime head_dim: u32) Variants(PersistentTiling) {
     comptime {
-        const tiling: PersistentTiling = .{ .head_dim = head_dim };
+        var tiling: PersistentTiling = .{ .head_dim = head_dim };
+        if (inter_sequence_persistent.largeHeadDim(head_dim)) {
+            tiling.block_m /= 2;
+            tiling.block_n = inter_sequence_persistent.large_head_dim_block_n;
+        }
         var list: VariantList(PersistentTiling) = .{};
         list.add(tiling, .{});
         list.add(tiling, .{ .grouped = true, .pack_gqa = true });
@@ -292,6 +309,7 @@ pub fn launch(comptime source: Source, comptime head_dim: u32, comptime index: u
         .inputs = specialization.inputs,
         .grouped = @intFromBool(specialization.grouped),
         .inter_sequence = @intFromBool(specialization.inter_sequence),
+        .split_kv = @intFromBool(specialization.split_kv),
         .arch = source.arch(),
     };
     var masks = limits.masks.iterator();
@@ -560,6 +578,7 @@ pub const Launch = struct {
     inputs: Inputs = .any,
     grouped: u32 = 0,
     inter_sequence: u32 = 0,
+    split_kv: u32 = 0,
     arch: u32,
 };
 
@@ -611,11 +630,15 @@ fn forwardSm80Short(head_dim: u32) Sm80FwdTiling {
 pub fn forwardSm80Variants(comptime head_dim: u32) Variants(Sm80FwdTiling) {
     comptime {
         const regular = forwardSm80Regular(head_dim);
+        var swizzled = regular;
+        if (head_dim != 96) swizzled.l2_swizzle = causal_l2_swizzle;
         const small_tiles = forwardSm80SmallTiles(head_dim);
         const sorted_head_dim = head_dim == 64 or head_dim == 128;
         const maxq256: SequenceLimits = .{ .max_seqlen_q = 256 };
         const dense_or_causal: std.EnumSet(Mask) = .initMany(&.{ .dense, .causal });
         var list: VariantList(Sm80FwdTiling) = .{};
+        if (sorted_head_dim) list.add(regular, grouped_split_kv);
+        list.add(small_tiles orelse regular, split_kv);
         if (sorted_head_dim) if (small_tiles) |tiling| list.add(tiling, varlenSorted(maxq256));
         switch (head_dim) {
             72 => {
@@ -640,15 +663,19 @@ pub fn forwardSm80Variants(comptime head_dim: u32) Variants(Sm80FwdTiling) {
         }
         if (sorted_head_dim) {
             list.add(regular, varlen_sorted);
-            list.add(regular, grouped_pack);
+            list.add(swizzled, grouped_pack);
         }
         if (small_tiles) |tiling| list.add(tiling, .{ .limits = maxq256 });
-        if (head_dim == 128) list.add(forwardSm80Short(head_dim), .{ .limits = .{
-            .max_seqlen_q = 1024,
-            .max_seqlen_k = 2048,
-            .masks = dense_or_causal,
-        } });
-        list.add(regular, .{});
+        if (head_dim == 128) {
+            var short = forwardSm80Short(head_dim);
+            short.l2_swizzle = causal_l2_swizzle;
+            list.add(short, .{ .limits = .{
+                .max_seqlen_q = 1024,
+                .max_seqlen_k = 2048,
+                .masks = dense_or_causal,
+            } });
+        }
+        list.add(swizzled, .{});
         if (head_dim == single_tile_inter_sequence_head_dim) {
             list.add(regular, inter_sequence_block_table);
             list.add(regular, inter_sequence_packed);
@@ -778,7 +805,6 @@ pub fn backwardSm80(head_dim: u32) Sm80BwdTiling {
             tiling.v_in_regs = true;
             tiling.alternate_gradient_order = true;
             tiling.p_first = true;
-            tiling.skips_padding_rows = true;
         },
         256 => {
             tiling.block_m = 64;
@@ -811,6 +837,9 @@ pub fn backwardSm80Variants(comptime head_dim: u32) Variants(Sm80BwdTiling) {
         const regular = backwardSm80(head_dim);
         var interleaved = regular;
         if (head_dim == 64) interleaved.schedule.interleaved_dq_reduction = true;
+        if (head_dim == 128) interleaved.skips_padding_rows = true;
+        var swizzled = regular;
+        if (head_dim != 96) swizzled.l2_swizzle = causal_l2_swizzle;
         const small_tiles = backwardSm80SmallTiles(head_dim);
         const maxk128: SequenceLimits = .{ .max_seqlen_k = 128 };
         var list: VariantList(Sm80BwdTiling) = .{};
@@ -820,7 +849,7 @@ pub fn backwardSm80Variants(comptime head_dim: u32) Variants(Sm80BwdTiling) {
         }
         list.add(interleaved, grouped_head_split);
         if (small_tiles) |tiling| list.add(tiling, .{ .limits = maxk128 });
-        list.add(regular, .{});
+        list.add(swizzled, .{});
         if (hasInterSequence(head_dim)) list.add(interleaved, inter_sequence_sorted);
         return list.slice();
     }

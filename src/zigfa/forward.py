@@ -20,10 +20,53 @@ from .tensors import (
 )
 
 
+SPLIT_KV_MIN_BLOCKS = 4
+SPLIT_KV_KEYS_PER_QUERY = 4
+SPLIT_KV_MAX_SPLITS = 64
+ACCUMULATOR_BYTES = 16
+
+
 class ForwardWorkspace(NamedTuple):
     facts: specialization.ShapeFacts
     semaphore: bool
     scheduler_metadata_rows: int
+    split_kv_words: int
+
+
+class SplitKv(NamedTuple):
+    tiles: int
+    splits: int
+    o_accum_warps: int
+    counter_words: int
+    words: int
+
+
+@functools.cache
+def resident_ctas(device_id, info):
+    kernel, _ = runtime.load_instance(device_id, info.name, "flash_attn_fwd")
+    occupancy = kernel.occupancy.max_active_blocks_per_multiprocessor(info.threads, info.shared_bytes)
+    return runtime.num_sm(device_id) * max(1, occupancy)
+
+
+@functools.cache
+def split_kv(device_id, info, q_shape, k_shape, window=specialization.UNBOUNDED):
+    batch, seqlen_q, num_head, head_dim = q_shape
+    seqlen_k, num_head_kv = k_shape[1], k_shape[2]
+    packing = num_head // num_head_kv if info.pack_gqa else 1
+    rows = seqlen_q * packing
+    tiles = batch * num_head // packing * -(-rows // info.block_m)
+    keys = seqlen_k if window[0] < 0 else min(seqlen_k, window[0] + seqlen_q + max(window[1], 0))
+    splits = 1
+    if keys >= SPLIT_KV_KEYS_PER_QUERY * seqlen_q:
+        splits = max(1, min(resident_ctas(device_id, info) // tiles, keys // info.block_n // SPLIT_KV_MIN_BLOCKS,
+                            SPLIT_KV_MAX_SPLITS))
+    warps = info.threads // 32
+    warp_rows = info.block_m // warps
+    o_accum_warps = min(warps, -(-min(rows, info.block_m) // warp_rows))
+    partial_bytes = warp_rows // 16 * (head_dim // 8 + 1) * 32 * ACCUMULATOR_BYTES
+    counter_words = -(-tiles // 4) * 4
+    words = counter_words + tiles * splits * o_accum_warps * partial_bytes // 4
+    return SplitKv(tiles, splits, o_accum_warps, counter_words, words)
 
 
 @functools.cache
@@ -32,10 +75,12 @@ def forward_workspace_layout(device_id, q_shape, k_shape, cu_seqlens_shape, max_
         q_shape, k_shape, cu_seqlens_shape, max_seqlen_q, max_seqlen_k, runtime.num_sm(device_id)
     )
     infos = specialization.reachable(device_id, "fwd", q_shape[-1], facts)
+    plans = (split_kv(device_id, info, q_shape, k_shape) for info in infos if info.split_kv and k_shape)
     return ForwardWorkspace(
         facts,
         any(info.scheduling_mode == "dynamic" for info in infos),
         min((info.cluster_block_m for info in infos if info.scheduler_metadata), default=0),
+        max((plan.words for plan in plans if plan.splits > 1), default=0),
     )
 
 
@@ -44,9 +89,12 @@ def forward_variant(
     device_id, q_shape, k_shape, cu_seqlens_shape, max_seqlen_q, max_seqlen_k, window=specialization.UNBOUNDED
 ):
     layout = forward_workspace_layout(device_id, q_shape, k_shape, cu_seqlens_shape, max_seqlen_q, max_seqlen_k)
-    variant = specialization.choose(
-        device_id, "fwd", q_shape[-1], layout.facts, rule=lambda info, facts: specialization.accepts(info, facts, window)
-    )
+
+    def rule(info, facts):
+        splits = info.split_kv and split_kv(device_id, info, q_shape, k_shape, window).splits > 1
+        return specialization.accepts(info, facts, window) and (splits or not info.split_kv)
+
+    variant = specialization.choose(device_id, "fwd", q_shape[-1], layout.facts, rule=rule)
     specialization.log_choice(
         "forward", device_id, q_shape[-1], variant, q=q_shape, k=k_shape, window=window,
         cu_seqlens=cu_seqlens_shape, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
@@ -62,6 +110,8 @@ def forward_workspace_shapes(q_shape, *, k_shape=None, cu_seqlens_shape=None, ma
     if layout.scheduler_metadata_rows:
         rows = q_shape[0] if layout.facts.varlen else q_shape[1]
         shapes += ((scheduler_metadata_entries(rows, layout.facts.batch_size, layout.scheduler_metadata_rows), 2),)
+    if layout.split_kv_words:
+        shapes += ((layout.split_kv_words,),)
     return shapes
 
 
@@ -104,7 +154,9 @@ def forward(
         max_seqlen_k,
     )
     workspace_layout = forward_workspace_layout(*key)
-    if len(workspace) != workspace_layout.semaphore + bool(workspace_layout.scheduler_metadata_rows):
+    metadata_index = int(workspace_layout.semaphore)
+    split_kv_index = metadata_index + bool(workspace_layout.scheduler_metadata_rows)
+    if len(workspace) != split_kv_index + bool(workspace_layout.split_kv_words):
         raise ValueError("pass the workspace that forward_workspace_shapes returns for these shapes")
     if not layout.row_axis_len_q:
         return
@@ -187,12 +239,24 @@ def forward(
             batch_strides[2], v_view.strides[row_axis], v_view.strides[-2],
             *output_strides, *lse_strides, layout.batch_size,
         )
+        if info.split_kv:
+            plan = split_kv(device_id, info, q_view.shape, k_view.shape, (window_size_left, window_size_right))
+            split_workspace = view_of(workspace[split_kv_index])
+            if math.prod(split_workspace.shape) < plan.words:
+                raise ValueError("the split-KV workspace is smaller than forward_workspace_shapes returns")
+            counters = split_workspace.pointer
+            status, = driver.cuMemsetD32Async(counters, 0, plan.tiles, runtime.stream_of(stream).handle)
+            if status != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuMemsetD32Async failed: {status}")
+            signature += "ppuu"
+            grid = (num_m_blocks * plan.splits, *grid[1:])
+            values += (counters + 4 * plan.counter_words, counters, plan.splits, plan.o_accum_warps)
     if info.scheduler_metadata:
         signature += "p"
         values += (
             build_scheduler_metadata(
-                workspace[-1], "fwd", head_dim, variant, "flash_attn_fwd", layout.cu_seqlens_q_pointer, layout.cu_seqlens_k_pointer,
-                layout.batch_size, num_m_blocks, "forward_workspace_shapes", stream,
+                workspace[metadata_index], "fwd", head_dim, variant, "flash_attn_fwd", layout.cu_seqlens_q_pointer,
+                layout.cu_seqlens_k_pointer, layout.batch_size, num_m_blocks, "forward_workspace_shapes", stream,
             ),
         )
     runtime.run(

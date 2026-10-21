@@ -46,6 +46,8 @@ const Span = struct {
     end: u32,
 };
 
+var split_arrivals: u32 addrspace(.shared) = undefined;
+
 pub fn SharedStorage(
     comptime tiling: Sm80FwdTiling,
     comptime specialization: configurations.Specialization,
@@ -687,6 +689,9 @@ pub fn FlashAttnFwdSm80(
 
         pub const Work = struct {
             tile: Tile,
+            split: Split = undefined,
+
+            const Split = if (specialization.split_kv) struct { idx: u32, tile_idx: u32 } else void;
 
             pub const all_groups: Span = .{ .first = 0, .end = block_n / 16 };
 
@@ -717,10 +722,23 @@ pub fn FlashAttnFwdSm80(
                 }
                 const scheduler = TileScheduler.create(tile_scheduler.forwardArguments(params));
                 const persistent_scheduler: PersistentScheduler = .create();
-                const tile = scheduler.getGridWork(
-                    tile_scheduler.gridTile(.x, 1, persistent_scheduler.initialWorkTileInfo()),
-                ) orelse return null;
-                return .{ .tile = Tile.init(params, tile) };
+                const grid = tile_scheduler.gridTile(
+                    .x,
+                    if (specialization.split_kv) params.num_splits else 1,
+                    persistent_scheduler.initialWorkTileInfo(),
+                );
+                const tile = scheduler.getGridWork(grid) orelse return null;
+                var work: Work = .{ .tile = Tile.init(params, tile) };
+                if (specialization.split_kv) {
+                    work.split = .{ .idx = grid.split_idx, .tile_idx = grid.tile_idx };
+                    const n_block_min = work.tile.n_block_min;
+                    const blocks = work.tile.n_block_max -| n_block_min;
+                    const num_splits = params.num_splits;
+                    const split_idx = grid.split_idx;
+                    work.tile.n_block_min = n_block_min + blocks * split_idx / num_splits;
+                    work.tile.n_block_max = n_block_min + blocks * (split_idx + 1) / num_splits;
+                }
+                return work;
             }
 
             pub fn visibleGroups(work: *const Work, n_block: u32) Span {
@@ -975,6 +993,74 @@ pub fn FlashAttnFwdSm80(
             }
         }
 
+        fn combineSplits(
+            params: ForwardParams,
+            work: *const Work,
+            softmax: *Running,
+            output: *Output,
+            trace: *Trace,
+        ) bool {
+            trace.begin(.combine);
+            defer trace.end(.combine);
+            const Partial = [mma_m_per_warp * (row_chunks + 1)][nvptx.warp_size]Accumulator;
+            const partials: [*]addrspace(.global) Partial = @ptrFromInt(params.o_accum);
+            const tile = work.tile;
+            const tile_rows = if (specialization.pack_gqa)
+                tile.pack_gqa.end_row - tile.first_row
+            else
+                tile.block_info.row_count;
+            const warp = thread.warp();
+            const lane = thread.lane();
+            const has_rows = warp * warp_rows < tile_rows;
+            const first_partial = work.split.tile_idx * params.num_splits * params.o_accum_warps;
+            const state_slot = mma_m_per_warp * row_chunks;
+            if (has_rows) {
+                const caching: nvptx.cache.StoreCaching = .{ .operator = .cache_global_level };
+                const own = &partials[first_partial + work.split.idx * params.o_accum_warps + warp];
+                inline for (output.*, softmax.*, 0..) |rows, rows_softmax, row_tile| {
+                    inline for (rows, 0..) |fragment, chunk| {
+                        const partial = &own[row_tile * row_chunks + chunk][lane];
+                        nvptx.cache.store(caching, partial, fragment);
+                    }
+                    const state: Accumulator = .{
+                        rows_softmax.row_max[0], rows_softmax.row_max[1],
+                        rows_softmax.row_sum[0], rows_softmax.row_sum[1],
+                    };
+                    nvptx.cache.store(caching, &own[state_slot + row_tile][lane], state);
+                }
+            }
+            nvptx.fence(.seq_cst, .gpu);
+            nvptx.barrierSyncAligned(.work_group, null);
+            if (thread.id() == 0) {
+                const counters: [*]addrspace(.global) u32 = @ptrFromInt(params.split_counters);
+                const counter = &counters[work.split.tile_idx];
+                split_arrivals = nvptx.atom(.gpu, .monotonic, .add, counter, 1);
+            }
+            nvptx.barrierSyncAligned(.work_group, null);
+            if (split_arrivals + 1 < params.num_splits) return false;
+            nvptx.fence(.seq_cst, .gpu);
+            if (!has_rows) return true;
+            const loading: nvptx.cache.LoadCaching = .{ .operator = .cache_global_level };
+            inline for (softmax) |*rows_softmax| rows_softmax.* = Online.init();
+            output.* = @splat(@splat(@splat(0)));
+            for (0..params.num_splits) |split_idx| {
+                const other = &partials[first_partial + split_idx * params.o_accum_warps + warp];
+                inline for (output, softmax, 0..) |*rows, *rows_softmax, row_tile| {
+                    const state = nvptx.cache.load(loading, &other[state_slot + row_tile][lane]);
+                    const own_scale, const other_scale = rows_softmax.combine(.{
+                        .row_max = .{ state[0], state[1] },
+                        .row_sum = .{ state[2], state[3] },
+                    }, params.softmax_scale_log2);
+                    inline for (rows, 0..) |*fragment, chunk| {
+                        const partial = &other[row_tile * row_chunks + chunk][lane];
+                        fragment.* = fragment.* * own_scale +
+                            nvptx.cache.load(loading, partial) * other_scale;
+                    }
+                }
+            }
+            return true;
+        }
+
         fn storeOutput(
             params: ForwardParams,
             work: *const Work,
@@ -1204,6 +1290,9 @@ pub fn FlashAttnFwdSm80(
                     load.restart(params, work);
                 }
             } else runTiles(params, work, &load, query, &softmax, &output, lanes, trace);
+            if (specialization.split_kv and params.num_splits > 1) {
+                if (!combineSplits(params, work, &softmax, &output, trace)) return trace.end(.tile);
+            }
             trace.begin(.store);
             storeOutput(params, work, softmax, output);
             trace.end(.store);
@@ -1281,7 +1370,8 @@ const Forward = FlashAttnFwdSm80(
 
 fn launch(params: ForwardParams, args: Forward.Args) void {
     var grid_params = params;
-    grid_params.num_m_blocks = nvptx.nctaid(0);
+    const splits = if (variant.specialization.split_kv) params.num_splits else 1;
+    grid_params.num_m_blocks = nvptx.nctaid(0) / splits;
     grid_params.num_head = nvptx.nctaid(1);
     Forward.run(grid_params, args);
 }
@@ -1294,6 +1384,9 @@ const names = .{
 } ++ entry.strides("q") ++ entry.strides("k") ++ entry.strides("v") ++ entry.strides("o") ++
     .{ "lse_batch_stride", "lse_head_stride", "num_batch" } ++
     (if (variant.specialization.scheduler_metadata) .{"scheduler_metadata"} else .{}) ++
+    (if (variant.specialization.split_kv) .{
+        "o_accum", "split_counters", "num_splits", "o_accum_warps",
+    } else .{}) ++
     if (variant.specialization.inter_sequence) .{
         "visibility_bits",  "window_sizes", "block_table",
         "sequence_records", "num_head",

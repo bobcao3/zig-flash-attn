@@ -262,7 +262,6 @@ const Span = struct {
 
 pub const TileScheduler = struct {
     cta_blocks: BlockRange,
-    warp_group_blocks: BlockRange,
     cta_table: u64,
     block_m: u32,
     first_split_tile: u32,
@@ -289,13 +288,8 @@ pub const TileScheduler = struct {
         const packing = if (packs) params.qhead_per_kvhead else 1;
         const heads = params.num_head / packing;
         const section_heads = @max(1, params.section_heads / packing);
-        const fills_waves = !has_warp_group_queue or cta_table_blocks * heads >=
-            persistent.cta_tile_min_waves * @min(ctas, params.num_sm);
-        const warp_group_end =
-            if (fills_waves) 0 else BlockTable.at(params.block_table_m64).blocks;
         var scheduler: TileScheduler = .{
-            .cta_blocks = .init(0, if (fills_waves) cta_table_blocks else 0, heads, section_heads),
-            .warp_group_blocks = .init(0, warp_group_end, heads, section_heads),
+            .cta_blocks = .init(0, cta_table_blocks, heads, section_heads),
             .cta_table = cta_table,
             .block_m = block_m,
             .qhead_per_kvhead = .init(params.qhead_per_kvhead),
@@ -394,7 +388,7 @@ pub const TileScheduler = struct {
         return switch (queue) {
             .cta => scheduler.cta_blocks.tileCount() - scheduler.halved_tiles +
                 (scheduler.num_splits - 1) * scheduler.num_split_blocks,
-            .warp_group => 2 * scheduler.halved_tiles + scheduler.warp_group_blocks.tileCount(),
+            .warp_group => 2 * scheduler.halved_tiles,
         };
     }
 
@@ -419,12 +413,6 @@ pub const TileScheduler = struct {
             }
             const whole_tile = tile_idx - (scheduler.num_splits - 1) * scheduler.num_split_blocks;
             return scheduler.ctaWork(params, whole_tile);
-        }
-        const halves = 2 * scheduler.halved_tiles;
-        if (tile_idx >= halves) {
-            const table = params.block_table_m64;
-            const blocks = scheduler.warp_group_blocks;
-            return blocks.locate(params, table, warp_group_block_m, packing, tile_idx - halves);
         }
         const cta_tile = scheduler.cta_blocks.tileCount() - scheduler.halved_tiles + tile_idx / 2;
         var work = scheduler.ctaWork(params, cta_tile);
