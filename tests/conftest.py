@@ -3,7 +3,7 @@ import torch
 
 import checks
 from shapes import HEAD_DIMS
-from zigfa import specialization
+from zigfa import runtime, specialization
 from zigfa.backward import backward_variant, backward_workspace_layout
 from zigfa.forward import forward_variant, forward_workspace_layout
 
@@ -17,6 +17,13 @@ SELECTION_CACHES = (
 
 def pytest_configure(config):
     torch.set_float32_matmul_precision("high")
+    launch = runtime.run
+
+    def run(kernel, *arguments, **options):
+        checks.launched_kernels.add(runtime.kernel_labels.get(kernel, "unlabelled"))
+        return launch(kernel, *arguments, **options)
+
+    runtime.run = run
 
 
 def pytest_report_header(config):
@@ -41,6 +48,7 @@ def clear_selection():
 
 @pytest.fixture(autouse=True)
 def fresh_selection():
+    checks.launched_kernels.clear()
     clear_selection()
     yield
     clear_selection()

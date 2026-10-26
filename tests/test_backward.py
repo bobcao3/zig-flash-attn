@@ -5,7 +5,7 @@ import torch
 
 import zigfa
 from zigfa import specialization
-from checks import case, queue_forward_checks, queue_gradient_checks, queue_requirement
+from checks import case, queue_attention_checks, queue_requirement
 from reference import attention_ref, varlen_attention_ref
 from shapes import (
     BATCHED_WINDOW_SEQLENS,
@@ -17,9 +17,8 @@ from shapes import (
     PACKED_GQA_QHEAD_PER_KVHEAD,
     PADDING_ROWS,
     SHORT_QUERY_SEQLENS,
-    SMALL_VARLEN_BATCHES,
     SMALL_VARLEN_HEAD_COUNTS,
-    SMALL_VARLEN_LENGTHS,
+    SMALL_VARLEN_SHAPES,
     VARLEN_SEQLENS,
     ZERO_LENGTH_QUERY_PADDING_ROWS,
     ZERO_LENGTH_QUERY_SEQLENS,
@@ -81,8 +80,7 @@ def varlen_inputs(total_q, total_k, num_head, num_head_kv, head_dim):
 def check_batched(q, k, v, dout, window, causal=False):
     batch, seqlen_q, num_head, _ = q.shape
     out, lse, *gradients = launch_forward_backward(q, k, v, dout, (batch, num_head, seqlen_q), window)
-    queue_forward_checks([(out, lse)], attention_ref, q, k, v, causal=causal, window_size=window)
-    queue_gradient_checks([gradients], attention_ref, q, k, v, dout, causal=causal, window_size=window)
+    queue_attention_checks([(out, lse)], [gradients], attention_ref, q, k, v, dout, causal=causal, window_size=window)
 
 
 def check_varlen(q, k, v, dout, cu_q, cu_k, causal, window, variants, total_q=None):
@@ -101,9 +99,9 @@ def check_varlen(q, k, v, dout, cu_q, cu_k, causal, window, variants, total_q=No
                 queue_requirement("out rows past the last boundary", torch.isnan(out[total_q:]).all())
                 queue_requirement("lse rows past the last boundary", torch.isnan(lse[:, total_q:]).all())
                 queue_requirement("dq rows past the last boundary", torch.isnan(dq[total_q:]).all())
-    references = (varlen_attention_ref, q[valid], k, v)
-    queue_forward_checks(forward_results, *references, cu_q, cu_k, causal, window)
-    queue_gradient_checks(gradient_results, *references, dout[valid], cu_q, cu_k, causal, window)
+    queue_attention_checks(
+        forward_results, gradient_results, varlen_attention_ref, q[valid], k, v, dout[valid], cu_q, cu_k, causal, window
+    )
 
 
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
@@ -154,8 +152,9 @@ def test_packed_gqa_at_every_group_size(monkeypatch, restrict_candidates, head_d
                 q, k, v, dout = batched_inputs(3, seqlen_q, seqlen_k, 2 * group, 2, head_dim)
                 results.append(launch_forward_backward(q, k, v, dout, (3, 2 * group, seqlen_q), window))
             (out, lse, *gradients), dense = results
-            queue_forward_checks([(out, lse)], attention_ref, q, k, v, causal=causal, window_size=window)
-            queue_gradient_checks([gradients], attention_ref, q, k, v, dout, causal=causal, window_size=window)
+            queue_attention_checks(
+                [(out, lse)], [gradients], attention_ref, q, k, v, dout, causal=causal, window_size=window
+            )
             for name, packed_tensor, dense_tensor in zip(("out", "lse"), (out, lse), dense):
                 equal = (packed_tensor == dense_tensor).all()
                 queue_requirement(f"{name} of the gqa instance equals the dense instance", equal)
@@ -201,8 +200,8 @@ def test_varlen_zero_length_queries(head_dim):
 
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
 def test_small_varlen_sequences(head_dim):
-    for (num_head, num_head_kv), batch, (minimum, maximum), window_name in itertools.product(
-        SMALL_VARLEN_HEAD_COUNTS, SMALL_VARLEN_BATCHES, SMALL_VARLEN_LENGTHS, ["dense", "causal"]
+    for (num_head, num_head_kv), (batch, minimum, maximum), window_name in itertools.product(
+        SMALL_VARLEN_HEAD_COUNTS, SMALL_VARLEN_SHAPES, ["dense", "causal"]
     ):
         with case(
             num_head=num_head, num_head_kv=num_head_kv, batch=batch, minimum=minimum, maximum=maximum, window=window_name

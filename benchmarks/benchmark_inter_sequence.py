@@ -1,90 +1,51 @@
 import argparse
-import itertools
-import statistics
+import functools
+import importlib
+import json
+import time
+import warnings
 
 import torch
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-from zigfa.torch import flash_attn_inter_sequence_func, flash_attn_varlen_func, get_inter_sequence_scheduler_metadata
+import timing
+from benchmark_attn import attention_bytes, attention_flops, gradient_of, versions, visible_pairs
+from zigfa import runtime
+from zigfa.torch import flash_attn_inter_sequence_func, get_inter_sequence_scheduler_metadata
 
 DENSE = (-1, -1)
 CAUSAL = (-1, 0)
 TEXT, CLEAN_IMAGE, NOISED_IMAGE, SECOND_TEXT, SECOND_IMAGE = range(5)
-TASKS = {
-    "i2t": (("image", DENSE, (0,)), ("text", CAUSAL, (0, 1))),
-    "it2i": (("text", CAUSAL, (0,)), ("image", DENSE, (0, 1)), ("image", DENSE, (0, 1, 2))),
-    "titi": (
-        ("text", CAUSAL, (TEXT,)),
-        ("image", DENSE, (TEXT, CLEAN_IMAGE)),
-        ("image", DENSE, (TEXT, NOISED_IMAGE)),
-        ("text", CAUSAL, (TEXT, CLEAN_IMAGE, SECOND_TEXT)),
-        ("image", DENSE, (TEXT, CLEAN_IMAGE, SECOND_TEXT, SECOND_IMAGE)),
-    ),
-    "caption": (
-        ("text", CAUSAL, (0,)),
-        ("image", DENSE, (0, 1)),
-        ("image", DENSE, (0, 2)),
-        ("image", DENSE, (0, 3)),
-        ("text", CAUSAL, (0, 4)),
-        ("text", CAUSAL, (0, 5)),
-        ("text", CAUSAL, (0, 1, 2, 3, 4, 5, 6)),
-    ),
+CAPTION = (
+    ("text", CAUSAL, (0,)),
+    ("image", DENSE, (0, 1)),
+    ("image", DENSE, (0, 2)),
+    ("image", DENSE, (0, 3)),
+    ("text", CAUSAL, (0, 4)),
+    ("text", CAUSAL, (0, 5)),
+    ("text", CAUSAL, (0, 1, 2, 3, 4, 5, 6)),
+)
+IMAGE_TO_TEXT = (("image", DENSE, (0,)), ("text", CAUSAL, (0, 1)))
+TEXT_TO_IMAGE = (("text", CAUSAL, (0,)), ("image", DENSE, (0, 1)), ("image", DENSE, (0, 1, 2)))
+INTERLEAVED = (
+    ("text", CAUSAL, (TEXT,)),
+    ("image", DENSE, (TEXT, CLEAN_IMAGE)),
+    ("image", DENSE, (TEXT, NOISED_IMAGE)),
+    ("text", CAUSAL, (TEXT, CLEAN_IMAGE, SECOND_TEXT)),
+    ("image", DENSE, (TEXT, CLEAN_IMAGE, SECOND_TEXT, SECOND_IMAGE)),
+)
+# Each layout names the sequences of a sample, the tokens of an image, and the range of the tokens of a text.
+LAYOUTS = {
+    "captions": (CAPTION, 280, (32, 512)),
+    "image → text": (IMAGE_TO_TEXT, 560, (32, 512)),
+    "text → image": (TEXT_TO_IMAGE, 1024, (64, 512)),
+    "interleaved": (INTERLEAVED, 1024, (64, 512)),
+    "4096-token images": (INTERLEAVED, 4096, (64, 512)),
 }
-EXTEND_TASKS = {
-    "i2t_extend": ("image", "text"),
-    "titi_extend": ("text", "image", "text"),
-    "it2i_generate": ("text", "image"),
-    "titi_generate": ("text", "image", "text", "image"),
-    "caption_extend": ("text", "image", "image", "image", "text", "text", "text"),
-}
-NEW_TOKENS_AND_REQUESTS = ((1, 64), (128, 16), (1024, 4))
-IMAGE_REQUESTS = (1, 4)
-MODELS = {
-    "gemma": (
-        ((16, 8, 256), (8, 4, 256), (32, 16, 128)),
-        ("i2t", "titi", "i2t_extend", "titi_extend"),
-        (256, 560, 1120),
-        ((32, 512), (256, 2048)),
-    ),
-    "qwen-image": (((24, 24, 128),), ("it2i", "titi", "it2i_generate", "titi_generate"), (1024, 4096), ((64, 512),)),
-    "gemma4-12b": (((16, 8, 256),), ("caption", "caption_extend"), (280,), ((32, 512),)),
-}
-
-
-def paired_milliseconds(functions, rounds, repeats=3, warmup=5):
-    for _ in range(warmup):
-        for function in functions:
-            function()
-    torch.cuda.synchronize()
-    times = [[] for _ in functions]
-    for round_index in range(rounds):
-        order = list(range(len(functions)))[:: -1 if round_index % 2 else 1]
-        events = {}
-        for index in order:
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            start.record()
-            for _ in range(repeats):
-                functions[index]()
-            end.record()
-            events[index] = (start, end)
-        torch.cuda.synchronize()
-        for index, (start, end) in events.items():
-            times[index].append(start.elapsed_time(end) / repeats)
-    medians = [statistics.median(samples) for samples in times]
-    speedups = [statistics.median(a / b for a, b in zip(times[0], samples)) for samples in times]
-    return medians, speedups
-
-
-def graph_replay(function, copies=10):
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        function()
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for _ in range(copies):
-            function()
-    return graph.replay
+HEAD_DIMS = (64, 128, 256, 512)
+MAX_PARTS = 8
+FA4_MAJORS = (9, 10, 12)
+RECOMPILE_LIMIT = 64
 
 
 def visibility_bits_of(visible):
@@ -107,7 +68,19 @@ def layout(samples, parts):
     visible = torch.zeros(len(lengths), len(lengths), dtype=torch.bool)
     for query, keys in enumerate(seen):
         visible[query, keys] = True
-    return lengths, visibility_bits_of(visible), torch.tensor(sequence_windows, dtype=torch.int32).t().contiguous()
+    return lengths, visible, sequence_windows
+
+
+def useful_pairs(lengths_q, lengths_k, visible, windows):
+    """Counts the query-key pairs that inter-sequence attention computes: all pairs of a visible pair of
+    sequences, and the pairs inside the window of a sequence that sees itself."""
+    pairs = 0
+    for query, key in visible.nonzero().tolist():
+        if query == key:
+            pairs += visible_pairs(lengths_q[query], lengths_k[key], windows[query])
+        else:
+            pairs += lengths_q[query] * lengths_k[key]
+    return pairs
 
 
 def cu_seqlens_of(lengths):
@@ -126,115 +99,198 @@ def samples_of(parts, image, text_range, tokens, generator):
     return samples
 
 
-def run(name, samples, parts, heads, heads_kv, head_dim, rounds):
-    lengths, bits, window_sizes = layout(samples, parts)
-    sample_lengths = [sum(sample) for sample in samples]
+def mask_tensors(samples, parts):
+    """Returns, for each token, its sample and its part of the sample, and a table whose entry
+    `MAX_PARTS * query_part + key_part` is 1 where the query part sees the key part in full, 2 where a part sees
+    itself causally, and 0 elsewhere. These define the visibility for FlexAttention."""
+    sample_of_token, part_of_token = [], []
+    for index, sample in enumerate(samples):
+        for part, length in enumerate(sample):
+            sample_of_token += [index] * length
+            part_of_token += [part] * length
+    table = torch.zeros(MAX_PARTS * MAX_PARTS, dtype=torch.int32)
+    for query, (_, window, parts_seen) in enumerate(parts):
+        for key in parts_seen:
+            table[MAX_PARTS * query + key] = 2 if key == query and window == CAUSAL else 1
+    return [torch.tensor(values, dtype=torch.int32, device="cuda") for values in (sample_of_token, part_of_token)] + [
+        table.cuda()
+    ]
+
+
+def flex_functions(q, k, v, dout, tensors):
+    """Returns the forward and backward functions of compiled FlexAttention with a block mask of the visibility."""
+    sample, part, table = tensors
+
+    def mask_mod(batch, head, query, key):
+        rule = table[part[query] * MAX_PARTS + part[key]]
+        return (sample[query] == sample[key]) & ((rule == 1) | ((rule == 2) & (key <= query)))
+
+    total = q.shape[0]
+    block_mask = create_block_mask(mask_mod, None, None, total, total)
+    inputs = [x.detach().transpose(0, 1).unsqueeze(0).contiguous().requires_grad_() for x in (q, k, v)]
+    grad = dout.transpose(0, 1).unsqueeze(0).contiguous()
+    compiled = compiled_flex_attention()
+
+    def forward():
+        return compiled(*inputs, block_mask=block_mask)
+
+    return forward, gradient_of(forward, inputs, grad)
+
+
+@functools.cache
+def compiled_flex_attention():
+    """Returns `torch.compile(flex_attention)`. Each case has its own token count, so the compiler may compile
+    once per case; a backward that donates its saved buffers could not run a second time."""
+    for name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(torch._dynamo.config, name):
+            setattr(torch._dynamo.config, name, RECOMPILE_LIMIT)
+    torch._functorch.config.donated_buffer = False
+    return torch.compile(flex_attention)
+
+
+@functools.cache
+def fa4_flex():
+    """Returns the FlashAttention-4 interface and a CuTe mask_mod of the visibility of `mask_tensors`, or None
+    where FlashAttention-4 is not installed."""
+    if torch.cuda.get_device_capability()[0] not in FA4_MAJORS:
+        return None
+    try:
+        interface = importlib.import_module("flash_attn.cute.interface")
+        cutlass = importlib.import_module("cutlass")
+        cute = importlib.import_module("cutlass.cute")
+        utils = importlib.import_module("flash_attn.cute.utils")
+    except ImportError:
+        return None
+
+    @cute.jit
+    def clamped(values, index, count):
+        """Reads `values` at `index`, or at its last entry for the positions past the end that a tile pads."""
+        index_fragment = cute.make_rmem_tensor(1, cutlass.Int32)
+        index_fragment.store(index)
+        value_fragment = cute.make_rmem_tensor(1, cutlass.Int32)
+        value_fragment[0] = values[cutlass.min(index_fragment[0], count - 1)]
+        return value_fragment.load()
+
+    @cute.jit
+    def mask_mod(batch, head, query, key, seqlen_info, aux_tensors):
+        sample, part, table = aux_tensors
+        parts = utils.scalar_to_ssa(MAX_PARTS, cutlass.Int32)
+        entry = clamped(part, query, seqlen_info.seqlen_q) * parts + clamped(part, key, seqlen_info.seqlen_k)
+        rule = clamped(table, entry, MAX_PARTS * MAX_PARTS)
+        same_sample = clamped(sample, query, seqlen_info.seqlen_q) == clamped(sample, key, seqlen_info.seqlen_k)
+        one, two = utils.scalar_to_ssa(1, cutlass.Int32), utils.scalar_to_ssa(2, cutlass.Int32)
+        return same_sample & ((rule == one) | ((rule == two) & (key <= query)))
+
+    return interface, mask_mod
+
+
+def fa4_functions(q, k, v, dout, tensors):
+    """Returns the forward and backward functions of FlashAttention-4 with the mask_mod of the visibility."""
+    flex = fa4_flex()
+    if flex is None:
+        return None
+    interface, mask_mod = flex
+    inputs = [x.detach().unsqueeze(0).requires_grad_() for x in (q, k, v)]
+
+    def forward():
+        return interface.flash_attn_func(*inputs, mask_mod=mask_mod, aux_tensors=tensors)
+
+    return forward, gradient_of(forward, inputs, dout.unsqueeze(0))
+
+
+def run(name, point, samples, parts, head_dim, arguments, output):
+    lengths, visible, windows = layout(samples, parts)
     total = sum(lengths)
-    cu_seqlens, cu_samples = cu_seqlens_of(lengths), cu_seqlens_of(sample_lengths)
-    bits, window_sizes = bits.cuda(), window_sizes.cuda()
+    heads = arguments.dim // head_dim
+    cu_seqlens = cu_seqlens_of(lengths)
+    bits = visibility_bits_of(visible).cuda()
+    window_sizes = torch.tensor(windows, dtype=torch.int32).t().contiguous().cuda()
     q = torch.randn(total, heads, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    k, v = (torch.randn_like(q[:, :heads_kv]).requires_grad_() for _ in range(2))
-    longest, longest_sample = max(lengths), max(sample_lengths)
+    k, v = (torch.randn_like(q).requires_grad_() for _ in range(2))
+    dout = torch.randn_like(q)
+    longest = max(lengths)
     metadata = get_inter_sequence_scheduler_metadata(cu_seqlens, cu_seqlens, bits)
 
-    def dense():
-        return flash_attn_varlen_func(q, k, v, cu_samples, cu_samples, longest_sample, longest_sample)
-
-    def inter(scheduler_metadata=metadata):
+    def zigfa_forward():
         return flash_attn_inter_sequence_func(
-            q, k, v, cu_seqlens, cu_seqlens, longest, longest, bits, window_sizes=window_sizes,
-            scheduler_metadata=scheduler_metadata,
-        )
-
-    (dense_forward, inter_forward, _), (_, forward_speedup, rebuilt_speedup) = paired_milliseconds(
-        [dense, inter, lambda: inter(None)], rounds
-    )
-    outputs = [dense(), inter()]
-    dout = torch.randn_like(outputs[0])
-    backward = [lambda out=out: torch.autograd.grad(out, (q, k, v), dout, retain_graph=True) for out in outputs]
-    (dense_backward, inter_backward), (_, backward_speedup) = paired_milliseconds(backward, rounds)
-    print(
-        f"{name:44} tokens={total:6} sequences={len(lengths):4} | forward dense {dense_forward:7.3f} ms "
-        f"inter {inter_forward:7.3f} ms x{forward_speedup:.2f} (metadata rebuilt x{rebuilt_speedup:.2f}) | "
-        f"backward dense {dense_backward:7.3f} ms inter {inter_backward:7.3f} ms x{backward_speedup:.2f}",
-        flush=True,
-    )
-
-
-def extend_requests(parts, image, text_range, new_tokens, count, generator):
-    requests = []
-    for _ in range(count):
-        lengths = [
-            image if kind == "image" else int(torch.randint(*text_range, (1,), generator=generator)) for kind in parts
-        ]
-        last = (image, image) if parts[-1] == "image" else (new_tokens, lengths[-1] + new_tokens)
-        requests.append([*((0, length) for length in lengths[:-1]), last])
-    return requests
-
-
-def run_extend(name, requests, parts, heads, heads_kv, head_dim, rounds, copies=10):
-    lengths_q = [length_q for lengths in requests for length_q, _ in lengths]
-    lengths_k = [length_k for lengths in requests for _, length_k in lengths]
-    request_q = [sum(length_q for length_q, _ in lengths) for lengths in requests]
-    request_k = [sum(length_k for _, length_k in lengths) for lengths in requests]
-    visible = torch.zeros(len(lengths_q), len(lengths_q), dtype=torch.bool)
-    for first in range(0, len(lengths_q), len(parts)):
-        for part in range(len(parts)):
-            visible[first + part, first : first + part + 1] = True
-    windows = [DENSE if kind == "image" else CAUSAL for _ in requests for kind in parts]
-    window_sizes = torch.tensor(windows, dtype=torch.int32).t().contiguous().cuda()
-    bits = visibility_bits_of(visible).cuda()
-    cu_q, cu_k, cu_request_q, cu_request_k = map(cu_seqlens_of, (lengths_q, lengths_k, request_q, request_k))
-    q = torch.randn(sum(lengths_q), heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    k, v = (torch.randn(sum(lengths_k), heads_kv, head_dim, device="cuda", dtype=torch.bfloat16) for _ in range(2))
-    metadata = get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits)
-
-    def dense():
-        return flash_attn_varlen_func(
-            q, k, v, cu_request_q, cu_request_k, max(request_q), max(request_k), causal=parts[-1] == "text"
-        )
-
-    def inter():
-        return flash_attn_inter_sequence_func(
-            q, k, v, cu_q, cu_k, max(lengths_q), max(lengths_k), bits, window_sizes=window_sizes,
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            longest,
+            longest,
+            bits,
+            window_sizes=window_sizes,
             scheduler_metadata=metadata,
         )
 
-    replays = [graph_replay(function, copies) for function in (dense, inter)]
-    (dense_forward, inter_forward), (_, speedup) = paired_milliseconds(replays, rounds)
-    print(
-        f"{name:62} queries={sum(lengths_q):6} keys={sum(lengths_k):7} | forward dense "
-        f"{dense_forward / copies * 1e3:8.1f} us inter {inter_forward / copies * 1e3:8.1f} us x{speedup:.2f}",
-        flush=True,
-    )
+    tensors = mask_tensors(samples, parts)
+    forward = {"zigfa": zigfa_forward}
+    backward = {"zigfa": gradient_of(zigfa_forward, (q, k, v), dout)}
+    forward["FlexAttention"], backward["FlexAttention"] = flex_functions(q, k, v, dout, tensors)
+    fa4 = fa4_functions(q, k, v, dout, tensors)
+    if fa4 is not None:
+        forward["FA4 FlexAttention"], backward["FA4 FlexAttention"] = fa4
+    pairs = useful_pairs(lengths, lengths, visible, windows)
+    case_seconds = timing.CASE_SECONDS / len(arguments.directions)
+    line = f"{name:30} tokens={total:6} sequences={len(lengths):4}"
+    for direction in arguments.directions:
+        functions = {"fwd": forward, "bwd": backward}[direction]
+        is_backward = direction == "bwd"
+        flop_count = attention_flops(pairs, heads, head_dim, is_backward)
+        byte_count = attention_bytes(total, total, heads, heads, head_dim, is_backward)
+        estimate = timing.estimated_seconds(flop_count, byte_count, is_backward)
+        measurement = timing.measure(f"{name} {direction}", functions, estimate, case_seconds)
+        line += f" | {direction} " + timing.summary(measurement, list(functions), flop_count, byte_count)
+        if output is not None:
+            record = timing.record(measurement, flop_count, byte_count)
+            output.write(json.dumps({"benchmark": "inter_sequence", **point, "direction": direction, **record}) + "\n")
+            output.flush()
+    return line
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compares inter-sequence attention with dense varlen attention over the same samples"
+        description="Times inter-sequence attention against compiled FlexAttention and FlashAttention-4 with a "
+        "mask_mod of the same visibility"
     )
-    parser.add_argument("--models", nargs="+", choices=list(MODELS), default=list(MODELS))
-    parser.add_argument("--tasks", nargs="+", choices=[*TASKS, *EXTEND_TASKS], default=[*TASKS, *EXTEND_TASKS])
+    parser.add_argument("--layouts", nargs="+", choices=list(LAYOUTS), default=list(LAYOUTS))
+    parser.add_argument("--head-dims", type=int, nargs="+", default=list(HEAD_DIMS))
+    parser.add_argument("--directions", nargs="+", choices=("fwd", "bwd"), default=["fwd", "bwd"])
     parser.add_argument("--tokens", type=int, default=16384)
-    parser.add_argument("--rounds", type=int, default=20)
+    parser.add_argument("--dim", type=int, default=2048)
+    parser.add_argument("--json", help="append one JSON record per case and direction to this file")
     arguments = parser.parse_args()
+    if torch.cuda.get_device_capability()[0] not in runtime.INTER_SEQUENCE_ARCHS:
+        print(f"zigfa builds no inter-sequence kernels for {torch.cuda.get_device_name()}.", flush=True)
+        return
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+    warnings.filterwarnings("ignore", message="Argument .* cannot be converted to a JitArgument")
+    started = time.perf_counter()
+    durations = []
+    print(timing.header(), flush=True)
+    print(
+        "Inputs are bfloat16 values drawn from N(0, 1). Each line times inter-sequence attention against compiled "
+        "FlexAttention, and FlashAttention-4 with a mask_mod where it runs, over the same visibility. TF/s count "
+        "only the visible query-key pairs; a percent after a rate is of the roofline, and (zigfa N%) is the speed "
+        "of zigfa as a percent of the speed of that implementation.",
+        flush=True,
+    )
+    output = open(arguments.json, "a") if arguments.json else None
+    common = {"device": torch.cuda.get_device_name(), "versions": versions()}
     generator = torch.Generator().manual_seed(1)
-    for model in arguments.models:
-        shapes, tasks, images, text_ranges = MODELS[model]
-        for task, (heads, heads_kv, head_dim), image, text_range in itertools.product(
-            (task for task in tasks if task in arguments.tasks), shapes, images, text_ranges
-        ):
-            name = f"{model} {task} h{heads}/{heads_kv} d{head_dim} image={image} text<{text_range[1]}"
-            if task in TASKS:
-                samples = samples_of(TASKS[task], image, text_range, arguments.tokens, generator)
-                run(name, samples, TASKS[task], heads, heads_kv, head_dim, arguments.rounds)
-                continue
-            parts = EXTEND_TASKS[task]
-            steps = NEW_TOKENS_AND_REQUESTS if parts[-1] == "text" else ((None, count) for count in IMAGE_REQUESTS)
-            for new_tokens, count in steps:
-                requests = extend_requests(parts, image, text_range, new_tokens, count, generator)
-                step = f"requests={count}" + (f" new={new_tokens}" if new_tokens else "")
-                run_extend(f"{name} {step}", requests, parts, heads, heads_kv, head_dim, arguments.rounds)
+    for name, (parts, image, text_range) in LAYOUTS.items():
+        samples = samples_of(parts, image, text_range, arguments.tokens, generator)
+        if name not in arguments.layouts:
+            continue
+        for head_dim in arguments.head_dims:
+            case_started = time.perf_counter()
+            point = {**common, "layout": name, "head_dim": head_dim}
+            line = run(f"{name} hd={head_dim:3}", point, samples, parts, head_dim, arguments, output)
+            durations.append(time.perf_counter() - case_started)
+            print(f"{line} [{durations[-1]:.2f} s]", flush=True)
+    print(timing.totals(durations, time.perf_counter() - started), flush=True)
 
 
 if __name__ == "__main__":

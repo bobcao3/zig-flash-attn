@@ -53,6 +53,16 @@ naming the exceptions), for example
 `reports/profile_viewer.html` also opens a trace that you drop onto it, and
 `reports/profile_design.html` describes the record and file formats.
 
+## Benchmarks
+
+`benchmarks/benchmark_attn.py` times zigfa against torch SDPA, which runs cuDNN where cuDNN accepts
+the case and FlashAttention otherwise, and against FlashAttention-4 on SM90, SM100 and SM120 GPUs.
+`benchmarks/benchmark_inter_sequence.py` times inter-sequence attention against compiled
+FlexAttention and FlashAttention-4 with a `mask_mod` of the same visibility. Their default
+arguments measure the points of `reports/perf_report.html`; with `--json PATH`, each script writes
+one record per point, and `python reports/update_perf_report.py DEVICE PATH...` writes the records
+of one device into the report.
+
 ## Build from source
 
 `pip install .` needs the Zig compiler with the self-hosted PTX backend from

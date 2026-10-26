@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch.library import opcheck
 
-from checks import case, queue_forward_checks, queue_gradient_checks, queue_requirement
+from checks import case, queue_attention_checks, queue_requirement
 from reference import FULLY_MASKED_LSE, inter_sequence_attention_ref, inter_sequence_visible
 from shapes import HEAD_LAYOUTS, cu_seqlens_of, cuda_seed
 from zigfa import inter_sequence, runtime
@@ -178,12 +178,16 @@ def check_layout(layout, num_head, num_head_kv, head_dim, **options):
         q, k, v, cu_q, cu_k, max(layout.lengths_q), max(layout.lengths_k), bits, return_attn_probs=True, **options
     )
     mask = inter_sequence_visible(cu_q, cu_k, layout.visible, windows)
-    queue_forward_checks([(out, lse)], inter_sequence_attention_ref, q, k, v, mask)
     if head_dim not in HEAD_DIMS:
+        queue_attention_checks(
+            [(out, lse)], [], inter_sequence_attention_ref, q, k, v, None, mask, float32_reference=False
+        )
         return out, lse, None, mask
     dout = torch.randn_like(out)
     gradients = torch.autograd.grad(out, (q, k, v), dout)
-    queue_gradient_checks([gradients], inter_sequence_attention_ref, q, k, v, dout, mask)
+    queue_attention_checks(
+        [(out, lse)], [gradients], inter_sequence_attention_ref, q, k, v, dout, mask, float32_reference=False
+    )
     return out, lse, gradients, mask
 
 

@@ -8,7 +8,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv, StatelessSymbolicContext
 from torch.library import opcheck
 
-from checks import queue_forward_checks, queue_gradient_checks
+from checks import queue_attention_checks
 from conftest import clear_selection
 from zigfa import runtime
 from zigfa.forward import forward_variant
@@ -218,8 +218,7 @@ def check_case(case, apply=None, gradient_layout=keep, return_attn_probs=False, 
     out.backward(dout)
     inputs = case.unpack([leaf.detach() for leaf in case.leaves])
     gradients = case.unpack([leaf.grad for leaf in case.leaves])
-    queue_forward_checks([(out, lse)], case.reference, *inputs)
-    queue_gradient_checks([gradients], case.reference, *inputs, dout)
+    queue_attention_checks([(out, lse)], [gradients], case.reference, *inputs, dout)
 
 
 MATRIX_LAYOUTS = {
@@ -336,7 +335,7 @@ def test_strided_packed_gradient_buffer_receives_the_gradients():
     dout = torch.randn_like(q)
     padded = torch.zeros(2, 64, 3, 2, HEAD_DIM + 4, device="cuda", dtype=torch.bfloat16)[..., :HEAD_DIM]
     flash_attn_backward_packed(dout, q, k, v, out, lse, None, None, 64, 64, SOFTMAX_SCALE, *window, None, padded)
-    queue_gradient_checks([padded.unbind(dim=-3)], attention_ref, q, k, v, dout)
+    queue_attention_checks([], [padded.unbind(dim=-3)], attention_ref, q, k, v, dout)
 
 
 UNSUPPORTED_VALUES = dict(dropout_p=0.1, attention_chunk=128, softcap=30.0, num_splits=4, deterministic=True)
@@ -540,8 +539,7 @@ def test_launch_selection_never_synchronizes_through_torch(name):
     graph.replay()
     torch.cuda.synchronize()
     inputs = case.unpack([leaf.detach() for leaf in case.leaves])
-    queue_forward_checks([(out, None)], case.reference, *inputs)
-    queue_gradient_checks([case.unpack(gradients)], case.reference, *inputs, dout)
+    queue_attention_checks([(out, None)], [case.unpack(gradients)], case.reference, *inputs, dout)
 
 
 def test_backward_packed_op_with_concatenated_heads_matches_reference():
@@ -554,4 +552,4 @@ def test_backward_packed_op_with_concatenated_heads_matches_reference():
     opcheck(flash_attn_backward_packed, (*arguments, None, dqkv), test_utils=OPCHECK_TESTS)
     flash_attn_backward_packed(*arguments, None, dqkv)
     gradients = dqkv.split([q.shape[-2], k.shape[-2], v.shape[-2]], dim=-2)
-    queue_gradient_checks([gradients], attention_ref, q, k, v, dout, window_size=(-1, 0))
+    queue_attention_checks([], [gradients], attention_ref, q, k, v, dout, window_size=(-1, 0))

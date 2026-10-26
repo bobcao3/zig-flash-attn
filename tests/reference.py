@@ -3,6 +3,7 @@ import math
 import torch
 
 FULLY_MASKED_LSE = float("-inf")
+longest_keys = 0
 
 
 def visible_keys(lengths_q, lengths_k, max_seqlen_q, max_seqlen_k, window_size):
@@ -18,6 +19,8 @@ def visible_keys(lengths_q, lengths_k, max_seqlen_q, max_seqlen_k, window_size):
 
 
 def masked_attention(q, k, v, visible, upcast, softmax_scale):
+    global longest_keys
+    longest_keys = visible.shape[-1]
     out_dtype = torch.float32 if upcast else q.dtype
     q, k, v = (x.float() if upcast else x.clone(memory_format=torch.contiguous_format) for x in (q, k, v))
     batch, seqlen_q, heads, head_dim = q.shape
@@ -41,10 +44,55 @@ def masked_attention(q, k, v, visible, upcast, softmax_scale):
     return out.to(out_dtype), lse
 
 
+def aligned(tensor):
+    if tensor.is_contiguous() and tensor.data_ptr() % 16 == 0:
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
+
+
+class FlashAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, cu_q, cu_k, max_q, max_k, window, scale):
+        out, lse, seed, offset, _ = torch.ops.aten._flash_attention_forward(
+            q, k, v, cu_q, cu_k, max_q, max_k, 0.0, False, False,
+            scale=scale, window_size_left=window[0], window_size_right=window[1],
+        )
+        ctx.save_for_backward(q, k, v, out, lse, cu_q, cu_k, seed, offset)
+        ctx.arguments = (max_q, max_k, window, scale)
+        return out, lse
+
+    @staticmethod
+    def backward(ctx, dout, _):
+        q, k, v, out, lse, cu_q, cu_k, seed, offset = ctx.saved_tensors
+        max_q, max_k, window, scale = ctx.arguments
+        gradients = torch.ops.aten._flash_attention_backward(
+            aligned(dout), q, k, v, out, lse, cu_q, cu_k, max_q, max_k, 0.0, False, seed, offset,
+            scale=scale, window_size_left=window[0], window_size_right=window[1],
+        )
+        return (*gradients, None, None, None, None, None, None)
+
+
+def flash_expresses(window, max_q, max_k):
+    # FlashAttention-2 replaces the right bound of a window with a left bound by max_k when the right bound is open or
+    # at least max_k. Bottom-right alignment then hides keys from the first rows of a query longer than max_k + 1.
+    left, right = window
+    return left < 0 or 0 <= right < max_k or max_q <= max_k + 1
+
+
+def flash_attention(q, k, v, cu_q, cu_k, max_q, max_k, window, scale):
+    global longest_keys
+    longest_keys = max_k
+    out, lse = FlashAttention.apply(*map(aligned, (q, k, v)), cu_q, cu_k, max_q, max_k, window, scale)
+    # FlashAttention-2 gives a row without visible keys a logsumexp of +inf.
+    return out, lse.masked_fill(lse == float("inf"), FULLY_MASKED_LSE)
+
+
 def attention_ref(q, k, v, *, causal=False, window_size=(-1, -1), upcast=True, softmax_scale=None):
     if causal:
         window_size = (window_size[0], 0)
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    if not upcast and flash_expresses(window_size, seqlen_q, seqlen_k):
+        return flash_attention(q, k, v, None, None, seqlen_q, seqlen_k, window_size, softmax_scale)
     lengths_q = torch.full((1,), seqlen_q, device=q.device)
     lengths_k = torch.full((1,), seqlen_k, device=q.device)
     visible = visible_keys(lengths_q, lengths_k, seqlen_q, seqlen_k, window_size)
@@ -69,6 +117,9 @@ def varlen_attention_ref(
     lengths_q, lengths_k = cu_q[1:] - cu_q[:-1], cu_k[1:] - cu_k[:-1]
     count, heads = len(lengths_q), q.shape[1]
     max_seqlen_q, max_seqlen_k = max(int(lengths_q.max()), 1), max(int(lengths_k.max()), 1)
+    if not upcast and flash_expresses(window_size, max_seqlen_q, max_seqlen_k):
+        cu_device = [on_device(cu.int(), q.device) for cu in (cu_q, cu_k)]
+        return flash_attention(q, k, v, *cu_device, max_seqlen_q, max_seqlen_k, window_size, softmax_scale)
     rows_q = on_device(sequence_rows(torch.arange(count) * max_seqlen_q, lengths_q), q.device)
     rows_k = on_device(sequence_rows(torch.arange(count) * max_seqlen_k, lengths_k), q.device)
 
