@@ -20,6 +20,8 @@ const tile_scheduler = @import("tile_scheduler.zig");
 const Chunk = fragments.Chunk;
 const Mbarrier = nvptx.Mbarrier;
 
+const NamedBarrier = enum(u4) { pivot_exchange = 2 };
+
 pub fn FlashAttnBwdSm100Dq(comptime tiling: configurations.Sm100BwdTiling) type {
     const head_dim = tiling.head_dim;
     const padded = tiling.headDimPadded();
@@ -87,6 +89,13 @@ pub fn FlashAttnBwdSm100Dq(comptime tiling: configurations.Sm100BwdTiling) type 
             k: [half_keys * padded / 8]Chunk,
             v: [half_keys * padded / 8]Chunk,
             kt: [key_rows * half_columns / 8]Chunk,
+            pivot_sums: [compute_groups][query_rows]f32,
+            pivot_keys: [compute_groups][query_rows]i32,
+        };
+
+        const RowPivot = struct {
+            sum: f32,
+            key: i32,
         };
 
         comptime {
@@ -387,15 +396,72 @@ pub fn FlashAttnBwdSm100Dq(comptime tiling: configurations.Sm100BwdTiling) type 
             interior: bool,
             lower: i32,
             upper: i32,
-        ) void {
+        ) f32x2.Pair {
             const dp = tcgen05.loadPieces(pieces, dp_address);
             tcgen05.waitLoad();
+            var sum = f32x2.splat(0);
             inline for (0..pieces) |piece_index| {
                 const piece: u32 = piece_index;
                 const words =
                     dsPiece(piece, probabilities, dp, dpsum_negated, interior, lower, upper);
                 tcgen05.store(dp_address + piece * 16, words);
+                sum = f32x2.addKeepingSubnormals(sum, f32x2.sumBf16(words));
             }
+            return sum;
+        }
+
+        fn takePivot(probabilities: *Scores, first_key: i32, pivot_key: *i32) void {
+            inline for (0..keys_per_compute_group) |column| {
+                if (probabilities[column] > fragments.pivot_probability) {
+                    pivot_key.* = first_key + @as(i32, column);
+                    probabilities[column] = 0;
+                }
+            }
+        }
+
+        fn shareRowPivot(partial: RowPivot) RowPivot {
+            const row = thread.warp() % 4 * 32 + thread.lane();
+            tiles.pivot_sums[columnGroup()][row] = partial.sum;
+            tiles.pivot_keys[columnGroup()][row] = partial.key;
+            nvptx.barrierSyncAligned(NamedBarrier.pivot_exchange, compute_warps * 32);
+            return .{
+                .sum = tiles.pivot_sums[0][row] + tiles.pivot_sums[1][row],
+                .key = @max(tiles.pivot_keys[0][row], tiles.pivot_keys[1][row]),
+            };
+        }
+
+        fn addPivotTerm(
+            params: BackwardParams,
+            work: Work,
+            values: @Vector(32, f32),
+            comptime piece: u32,
+            pivot: RowPivot,
+        ) @Vector(32, f32) {
+            const keys: [*]addrspace(.global) const Chunk = @ptrFromInt(params.k);
+            const column = columnGroup() * half_columns + piece * 32;
+            const element = work.batch * params.k_batch_stride +
+                @as(u64, @intCast(pivot.key)) * params.k_row_stride +
+                work.kv_head * params.k_head_stride + column;
+            // `pivot.sum` can be an FP32 subnormal number, and `fma.ftz` flushes subnormal inputs
+            // to zero (PTX ISA, fma).
+            const weight = f32x2.splat(-pivot.sum);
+            var result = values;
+            inline for (0..4) |chunk| {
+                if (column + chunk * 8 < head_dim) {
+                    const words = keys[element / 8 + chunk];
+                    inline for (0..4) |word| {
+                        const first = chunk * 8 + word * 2;
+                        const value = f32x2.fmaKeepingSubnormals(
+                            weight,
+                            f32x2.widenBf16(words[word]),
+                            .{ result[first], result[first + 1] },
+                        );
+                        result[first] = value[0];
+                        result[first + 1] = value[1];
+                    }
+                }
+            }
+            return result;
         }
 
         fn storeDq(
@@ -403,9 +469,14 @@ pub fn FlashAttnBwdSm100Dq(comptime tiling: configurations.Sm100BwdTiling) type 
             args: Args,
             work: Work,
             query: u32,
-            values: @Vector(32, f32),
+            accumulated: @Vector(32, f32),
             comptime piece: u32,
+            pivot: RowPivot,
         ) void {
+            const values = if (pivot.key >= 0)
+                addPivotTerm(params, work, accumulated, piece, pivot)
+            else
+                accumulated;
             const out: [*]addrspace(.global) Chunk = @ptrFromInt(args.dq);
             const element = work.batch * args.dq_batch_stride +
                 @as(u64, work.sequence.offset_q + query) * args.dq_row_stride +
@@ -428,7 +499,14 @@ pub fn FlashAttnBwdSm100Dq(comptime tiling: configurations.Sm100BwdTiling) type 
             }
         }
 
-        fn epilogueDq(params: BackwardParams, args: Args, work: Work, query: u32, count: u32) void {
+        fn epilogueDq(
+            params: BackwardParams,
+            args: Args,
+            work: Work,
+            query: u32,
+            count: u32,
+            pivot: RowPivot,
+        ) void {
             const valid = query < work.sequence.seqlen_q;
             if (count > 0) {
                 mbarrier.wait(.cta, &dq_full, 0);
@@ -444,7 +522,7 @@ pub fn FlashAttnBwdSm100Dq(comptime tiling: configurations.Sm100BwdTiling) type 
                     ),
                 ) else @as(@Vector(tcgen05.piece_columns, f32), @splat(0));
                 if (count > 0) tcgen05.waitLoad();
-                if (valid) storeDq(params, args, work, query, values, piece);
+                if (valid) storeDq(params, args, work, query, values, piece, pivot);
             }
         }
 
@@ -464,6 +542,8 @@ pub fn FlashAttnBwdSm100Dq(comptime tiling: configurations.Sm100BwdTiling) type 
                 if (valid) work.block_info.colLimitLeft(@intCast(query)) else seqlen_k;
             const col_limit_right = work.block_info.colLimitRight(@intCast(query));
             const count = work.n_block_max - work.n_block_min;
+            var pivot_sum = f32x2.splat(0);
+            var pivot_key: i32 = -1;
             const s_address = tcgen05.warpAddress(tmem_base, s_column + columnGroup() *
                 keys_per_compute_group);
             const dp_address = tcgen05.warpAddress(tmem_base, dp_column + columnGroup() *
@@ -485,14 +565,29 @@ pub fn FlashAttnBwdSm100Dq(comptime tiling: configurations.Sm100BwdTiling) type 
                 var probabilities =
                     f32x2.exponentiate(scores, lse_negated, params.softmax_scale_log2);
                 if (!interior) @import("mask.zig").maskR2p(&probabilities, lower, upper, 0);
+                if (f32x2.warpHasPivot(probabilities)) takePivot(
+                    &probabilities,
+                    @intCast(work.sequence.offset_k + @as(u32, @intCast(key0))),
+                    &pivot_key,
+                );
                 mbarrier.wait(.cta, &dp_full, index);
                 tcgen05.fenceAfterSync();
-                computeDs(probabilities, dp_address, dpsum_negated, interior, lower, upper);
+                pivot_sum = f32x2.addKeepingSubnormals(
+                    pivot_sum,
+                    computeDs(probabilities, dp_address, dpsum_negated, interior, lower, upper),
+                );
                 tcgen05.waitStore();
                 tcgen05.fenceBeforeSync();
                 mbarrier.arrive(.leader_cta, &ds_ready);
             }
-            epilogueDq(params, args, work, query, count);
+            const pivot = shareRowPivot(.{ .sum = pivot_sum[0] + pivot_sum[1], .key = pivot_key });
+            if (valid and columnGroup() == 0) {
+                const sums: [*]addrspace(.global) f32 = @ptrFromInt(params.pivot_sum);
+                const keys: [*]addrspace(.global) i32 = @ptrFromInt(params.pivot_key);
+                sums[vector] = pivot.sum * BackwardParams.pivot_sum_scale;
+                keys[vector] = pivot.key;
+            }
+            epilogueDq(params, args, work, query, count, pivot);
         }
 
         pub fn runCompute(params: BackwardParams, args: Args) void {

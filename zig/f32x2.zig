@@ -1,5 +1,9 @@
-const nvptx = @import("std").nvptx;
+const std = @import("std");
+const nvptx = std.nvptx;
 const maskR2p = @import("mask.zig").maskR2p;
+const thread = @import("thread.zig");
+const Chunk = @import("fragments.zig").Chunk;
+const pivot_probability = @import("fragments.zig").pivot_probability;
 
 pub const Pair = @Vector(2, f32);
 
@@ -11,8 +15,16 @@ pub fn fma(a: Pair, b: Pair, c: Pair) Pair {
     return nvptx.math.fmaF32x2(.nearest_even, true, a, b, c);
 }
 
+pub fn fmaKeepingSubnormals(a: Pair, b: Pair, c: Pair) Pair {
+    return nvptx.math.fmaF32x2(.nearest_even, false, a, b, c);
+}
+
 pub fn add(a: Pair, b: Pair) Pair {
     return nvptx.math.addF32x2(.nearest_even, true, a, b);
+}
+
+pub fn addKeepingSubnormals(a: Pair, b: Pair) Pair {
+    return nvptx.math.addF32x2(.nearest_even, false, a, b);
 }
 
 pub fn mul(a: Pair, b: Pair) Pair {
@@ -118,4 +130,90 @@ pub fn quadAt(
 ) @Vector(4, @typeInfo(@TypeOf(values)).vector.child) {
     const first = index * 4;
     return .{ values[first], values[first + 1], values[first + 2], values[first + 3] };
+}
+
+pub fn largest(values: anytype) f32 {
+    const count = @typeInfo(@TypeOf(values)).vector.len;
+    var level: [count]f32 = values;
+    comptime var remaining = count;
+    inline while (remaining > 1) {
+        const next = (remaining + 2) / 3;
+        inline for (0..next) |index| {
+            const first = 3 * index;
+            level[index] = if (first + 2 < remaining)
+                max3(level[first], level[first + 1], level[first + 2])
+            else if (first + 1 < remaining)
+                @max(level[first], level[first + 1])
+            else
+                level[first];
+        }
+        remaining = next;
+    }
+    return level[0];
+}
+
+pub fn warpHasPivot(probabilities: anytype) bool {
+    return nvptx.voteSync(.any, largest(probabilities) > pivot_probability, .all);
+}
+
+pub fn excludePivots(probabilities: anytype, keys: [*]addrspace(.global) i32, key: i32) void {
+    inline for (0..@typeInfo(@TypeOf(probabilities.*)).vector.len) |column| {
+        if (probabilities[column] > pivot_probability) {
+            keys[column] = key;
+            probabilities[column] = 0;
+        }
+    }
+}
+
+pub fn widenBf16(word: u32) Pair {
+    return nvptx.Bf16x2.toF32(@fromBackingInt(word));
+}
+
+pub fn sumBf16(words: anytype) Pair {
+    const count = @typeInfo(@TypeOf(words)).vector.len;
+    var level: [count]Pair = undefined;
+    inline for (0..count) |word| level[word] = widenBf16(words[word]);
+    comptime var remaining = count;
+    inline while (remaining > 1) {
+        const next = (remaining + 1) / 2;
+        inline for (0..remaining / 2) |index| {
+            level[index] = addKeepingSubnormals(level[2 * index], level[2 * index + 1]);
+        }
+        if (remaining % 2 == 1) level[next - 1] = level[remaining - 1];
+        remaining = next;
+    }
+    return level[0];
+}
+
+/// Returns, in each lane, the sum over the rows of the BF16 column `chunk * 8 + thread.lane() / 4`
+/// of a tile with 128-byte rows that stores logical chunk `c` of row `r` at chunk `c ^ r % 8`.
+/// The caller passes the same `chunk` in lanes that differ only in bits 2 to 4 of `thread.lane()`.
+pub fn swizzledColumnSum(tile: anytype, chunk: u32) f32 {
+    const rows = @typeInfo(@TypeOf(tile.*)).array.len / 8;
+    const slice = thread.lane() / 4;
+    // Quarter warp q reads rows q and q + 4 of each group of 8 rows, so that the 16-byte loads of
+    // its 8 lanes touch 8 different groups of 4 banks.
+    const row = slice % 2 * 4 + slice / 2;
+    var sums: [4]Pair = @splat(splat(0));
+    inline for (0..rows / 8) |pass| {
+        const words: Chunk = tile[(pass * 8 + row) * 8 + (chunk ^ row)];
+        inline for (0..4) |word| {
+            sums[word] = addKeepingSubnormals(sums[word], widenBf16(words[word]));
+        }
+    }
+    var level: [8]f32 = undefined;
+    inline for (0..4) |word| {
+        level[2 * word] = sums[word][0];
+        level[2 * word + 1] = sums[word][1];
+    }
+    const clamp: nvptx.ShuffleClamp = .{ .clamp = 31, .segment_mask = 0 };
+    inline for (.{ 16, 8, 4 }, .{ 4, 2, 1 }) |offset, half| {
+        const upper = thread.lane() & offset != 0;
+        inline for (0..half) |index| {
+            const kept = if (upper) level[index + half] else level[index];
+            const sent = if (upper) level[index] else level[index + half];
+            level[index] = kept + nvptx.shflSync(.bfly, f32, sent, offset, clamp, .all);
+        }
+    }
+    return level[0];
 }

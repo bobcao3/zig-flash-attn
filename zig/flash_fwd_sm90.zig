@@ -59,7 +59,6 @@ pub fn FlashAttnFwdSm90(
         tile_scheduler.PersistentScheduler(tiling.scheduling_mode, .{ .axis = .x, .ctas = 1 });
     const rescale_o_before_gemm = tiling.rescale_o_before_gemm;
     const use_scheduler_barrier = tiling.use_scheduler_barrier;
-    const intra_wg_overlap = tiling.intra_wg_overlap;
     const producer_registers: u32, const consumer_registers: u32 =
         configurations.registerRequirements(tiling.consumerGroups());
 
@@ -234,28 +233,96 @@ pub fn FlashAttnFwdSm90(
             wgmma.commit();
         }
 
-        fn exponentiate(
-            softmax: *Online,
+        fn scoreFragments(
             scores: wgmma.Accumulator(block_n),
             masked: bool,
             n_block: u32,
             limits: ColLimits,
-            softmax_scale_log2: f32,
-        ) Online.Exponentials {
-            var score_fragments: [block_n / 8]Accumulator = undefined;
+        ) Online.Scores {
+            var score_fragments: Online.Scores = undefined;
             inline for (&score_fragments, 0..) |*fragment, tile| {
                 fragment.* = .{
                     scores[tile * 4],     scores[tile * 4 + 1],
                     scores[tile * 4 + 2], scores[tile * 4 + 3],
                 };
             }
-            if (intra_wg_overlap and !masked) return Online.exponentials(
-                softmax,
+            if (masked) applyMask(&score_fragments, n_block * block_n, limits, -std.math.inf(f32));
+            return score_fragments;
+        }
+
+        const SoftmaxBlock = struct {
+            exponentials: Online.Exponentials,
+            probabilities: Online.Probabilities,
+        };
+
+        fn softmaxBlock(
+            comptime leaves_out_max: bool,
+            comptime waits: bool,
+            softmax: *Online,
+            decision: Online.Raise,
+            score_fragments: Online.Scores,
+            softmax_scale_log2: f32,
+            output: *wgmma.Accumulator(columns),
+            values_empty: *addrspace(.shared) nvptx.Mbarrier,
+        ) SoftmaxBlock {
+            const exponentials = softmax.exponentialsAfter(
+                leaves_out_max,
+                decision,
                 score_fragments,
                 softmax_scale_log2,
             );
-            if (masked) applyMask(&score_fragments, n_block * block_n, limits, -std.math.inf(f32));
-            return Online.exponentials(softmax, score_fragments, softmax_scale_log2);
+            if (waits) {
+                wgmma.wait(0);
+                wgmma.fenceOperand(output);
+                mbarrier.arrive(.thread, values_empty);
+            }
+            return .{
+                .exponentials = exponentials,
+                .probabilities = Online.pack(exponentials.values),
+            };
+        }
+
+        fn exponentiate(
+            comptime waits: bool,
+            softmax: *Online,
+            scores: wgmma.Accumulator(block_n),
+            masked: bool,
+            n_block: u32,
+            limits: ColLimits,
+            softmax_scale_log2: f32,
+            output: *wgmma.Accumulator(columns),
+            values_empty: *addrspace(.shared) nvptx.Mbarrier,
+            raise_vote: nvptx.NamedBarrier,
+        ) SoftmaxBlock {
+            const score_fragments = scoreFragments(scores, masked, n_block, limits);
+            const decision = softmax.raise(score_fragments, softmax_scale_log2);
+            // All threads of a warpgroup must execute the same `wgmma.wait_group` (PTX ISA
+            // 9.7.17.7.3), so the branch that waits takes the vote of the whole warpgroup.
+            const raised = if (waits) nvptx.barrierRedAligned(
+                .@"or",
+                raise_vote,
+                warps_per_group * 32,
+                decision.raised,
+            ) else decision.raised;
+            return if (raised) softmaxBlock(
+                true,
+                waits,
+                softmax,
+                decision,
+                score_fragments,
+                softmax_scale_log2,
+                output,
+                values_empty,
+            ) else softmaxBlock(
+                false,
+                waits,
+                softmax,
+                decision,
+                score_fragments,
+                softmax_scale_log2,
+                output,
+                values_empty,
+            );
         }
 
         fn rescaleOutput(
@@ -287,6 +354,8 @@ pub fn FlashAttnFwdSm90(
             const turn: nvptx.NamedBarrier = @fromBackingInt(@intCast(1 + group));
             const successor: nvptx.NamedBarrier =
                 @fromBackingInt(@intCast(1 + (group + 1) % tiling.consumerGroups()));
+            const raise_vote: nvptx.NamedBarrier =
+                @fromBackingInt(@intCast(2 + tiling.consumerGroups() + group));
             const scheduler_barrier_threads = 2 * warps_per_group * 32;
             if (use_scheduler_barrier and group == 0) nvptx.barrierArriveAligned(
                 turn,
@@ -327,15 +396,20 @@ pub fn FlashAttnFwdSm90(
                     wgmma.fenceOperand(&scores);
                     mbarrier.arrive(.thread, &k_empty[stage]);
                     if (count == 1) mbarrier.arrive(.thread, &q_empty);
-                    var exponentials = exponentiate(
+                    const first = exponentiate(
+                        false,
                         &softmax,
                         scores,
                         work.needsMask(work.n_block_min),
                         work.n_block_min,
                         limits,
                         params.softmax_scale_log2,
+                        &output,
+                        &v_empty[stage],
+                        raise_vote,
                     );
-                    var probabilities = Online.pack(exponentials.values);
+                    var exponentials = first.exponentials;
+                    var probabilities = first.probabilities;
                     var previous_stage = stage;
                     var previous_phase = phase;
                     const phase_masks: []const ?bool =
@@ -390,18 +464,20 @@ pub fn FlashAttnFwdSm90(
                             wgmma.fenceOperand(&scores);
                             mbarrier.arrive(.thread, &k_empty[stage]);
                             if (index + 1 == count) mbarrier.arrive(.thread, &q_empty);
-                            exponentials = exponentiate(
+                            const block = exponentiate(
+                                true,
                                 &softmax,
                                 scores,
                                 masked_block,
                                 n_block,
                                 limits,
                                 params.softmax_scale_log2,
+                                &output,
+                                &v_empty[previous_stage],
+                                raise_vote,
                             );
-                            wgmma.wait(0);
-                            wgmma.fenceOperand(&output);
-                            mbarrier.arrive(.thread, &v_empty[previous_stage]);
-                            probabilities = Online.pack(exponentials.values);
+                            exponentials = block.exponentials;
+                            probabilities = block.probabilities;
                             if (!rescale_o_before_gemm) rescaleOutput(&output, exponentials);
                             previous_stage = stage;
                             previous_phase = phase;

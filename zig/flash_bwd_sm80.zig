@@ -22,6 +22,7 @@ const RowPair = fragments.RowPair;
 const chunk_elements = configurations.Sm80FwdTiling.chunk_elements;
 
 const vector_reductions = nvptx.gpu.sm >= 90;
+const pivot_probability = fragments.pivot_probability;
 /// Without vector reductions, the backward adds each query gradient value with its own reduction,
 /// and the fragment order of `dq_accum` lets each of those reductions cover 32 consecutive floats.
 pub const fragment_ordered_dq_accum = !vector_reductions;
@@ -690,20 +691,154 @@ pub fn FlashAttnBwdSm80(
             return result;
         }
 
-        pub fn storePdS(probabilities: Probabilities, operands: *const Operands) void {
+        const Words = [score_rows][columns_per_warp / 8]@Vector(2, u32);
+
+        /// Holds the share of a lane in the dS row sums of a step, times
+        /// `BackwardParams.pivot_sum_scale`, and whether the lane cleared the dS of a pivot key.
+        pub const PivotSums = struct {
+            totals: [score_rows]f32,
+            has_pivot: bool,
+        };
+
+        /// A probability, which is not negative, is a pivot when its BF16 bit pattern exceeds
+        /// `pivot_bits`. Unless the probability is NaN, this holds exactly when its BF16 value
+        /// exceeds `pivot_probability`.
+        const pivot_bits: u32 = @as(u32, @bitCast(pivot_probability)) >> 16;
+        /// Adding `pivot_bias` to two BF16 numbers with clear sign bits sets bit 15 or 31 for each
+        /// one whose bit pattern exceeds `pivot_bits`, without a carry between the halves.
+        const pivot_bias: u32 = (0x7fff - pivot_bits) * 0x1_0001;
+
+        comptime {
+            std.debug.assert(@as(u32, @bitCast(pivot_probability)) & 0xffff == 0);
+        }
+
+        /// Stores P and dS to shared memory, with the dS of each pivot key cleared, and returns
+        /// the row sums of the stored dS. The postprocess adds the products of the cleared dS,
+        /// which equals the negated row sum.
+        pub fn storePdS(computed: Probabilities, operands: *const Operands) PivotSums {
+            var ds = computed.ds;
+            var flags: u32 = 0;
+            inline for (&ds, computed.p) |*row_ds, row_p| {
+                inline for (row_ds, row_p) |*words, p| {
+                    inline for (0..2) |half| {
+                        const biased = p[half] +% pivot_bias;
+                        flags |= biased;
+                        // The selector 0xbb99 replicates bit 15 over the low half and bit 31 over
+                        // the high half (PTX ISA 9.7.10.7).
+                        words[half] &= ~nvptx.math.prmt(null, biased, 0, 0xbb99);
+                    }
+                }
+            }
+            storeTile(Storage.pTile(), computed.p, operands);
+            storeTile(Storage.dsTile(), ds, operands);
+            return .{ .totals = rowSums(ds), .has_pivot = flags & 0x8000_8000 != 0 };
+        }
+
+        fn storeTile(destination: anytype, words: Words, operands: *const Operands) void {
             const word = thread.lane() % 4;
-            inline for (0..score_rows * columns_per_warp / 8) |index| {
-                const row_tile = index / (columns_per_warp / 8);
-                const tile = index % (columns_per_warp / 8);
-                inline for (.{ Storage.pTile(), Storage.dsTile() }, .{
-                    probabilities.p[row_tile][tile], probabilities.ds[row_tile][tile],
-                }) |destination, pair| {
+            inline for (words, 0..) |row_words, row_tile| {
+                inline for (row_words, 0..) |pair, tile| {
                     inline for (0..2) |half| {
                         const row = row_tile * 16 + half * 8;
-                        const words: [*]addrspace(.shared) u32 =
+                        const shared_words: [*]addrspace(.shared) u32 =
                             @ptrCast(operands.pds_store.chunk(destination, row, tile));
-                        words[word] = pair[half];
+                        shared_words[word] = pair[half];
                     }
+                }
+            }
+        }
+
+        /// Returns the share of this lane in the row sums of `ds`, times
+        /// `BackwardParams.pivot_sum_scale`. On SM120, the kernels that load with the tensor
+        /// memory accelerator run faster when they add the values, and the others run faster with
+        /// matrix multiplies: the words of two adjacent 8-column tiles form the A fragment of a
+        /// product with 16 columns (PTX ISA 9.7.16.5.8), and a B fragment whose elements all equal
+        /// the scale gives the scaled sums of the rows.
+        fn rowSums(ds: Words) [score_rows]f32 {
+            const odd = thread.lane() % 2 == 1;
+            const scale = BackwardParams.pivot_sum_scale;
+            var totals: [score_rows]f32 = undefined;
+            inline for (ds, &totals) |row_ds, *total| {
+                if (tiling.tma) {
+                    var sums: RowPair = undefined;
+                    inline for (0..2) |half| {
+                        var values: [columns_per_warp / 4]f32 = undefined;
+                        inline for (row_ds, 0..) |words, tile| {
+                            const pair = nvptx.Bf16x2.toF32(@fromBackingInt(words[half]));
+                            values[2 * tile] = pair[0];
+                            values[2 * tile + 1] = pair[1];
+                        }
+                        comptime var width = values.len;
+                        inline while (width > 1) : (width = (width + 1) / 2) {
+                            inline for (0..width / 2) |index| {
+                                values[index] = values[2 * index] + values[2 * index + 1];
+                            }
+                            if (width % 2 == 1) values[width / 2] = values[width - 1];
+                        }
+                        sums[half] = values[0];
+                    }
+                    const row_sums = fragments.quadAllreduce(.sum, sums);
+                    total.* = (if (odd) row_sums[1] else row_sums[0]) * scale;
+                } else {
+                    const scales = @backingInt(nvptx.Bf16x2.fromF32(scale, scale));
+                    var sums: Accumulator = @splat(0);
+                    inline for (0..columns_per_warp / 16) |pair| {
+                        const left = row_ds[2 * pair];
+                        const right = row_ds[2 * pair + 1];
+                        sums = nvptx.mmaSync(
+                            fragments.mma_m16n8k16,
+                            @Vector(4, u32){ left[0], left[1], right[0], right[1] },
+                            @Vector(2, u32){ scales, scales },
+                            sums,
+                        );
+                    }
+                    total.* = if (odd) sums[2] else sums[0];
+                }
+            }
+            return totals;
+        }
+
+        /// Stores the flat rows of the pivot keys of the step in `pivot_key` and adds the row sums
+        /// to `pivot_sum`. The kernel reads the probabilities back from shared memory, where they
+        /// stay until the next step stores its own.
+        pub fn finishPivots(
+            params: BackwardParams,
+            work: *const Work,
+            step: Step,
+            operands: *const Operands,
+            sums: PivotSums,
+        ) void {
+            const warp_m = thread.warp() % warps_m;
+            const lane = thread.lane();
+            const first_row = step.block_info.first_row + warp_m * 16 * score_rows + lane / 4;
+            const base = work.batch * params.lse_batch_stride + step.head * params.lse_head_stride +
+                work.sequence.offset_q;
+            if (nvptx.voteSync(.any, sums.has_pivot, .all)) {
+                const first_column = work.sequence.offset_k + work.first_key +
+                    thread.warp() / warps_m * columns_per_warp + lane % 4 * 2;
+                const keys: [*]addrspace(.global) i32 = @ptrFromInt(params.pivot_key);
+                inline for (0..score_rows * 2) |half_tile| {
+                    const local_row = half_tile * 8;
+                    var key: i32 = -1;
+                    inline for (0..columns_per_warp / 8) |tile| {
+                        const shared_words: [*]addrspace(.shared) const u32 = @ptrCast(
+                            operands.pds_store.chunk(Storage.pTile(), local_row, tile),
+                        );
+                        const p = shared_words[lane % 4];
+                        const column: i32 = @intCast(first_column + tile * 8);
+                        if ((p & 0xffff) > pivot_bits) key = column;
+                        if ((p >> 16) > pivot_bits) key = column + 1;
+                    }
+                    const row = first_row + local_row;
+                    if (key >= 0 and row < work.sequence.seqlen_q) keys[base + row] = key;
+                }
+            }
+            const pivot_sum: [*]addrspace(.global) f32 = @ptrFromInt(params.pivot_sum);
+            const sum_row = first_row + if (lane % 2 == 1) @as(u32, 8) else 0;
+            inline for (sums.totals, 0..) |total, row_tile| {
+                const row = sum_row + @as(u32, row_tile) * 16;
+                if (lane % 4 < 2 and row < work.sequence.seqlen_q and total != 0) {
+                    nvptx.red(.gpu, .monotonic, .add, &pivot_sum[base + row], total);
                 }
             }
         }
@@ -1047,7 +1182,8 @@ const auxiliary: flash_bwd_preprocess.Options = .{
 };
 
 const Entry = entry.Entry(BackwardParams, Backward.Args, .{
-    "q", "k", "v", "do", "lse_log2", "dpsum", "dq_accum", "dk", "dv",
+    "q",         "k",         "v",        "do", "lse_log2", "dpsum",
+    "pivot_sum", "pivot_key", "dq_accum", "dk", "dv",
 } ++ entry.backward_sequence ++ entry.strides("q") ++ entry.strides("k") ++ entry.strides("v") ++
     entry.strides("do") ++ entry.strides("dk") ++ entry.strides("dv") ++
     entry.strides("dq_accum") ++ .{ "lse_batch_stride", "lse_head_stride", "num_batch" } ++
@@ -1073,9 +1209,10 @@ comptime {
                 .name = "flash_attn_bwd_prepare_varlen_num_blocks",
             });
         }
-        if (variant.specialization.head_split) @export(
-            &flash_bwd_preprocess.flashAttnBwdClear,
-            .{ .name = "flash_attn_bwd_clear" },
+        @export(
+            &flash_bwd_postprocess.FlashAttnBwdFixDk(auxiliary).flashAttnBwdFixDk,
+            .{ .name = "flash_attn_bwd_fix_dk" },
         );
+        @export(&flash_bwd_preprocess.flashAttnBwdClear, .{ .name = "flash_attn_bwd_clear" });
     }
 }

@@ -1023,8 +1023,8 @@ pub fn FlashAttnFwdSm80(
                         nvptx.cache.store(caching, partial, fragment);
                     }
                     const state: Accumulator = .{
-                        rows_softmax.row_max[0], rows_softmax.row_max[1],
-                        rows_softmax.row_sum[0], rows_softmax.row_sum[1],
+                        rows_softmax.row_max[0],  rows_softmax.row_max[1],
+                        rows_softmax.rest_sum[0], rows_softmax.rest_sum[1],
                     };
                     nvptx.cache.store(caching, &own[state_slot + row_tile][lane], state);
                 }
@@ -1049,7 +1049,7 @@ pub fn FlashAttnFwdSm80(
                     const state = nvptx.cache.load(loading, &other[state_slot + row_tile][lane]);
                     const own_scale, const other_scale = rows_softmax.combine(.{
                         .row_max = .{ state[0], state[1] },
-                        .row_sum = .{ state[2], state[3] },
+                        .rest_sum = .{ state[2], state[3] },
                     }, params.softmax_scale_log2);
                     inline for (rows, 0..) |*fragment, chunk| {
                         const partial = &other[row_tile * row_chunks + chunk][lane];

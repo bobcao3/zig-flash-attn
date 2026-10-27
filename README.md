@@ -28,6 +28,56 @@ In `flash_attn_inter_sequence_func`, bit `j` of row `i` lets query sequence
 keys, as when extending a KV cache. It takes head dimensions 64, 128 and 256,
 and 512 without autograd.
 
+The lower-level `zigfa.backward` takes a workspace that the caller allocates.
+`zigfa.backward_workspace_shapes(q_shape, lse_shape, k_shape, window_size_left=-1,
+window_size_right=-1, *, cu_seqlens_shape=None, max_seqlen_q=None,
+max_seqlen_k=None)` returns the shapes of its buffers and requires `k_shape`,
+because the backward keeps the dK terms of keys whose probability exceeds 3/4 in
+a buffer sized by the keys. Allocate each shape as a `torch.float32` tensor on
+the device of `q` and pass the tensors as a tuple in the returned order. The
+number and the shapes of the buffers depend on the GPU, the shapes and the
+window, so do not unpack the tuple by position.
+
+## Numerics
+
+The kernels apply the fix of "A Fix for Softmax and Cross-Entropy" (Barron,
+Gnanapragasam and Tschannen) to attention. The forward leaves the exponential of
+a key that scores the stored maximum of its row out of the running sum of the
+row and adds it back as an exact 1, so the log-sum-exp of a row that puts almost
+all of its weight on one key keeps the small terms of the other keys. The SM100
+forward can leave out several keys that score the stored maximum and adds each
+of them back as an exact 1. During its pass over the keys of a row, the forward
+raises the stored maximum only when a score exceeds it by more than about
+8 / (softmax_scale * log2(e)), so the stored maximum can lie up to that amount
+below the largest score of the row. In a row whose other scores all lie more
+than that amount below its largest score, the key with the largest score is left
+out. In the backward, the score of a key whose probability exceeds 3/4 gets the
+negated sum of the other score gradients of its row as its gradient, which keeps
+dQ and dK accurate on such rows, for example rows dominated by an attention
+sink. The SM80, SM90 and SM120 backward kernels compare the probability
+rounded to BF16 with 3/4. Kernels that write dK in BF16 add the dK terms of
+such a key in a second pass, which can cost half a BF16 unit of the dK before
+those terms. The SM100 backward for head dimension 256 instead rounds the
+gradient of such a key to BF16 before it multiplies the gradient into dK, which
+costs less than one BF16 unit of each such term.
+
+A row that splits its weight over several keys with nearly equal scores has no
+such key and keeps the standard backward formula. The exponentials flush values
+below 2^-126 to zero, so the fix holds up to margins of about 87 - ln(n) nats
+when n keys carry the rest of the weight; the SM100 backward also flushes the
+products that form the gradients and loses accuracy a few nats earlier. In the
+forward, the exponential of a score can exceed that of the stored maximum by a
+factor of up to about 2^8. When the exponential of the stored maximum grows by a
+factor above 2^126, the factor that rescales the earlier sum flushes to zero and
+drops the terms of that sum, which lie below 2^-118 times the largest
+exponential of the row. The forward log-sum-exp therefore holds only up to
+margins of about 118 ln(2) - ln(n), or 82 - ln(n), nats. The SM100 forward
+computes some exponentials with a polynomial whose relative error reaches about
+9e-5. Any key that the SM100 forward does not leave out can carry that error in
+its exponential, so the SM100 log-sum-exp can be off by up to about 9e-5 * l'
+nats, where l' is the sum of the exponentials of those keys relative to the
+exponential of the stored maximum.
+
 ## Profiling
 
 Kernels built with `zig build -Dprofile`, or packaged with `ZIGFA_PROFILE=1`,

@@ -123,6 +123,8 @@ pub fn FlashAttnBwdPreprocess(comptime options: Options) type {
             lse: u64,
             lse_log2: u64,
             dpsum: u64,
+            pivot_sum: u64,
+            pivot_key: u64,
             dq_accum: u64,
             cu_seqlens_q: u64,
             seqlen_q: u32,
@@ -138,10 +140,13 @@ pub fn FlashAttnBwdPreprocess(comptime options: Options) type {
             dq_accum_row_stride: u64,
             dq_accum_head_stride: u64,
             num_batch: u32,
+            dk_states: u64,
+            dk_state_chunks: u32,
         ) callconv(.{ .nvptx_kernel = .{
             .required_work_group_size = .{ .x = auxiliary_threads },
         } }) void {
             if (options.pdl) nvptx.griddepcontrol(.launch_dependents);
+            clearGridChunks(dk_states, dk_state_chunks);
             const tile = rowTile(
                 preprocess_rows,
                 options.varlen_as_one_sequence,
@@ -196,12 +201,16 @@ pub fn FlashAttnBwdPreprocess(comptime options: Options) type {
                 const lse_in: [*]addrspace(.global) const f32 = @ptrFromInt(lse);
                 const lse_out: [*]addrspace(.global) f32 = @ptrFromInt(lse_log2);
                 const sum_out: [*]addrspace(.global) f32 = @ptrFromInt(dpsum);
+                const pivot_sums: [*]addrspace(.global) f32 = @ptrFromInt(pivot_sum);
+                const pivot_keys: [*]addrspace(.global) i32 = @ptrFromInt(pivot_key);
                 if (elect.groupLeader(preprocess_lanes)) {
                     const value = lse_in[index];
                     lse_out[index] =
                         if (value == -std.math.inf(f32)) -std.math.inf(f32) else value *
                         -std.math.log2e;
                     sum_out[index] = -sum;
+                    pivot_sums[index] = 0;
+                    pivot_keys[index] = -1;
                 }
                 if (options.clear_dq_accum) {
                     const zeros: [*]addrspace(.global) Chunk = @ptrFromInt(dq_accum);
@@ -225,6 +234,15 @@ pub fn FlashAttnBwdPreprocess(comptime options: Options) type {
             }
         }
     };
+}
+
+fn clearGridChunks(pointer: u64, chunks: u32) void {
+    const zeros: [*]addrspace(.global) Chunk = @ptrFromInt(pointer);
+    const blocks = nvptx.nctaid(0) * nvptx.nctaid(1) * nvptx.nctaid(2);
+    const block = @workGroupId(0) +
+        nvptx.nctaid(0) * (@workGroupId(1) + nvptx.nctaid(1) * @workGroupId(2));
+    var index = block * auxiliary_threads + thread.id();
+    while (index < chunks) : (index += blocks * auxiliary_threads) zeros[index] = @splat(0);
 }
 
 pub fn flashAttnBwdClear(accumulator: u64, chunks: u32) callconv(.{ .nvptx_kernel = .{

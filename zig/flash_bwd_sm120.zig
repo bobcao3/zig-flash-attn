@@ -20,7 +20,7 @@ const auxiliary: flash_bwd_preprocess.Options = .{
 
 const bulk = backward_tiling.bulk_reduce;
 const Entry = entry.Entry(BackwardParams, Backward.Args, .{ "q_map", "k_map", "v_map", "do_map" } ++
-    (if (bulk) .{"dq_accum_map"} else .{}) ++ .{ "lse_log2", "dpsum" } ++
+    (if (bulk) .{"dq_accum_map"} else .{}) ++ .{ "lse_log2", "dpsum", "pivot_sum", "pivot_key" } ++
     (if (bulk) .{} else .{"dq_accum"}) ++ .{ "dk", "dv" } ++ entry.backward_sequence ++
     entry.strides("dk") ++ entry.strides("dv") ++ (if (bulk) .{} else entry.strides("dq_accum")) ++
     .{ "lse_batch_stride", "lse_head_stride", "num_batch" } ++
@@ -45,9 +45,10 @@ comptime {
                 .name = "flash_attn_bwd_prepare_varlen_num_blocks",
             });
         }
-        if (variant.specialization.head_split) @export(
-            &flash_bwd_preprocess.flashAttnBwdClear,
-            .{ .name = "flash_attn_bwd_clear" },
+        @export(
+            &flash_bwd_postprocess.FlashAttnBwdFixDk(auxiliary).flashAttnBwdFixDk,
+            .{ .name = "flash_attn_bwd_fix_dk" },
         );
+        @export(&flash_bwd_preprocess.flashAttnBwdClear, .{ .name = "flash_attn_bwd_clear" });
     }
 }

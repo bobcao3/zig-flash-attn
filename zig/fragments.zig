@@ -20,6 +20,15 @@ pub const mma_m16n8k8: nvptx.matrix.MmaOptions = .{
 
 pub const rescale_threshold = 8.0;
 
+/// The probabilities of a query row sum to 1, so at most one key of a row, the pivot, has a
+/// probability above `pivot_probability`. The backward kernels sum the BF16 dS of the other keys of
+/// the row and leave that sum, times `BackwardParams.pivot_sum_scale`, in `pivot_sum`. The dS of
+/// the pivot is the negated sum of those dS, which a kernel that reads `pivot_sum` obtains as the
+/// negated value of `pivot_sum` divided by that scale. Taking the dS of the pivot from the other dS
+/// avoids the cancellation of P (dP - D) for P near 1. A row that splits its probability over keys
+/// with nearly equal scores has no pivot.
+pub const pivot_probability: f32 = 0.75;
+
 pub fn exp2(x: anytype) @TypeOf(x) {
     var result: @TypeOf(x) = undefined;
     inline for (0..@typeInfo(@TypeOf(x)).vector.len) |i| {
@@ -102,16 +111,52 @@ pub fn quadAllreduce(comptime op: enum { max, sum }, x: RowPair) RowPair {
     };
 }
 
+/// Returns whether this lane is the lowest lane of its quad whose predicate holds. Bit i of the
+/// ballot holds the predicate of lane i (PTX ISA, vote).
+fn firstInQuad(predicate: bool) bool {
+    const lane = thread.lane();
+    const own = @as(u32, 1) << @intCast(lane % 4);
+    const quad = nvptx.voteBallotSync(predicate, .all) >> @intCast(lane & 28);
+    return quad & (2 * own - 1) == own;
+}
+
+/// Returns log2(1 + x) for 0 <= x < 1/16 from the terms of the series of ln(1 + x) up to x^6.
+fn log2p1Series(x: f32) f32 {
+    var series: f32 = -1.0 / 6.0;
+    inline for (.{ 1.0 / 5.0, -1.0 / 4.0, 1.0 / 3.0, -1.0 / 2.0, 1.0 }) |coefficient| {
+        series = @mulAdd(f32, series, x, coefficient);
+    }
+    return std.math.log2e * (x * series);
+}
+
+/// Returns log2(2^exponent + rest) for rest >= 0, given the f32 sum `total` of 2^exponent and
+/// `rest`. For `rest` below 1/16, the result exponent + log2(1 + rest) keeps the relative accuracy
+/// of `rest`, which `total` loses, and differs from log2(2^exponent + rest) by about
+/// |exponent| * rest / (1 + rest).
+pub fn log2Sum(exponent: f32, rest: f32, total: f32) f32 {
+    const near_zero = exponent + log2p1Series(rest);
+    const logarithm = nvptx.math.lg2ApproxF32(true, total);
+    return if (rest < 1.0 / 16.0) near_zero else logarithm;
+}
+
+/// Online softmax over blocks of keys. The `rest_sum` values of the four lanes of a quad add up
+/// to the sum of the exponentials, relative to the f32 product `row_max * scale_log2`, of every
+/// key except one key whose score equals `row_max`, so that `finalize` forms the logarithm of the
+/// full sum without rounding the small terms away against the exponential of that key.
+/// `ex2.approx.ftz` flushes values below 2^-126 to zero (PTX ISA, ex2), including the rescale
+/// factor of `rest_sum` when `row_max * scale_log2` rises by more than 126. The terms of
+/// `rest_sum` reach up to 2^rescale_threshold, so the log-sum-exp stays accurate up to margins of
+/// about 118 ln 2 - ln(n) = 81.8 - ln(n) nats when n keys carry the rest of the weight.
 pub fn Softmax(comptime block_n: comptime_int) type {
     return struct {
         row_max: RowPair,
-        row_sum: RowPair,
+        rest_sum: RowPair,
 
         pub const Scores = [block_n / 8]Accumulator;
         pub const Probabilities = [block_n / 16]@Vector(4, u32);
 
         pub fn init() @This() {
-            return .{ .row_max = @splat(-std.math.inf(f32)), .row_sum = @splat(0) };
+            return .{ .row_max = @splat(-std.math.inf(f32)), .rest_sum = @splat(0) };
         }
 
         pub const Step = struct {
@@ -132,6 +177,22 @@ pub fn Softmax(comptime block_n: comptime_int) type {
         };
 
         pub fn exponentials(softmax: *@This(), scores: Scores, scale_log2: f32) Exponentials {
+            return softmax.orderedExponentials(.after_branch, scores, scale_log2);
+        }
+
+        /// Names where `orderedExponentials` computes the exponentials of a block. With
+        /// `in_branch`, each side of the branch on a raised maximum computes them. With
+        /// `after_branch`, the code after that branch computes them.
+        pub const Order = enum { in_branch, after_branch };
+
+        /// Returns what `exponentials` returns, with the exponentials in the place that `order`
+        /// names. Which order runs faster depends on the kernel.
+        fn orderedExponentials(
+            softmax: *@This(),
+            comptime order: Order,
+            scores: Scores,
+            scale_log2: f32,
+        ) Exponentials {
             var max = softmax.row_max;
             inline for (scores) |fragment| {
                 const even: RowPair = .{ fragment[0], fragment[2] };
@@ -152,21 +213,177 @@ pub fn Softmax(comptime block_n: comptime_int) type {
                 .Or,
                 raise_max & (softmax.row_max != minus_infinity),
             ), .all);
-            var sum = softmax.row_sum * row_scale;
+            const row_max = @select(f32, raise_max, max, softmax.row_max);
+            const new_max = raise_max & (row_max != minus_infinity);
+            // Relative to `offset`, the key that `rest_sum` leaves out has the exponential about
+            // 2^e * `row_scale`, where e is the exact product `softmax.row_max * scale_log2` minus
+            // its rounding `previous_scaled_max`. A raise of the maximum makes `row_scale` about
+            // 2^-8 or less, so `row_scale` serves as that exponential within |e| * 2^-8. Only a
+            // block that raises the maximum of a row holds the key that `rest_sum` leaves out.
+            if (order == .in_branch) {
+                const rebased = softmax.rebase(new_max, row_scale, row_scale);
+                const offsets: Accumulator = .{ offset[0], offset[0], offset[1], offset[1] };
+                const scale4: Accumulator = @splat(scale_log2);
+                var block_sum: RowPair = undefined;
+                var values: Scores = undefined;
+                if (nvptx.voteSync(.any, @reduce(.Or, new_max), .all)) {
+                    block_sum = exponentiate(scores, scale4, offsets, &values);
+                    const max_term = @select(
+                        f32,
+                        new_max,
+                        exp2(@mulAdd(RowPair, row_max, scale, -offset)),
+                        @as(RowPair, @splat(-1)),
+                    );
+                    block_sum = restExceptMax(values, max_term);
+                } else {
+                    block_sum = exponentiate(scores, scale4, offsets, &values);
+                }
+                const rest_sum = rebased + block_sum;
+                softmax.* = .{ .row_max = row_max, .rest_sum = rest_sum };
+                return .{
+                    .row_scale = .{ row_scale[0], row_scale[0], row_scale[1], row_scale[1] },
+                    .should_rescale = should_rescale,
+                    .values = values,
+                };
+            }
             const offsets: Accumulator = .{ offset[0], offset[0], offset[1], offset[1] };
             const scale4: Accumulator = @splat(scale_log2);
-            var values: Scores = undefined;
-            inline for (&values, scores) |*value, fragment| {
-                value.* = exp2(@mulAdd(Accumulator, fragment, scale4, -offsets));
-                sum += RowPair{ value[0] + value[1], value[2] + value[3] };
+            // In the rows that keep their maximum, `rest_sum` is zero or keeps its offset, so
+            // these rows add the exponentials to `rest_sum` after the branch.
+            var raised_sum: RowPair = @splat(0);
+            if (nvptx.voteSync(.any, @reduce(.Or, new_max), .all)) {
+                const rebased = softmax.rebase(new_max, row_scale, row_scale);
+                var raised_values: Scores = undefined;
+                _ = exponentiate(scores, scale4, offsets, &raised_values);
+                const max_term = exp2(@mulAdd(RowPair, row_max, scale, -offset));
+                raised_sum = rebased + restExceptMax(raised_values, max_term);
             }
-            softmax.row_max = @select(f32, raise_max, max, softmax.row_max);
-            softmax.row_sum = sum;
+            var values: Scores = undefined;
+            const block_sum = exponentiate(scores, scale4, offsets, &values);
+            const rest_sum = @select(f32, new_max, raised_sum, softmax.rest_sum + block_sum);
+            softmax.* = .{ .row_max = row_max, .rest_sum = rest_sum };
             return .{
                 .row_scale = .{ row_scale[0], row_scale[0], row_scale[1], row_scale[1] },
                 .should_rescale = should_rescale,
                 .values = values,
             };
+        }
+
+        /// The decisions that `exponentials` takes for a block of keys before it exponentiates.
+        pub const Raise = struct {
+            row_max: RowPair,
+            row_scale: RowPair,
+            offset: RowPair,
+            should_rescale: bool,
+            /// Holds when a row of the warp raises its maximum.
+            raised: bool,
+        };
+
+        /// Returns the decisions of `exponentials` for `scores`, so that a caller can branch on
+        /// `raised` and call `exponentialsAfter` in each branch.
+        pub fn raise(softmax: @This(), scores: Scores, scale_log2: f32) Raise {
+            var max = softmax.row_max;
+            inline for (scores) |fragment| {
+                const even: RowPair = .{ fragment[0], fragment[2] };
+                const odd: RowPair = .{ fragment[1], fragment[3] };
+                max = @max(max, @max(even, odd));
+            }
+            max = quadAllreduce(.max, max);
+            const scale: RowPair = @splat(scale_log2);
+            const minus_infinity: RowPair = @splat(-std.math.inf(f32));
+            const scaled_max =
+                @select(f32, max != minus_infinity, max * scale, @as(RowPair, @splat(0)));
+            const previous_scaled_max = softmax.row_max * scale;
+            const exponent = previous_scaled_max - scaled_max;
+            const raise_max = exponent < @as(RowPair, @splat(-rescale_threshold));
+            const row_max = @select(f32, raise_max, max, softmax.row_max);
+            return .{
+                .row_max = row_max,
+                .row_scale = @select(f32, raise_max, exp2(exponent), @as(RowPair, @splat(1))),
+                .offset = @select(f32, raise_max, scaled_max, previous_scaled_max),
+                .should_rescale = nvptx.voteSync(.any, @reduce(
+                    .Or,
+                    raise_max & (softmax.row_max != minus_infinity),
+                ), .all),
+                .raised = nvptx.voteSync(.any, @reduce(
+                    .Or,
+                    raise_max & (row_max != minus_infinity),
+                ), .all),
+            };
+        }
+
+        /// Returns what `exponentials` returns for `scores`, given the decisions of `raise`. When
+        /// `raised` holds, `leaves_out_max` must hold.
+        pub fn exponentialsAfter(
+            softmax: *@This(),
+            comptime leaves_out_max: bool,
+            decision: Raise,
+            scores: Scores,
+            scale_log2: f32,
+        ) Exponentials {
+            const offset = decision.offset;
+            const offsets: Accumulator = .{ offset[0], offset[0], offset[1], offset[1] };
+            const row_scale = decision.row_scale;
+            var values: Scores = undefined;
+            var block_sum = exponentiate(scores, @splat(scale_log2), offsets, &values);
+            var rebased = softmax.rest_sum * row_scale;
+            if (leaves_out_max) {
+                // `row_scale` is below 1 exactly in the rows that raise their maximum.
+                const minus_infinity: RowPair = @splat(-std.math.inf(f32));
+                const new_max = (row_scale < @as(RowPair, @splat(1))) &
+                    (decision.row_max != minus_infinity);
+                const max_term = @select(
+                    f32,
+                    new_max,
+                    exp2(@mulAdd(RowPair, decision.row_max, @splat(scale_log2), -offset)),
+                    @as(RowPair, @splat(-1)),
+                );
+                block_sum = restExceptMax(values, max_term);
+                rebased = softmax.rebase(new_max, row_scale, row_scale);
+            }
+            softmax.* = .{ .row_max = decision.row_max, .rest_sum = rebased + block_sum };
+            return .{
+                .row_scale = .{ row_scale[0], row_scale[0], row_scale[1], row_scale[1] },
+                .should_rescale = decision.should_rescale,
+                .values = values,
+            };
+        }
+
+        fn exponentiate(
+            scores: Scores,
+            scale: Accumulator,
+            offsets: Accumulator,
+            values: *Scores,
+        ) RowPair {
+            var sum: RowPair = @splat(0);
+            inline for (values, scores) |*value, fragment| {
+                value.* = exp2(@mulAdd(Accumulator, fragment, scale, -offsets));
+                sum += RowPair{ value[0] + value[1], value[2] + value[3] };
+            }
+            return sum;
+        }
+
+        /// Returns the share of this lane in the row sums of `values` without one value per row
+        /// of the quad that equals `max_term`. The lowest lane of the quad that holds values equal
+        /// to `max_term` leaves out one of those values.
+        fn restExceptMax(values: Scores, max_term: RowPair) RowPair {
+            const max_terms: Accumulator = .{ max_term[0], max_term[0], max_term[1], max_term[1] };
+            const zeros: Accumulator = @splat(0);
+            var rest_sum: RowPair = @splat(0);
+            var max_count: RowPair = @splat(0);
+            inline for (values) |value| {
+                const is_max = value == max_terms;
+                const rest = @select(f32, is_max, zeros, value);
+                const count = @select(f32, is_max, @as(Accumulator, @splat(1)), zeros);
+                rest_sum += RowPair{ rest[0] + rest[1], rest[2] + rest[3] };
+                max_count += RowPair{ count[0] + count[1], count[2] + count[3] };
+            }
+            var result: RowPair = undefined;
+            inline for (0..2) |row| {
+                const kept: f32 = if (firstInQuad(max_count[row] > 0)) 1 else 0;
+                result[row] = @mulAdd(f32, max_count[row] - kept, max_term[row], rest_sum[row]);
+            }
+            return result;
         }
 
         pub fn pack(values: Scores) Probabilities {
@@ -185,7 +402,17 @@ pub fn Softmax(comptime block_n: comptime_int) type {
         }
 
         pub fn step(softmax: *@This(), scores: Scores, scale_log2: f32) Step {
-            const exponentiated = exponentials(softmax, scores, scale_log2);
+            return softmax.orderedStep(.after_branch, scores, scale_log2);
+        }
+
+        /// Returns what `step` returns, with the exponentials in the place that `order` names.
+        pub fn orderedStep(
+            softmax: *@This(),
+            comptime order: Order,
+            scores: Scores,
+            scale_log2: f32,
+        ) Step {
+            const exponentiated = softmax.orderedExponentials(order, scores, scale_log2);
             return .{
                 .row_scale = exponentiated.row_scale,
                 .should_rescale = exponentiated.should_rescale,
@@ -201,8 +428,18 @@ pub fn Softmax(comptime block_n: comptime_int) type {
             const row_max = @max(softmax.row_max, other.row_max);
             const own_scale = combineScale(softmax.row_max, row_max, scale_log2);
             const other_scale = combineScale(other.row_max, row_max, scale_log2);
+            const scale: RowPair = @splat(scale_log2);
+            const offset = row_max * scale;
+            const own_leads = softmax.row_max == row_max;
+            const non_empty = row_max != @as(RowPair, @splat(-std.math.inf(f32)));
+            // In the rows where `softmax` holds a maximum at least as large as that of `other`,
+            // the merged state leaves out the key that `softmax` leaves out. In the other rows,
+            // the merged state leaves out the key that `other` leaves out.
+            const own_term = exp2(@mulAdd(RowPair, softmax.row_max, scale, -offset));
+            const other_term = exp2(@mulAdd(RowPair, other.row_max, scale, -offset));
+            softmax.rest_sum = softmax.rebase(!own_leads, own_scale, own_term) +
+                other.rebase(own_leads & non_empty, other_scale, other_term);
             softmax.row_max = row_max;
-            softmax.row_sum = softmax.row_sum * own_scale + other.row_sum * other_scale;
             return .{
                 .{ own_scale[0], own_scale[0], own_scale[1], own_scale[1] },
                 .{ other_scale[0], other_scale[0], other_scale[1], other_scale[1] },
@@ -216,20 +453,47 @@ pub fn Softmax(comptime block_n: comptime_int) type {
             return @select(f32, row_max == minus_infinity, @as(RowPair, @splat(0)), exp2(exponent));
         }
 
+        /// Returns the share of this lane in the sum of the exponentials of the keys of `softmax`
+        /// relative to a new offset, given the factor `scale` that converts the exponentials in
+        /// `rest_sum` to the new offset and the exponential `left_out` of the key that `rest_sum`
+        /// leaves out, relative to the new offset. In the rows where `fold` is false, the sum
+        /// also leaves out that key. In the other rows, each lane of the quad adds a quarter of
+        /// `left_out`.
+        fn rebase(
+            softmax: @This(),
+            fold: @Vector(2, bool),
+            scale: RowPair,
+            left_out: RowPair,
+        ) RowPair {
+            const quarter_term = @select(
+                f32,
+                fold,
+                left_out * @as(RowPair, @splat(0.25)),
+                @as(RowPair, @splat(0)),
+            );
+            return @mulAdd(RowPair, softmax.rest_sum, scale, quarter_term);
+        }
+
         pub fn finalize(softmax: @This(), scale_log2: f32) Finalized {
-            const sum = quadAllreduce(.sum, softmax.row_sum);
-            const non_empty_row = sum > @as(RowPair, @splat(0));
+            const rest_sum = quadAllreduce(.sum, softmax.rest_sum);
+            const non_empty_row = softmax.row_max != @as(RowPair, @splat(-std.math.inf(f32)));
             const scale: RowPair = @splat(scale_log2);
             const ln2: RowPair = @splat(std.math.ln2);
+            const scaled_max = softmax.row_max * scale;
+            const residual = @mulAdd(RowPair, softmax.row_max, scale, -scaled_max);
+            // Relative to `scaled_max`, the key that `rest_sum` leaves out has the exponential
+            // 2^residual.
+            const row_sum = exp2(residual) + rest_sum;
             const log2_sum: RowPair = .{
-                nvptx.math.lg2ApproxF32(true, sum[0]), nvptx.math.lg2ApproxF32(true, sum[1]),
+                log2Sum(residual[0], rest_sum[0], row_sum[0]),
+                log2Sum(residual[1], rest_sum[1], row_sum[1]),
             };
-            const log_sum_exp = (softmax.row_max * scale + log2_sum) * ln2;
+            const log_sum_exp = (scaled_max + log2_sum) * ln2;
             return .{
                 .row_scale = @select(
                     f32,
                     non_empty_row,
-                    @as(RowPair, @splat(1)) / sum,
+                    @as(RowPair, @splat(1)) / row_sum,
                     @as(RowPair, @splat(0)),
                 ),
                 .lse = @select(

@@ -27,6 +27,11 @@ const cp_async = nvptx.cp_async;
 const Accumulator = fragments.Accumulator;
 const Chunk = fragments.Chunk;
 const pds_swizzle_bytes = 32;
+const pivot_probability = fragments.pivot_probability;
+const sum_swizzle_bytes = 32;
+const SumOperands = wgmma.Operands(sum_swizzle_bytes);
+const bf16_scale: u16 = @truncate(@as(u32, @bitCast(BackwardParams.pivot_sum_scale)) >> 16);
+const bf16_scales: u32 = @backingInt(nvptx.Bf16x2.init(bf16_scale, bf16_scale));
 const producer_warps = configurations.Sm90BwdTiling.producer_warps;
 const consumer_warps = configurations.Sm90BwdTiling.consumer_warps;
 const consumer_threads = consumer_warps * 32;
@@ -79,6 +84,25 @@ fn consumerGroup() u32 {
 fn publishClearedRows() void {
     nvptx.fenceProxyAsync(.shared);
     nvptx.barrierSyncAligned(NamedBarrier.consumers, consumer_threads);
+}
+
+/// Returns whether one of the BF16 probabilities in `words` exceeds `pivot_probability`.
+fn holdsPivot(comptime count: usize, words: [count]u32) bool {
+    var largest: [4]nvptx.Bf16x2 = undefined;
+    inline for (&largest, 0..) |*part, index| part.* = @fromBackingInt(words[index]);
+    inline for (4..count) |index| {
+        largest[index % 4] = largest[index % 4].max(@fromBackingInt(words[index]));
+    }
+    const halves = largest[0].max(largest[1]).max(largest[2].max(largest[3])).toF32();
+    return @max(halves[0], halves[1]) > pivot_probability;
+}
+
+/// Returns whether the BF16 probability of element `index` of `words`, which hold two elements
+/// each, exceeds `pivot_probability`. Rounding to BF16 changes a probability by at most 2^-8 of
+/// its value, so at most one rounded probability of a row exceeds 3/4.
+fn isPivot(words: anytype, comptime index: usize) bool {
+    const pair: nvptx.Bf16x2 = @fromBackingInt(words[index / 2]);
+    return pair.toF32()[index % 2] > pivot_probability;
 }
 
 fn schedulerOptions(
@@ -217,6 +241,8 @@ pub fn FlashAttnBwdSm90(
         var query_empty: [stages]nvptx.Mbarrier addrspace(.shared) = undefined;
         var do_full: [stages]nvptx.Mbarrier addrspace(.shared) = undefined;
         var do_empty: [stages]nvptx.Mbarrier addrspace(.shared) = undefined;
+        var scales: [8 * sum_swizzle_bytes / 4]u32 align(8 * sum_swizzle_bytes) addrspace(.shared) =
+            undefined;
 
         pub const init_scope: mbarrier.Scope = .cta;
         pub const initializer_warp: u32 = 0;
@@ -474,6 +500,27 @@ pub fn FlashAttnBwdSm90(
             return result;
         }
 
+        fn excludePivots(
+            ds: *wgmma.Accumulator(block_m),
+            probabilities: [block_m / 4]u32,
+            pivot_keys: [*]addrspace(.global) i32,
+            vectors: u64,
+            first_key_row: u32,
+        ) void {
+            const thread_pivot_keys = pivot_keys + vectors + thread.lane() % 4 * 2;
+            const key = first_key_row + consumerWarp() * 16 + thread.lane() / 4;
+            inline for (0..block_m / 8) |tile| {
+                inline for (0..4) |element| {
+                    const index = tile * 4 + element;
+                    if (isPivot(probabilities, index)) {
+                        thread_pivot_keys[tile * 8 + element % 2] =
+                            @intCast(key + element / 2 * 8);
+                        ds[index] = 0;
+                    }
+                }
+            }
+        }
+
         const PdS = struct {
             probabilities: [query_steps]@Vector(4, u32),
             ds: [query_steps]@Vector(4, u32),
@@ -491,6 +538,9 @@ pub fn FlashAttnBwdSm90(
             softmax_scale_log2: f32,
             ds_base: u32,
             matrix_base: u32,
+            pivot_keys: [*]addrspace(.global) i32,
+            vectors: u64,
+            first_key_row: u32,
         ) PdS {
             var probabilities = leading.*;
             wgmma.wait(0);
@@ -507,8 +557,13 @@ pub fn FlashAttnBwdSm90(
                 softmax_scale_log2,
             );
             const dpsum_negated = rowVectors(dpsum);
-            const ds_registers =
-                wgmma.packPairs(block_m, computeDs(masked, probabilities, dp.*, dpsum_negated));
+            var ds = computeDs(masked, probabilities, dp.*, dpsum_negated);
+            const packed_probabilities = wgmma.packPairs(block_m, probabilities);
+            const words: [block_m / 4]u32 = @bitCast(packed_probabilities);
+            if (nvptx.voteSync(.any, holdsPivot(words.len, words), .all)) {
+                excludePivots(&ds, words, pivot_keys, vectors, first_key_row);
+            }
+            const ds_registers = wgmma.packPairs(block_m, ds);
             inline for (0..query_steps) |query_step| {
                 const chunk = query_step * 2;
                 wgmma.storeMatrices(
@@ -518,10 +573,7 @@ pub fn FlashAttnBwdSm90(
                     ds_registers[query_step],
                 );
             }
-            return .{
-                .probabilities = wgmma.packPairs(block_m, probabilities),
-                .ds = ds_registers,
-            };
+            return .{ .probabilities = packed_probabilities, .ds = ds_registers };
         }
 
         fn dqStagingChunks() [4]u32 {
@@ -548,9 +600,13 @@ pub fn FlashAttnBwdSm90(
             const group = consumerGroup();
             const warp_in_group = consumerWarp() % 4;
             const work = splitWork(Work, tiling, specialization, params) orelse return;
+            nvptx.griddepcontrol(.wait);
             const iterations = work.iterations();
             var gradients: Gradients = .{ .dk = @splat(0), .dv = @splat(0) };
             if (iterations > 0) {
+                // The fence and consumer barrier before each dQ product publish `scales` to the
+                // async proxy, through which wgmma reads shared memory (PTX ISA section 9.7.17.4).
+                if (consumerThread() < scales.len) scales[consumerThread()] = bf16_scales;
                 while (!kv_full.tryWaitParity(0)) {}
                 if (params.cu_seqlens_k != 0 and work.key_count < block_n) {
                     Layout.clearRows(
@@ -658,6 +714,10 @@ pub fn FlashAttnBwdSm90(
             const key_box = placement.key_box;
             const step = work.step(iteration);
             const stage = iteration % stages;
+            const vectors: u64 = work.batch * params.lse_batch_stride +
+                step.head * params.lse_head_stride + work.sequence.offset_q +
+                step.block_info.first_row;
+            const pivot_keys: [*]addrspace(.global) i32 = @ptrFromInt(params.pivot_key);
             while (!query_full[stage].tryWaitParity(@intCast((iteration / stages) & 1))) {}
             const lse = rowVectors(&tiles.lse[stage]);
             const query_base = wgmma.address(&tiles.q[stage]);
@@ -724,6 +784,9 @@ pub fn FlashAttnBwdSm90(
                     params.softmax_scale_log2,
                     ds_base,
                     matrix_base,
+                    pivot_keys,
+                    vectors,
+                    work.sequence.offset_k + work.first_key,
                 )
             else
                 computePdS(
@@ -738,6 +801,9 @@ pub fn FlashAttnBwdSm90(
                     params.softmax_scale_log2,
                     ds_base,
                     matrix_base,
+                    pivot_keys,
+                    vectors,
+                    work.sequence.offset_k + work.first_key,
                 );
             const ds_registers = pds.ds;
             const do_rows = Operands.mnMajor(do_base, block_m);
@@ -756,6 +822,8 @@ pub fn FlashAttnBwdSm90(
             nvptx.fenceProxyAsync(.shared);
             nvptx.barrierSyncAligned(NamedBarrier.consumers, consumer_threads);
             var dq_accumulator: wgmma.Accumulator(dq_columns) = undefined;
+            var row_sums: wgmma.Accumulator(8) = undefined;
+            const sums_rows = dq_split != .by_columns or consumerGroup() == 0;
             wgmma.fence();
             if (writes_dq) {
                 const scores_transposed = DsOperands.mnMajor(ds_base + query_box *
@@ -772,6 +840,20 @@ pub fn FlashAttnBwdSm90(
                         true,
                         true,
                     );
+                }
+                if (sums_rows) {
+                    const scales_operand = SumOperands.kMajor(wgmma.address(&scales));
+                    inline for (0..key_steps) |key_step| {
+                        wgmma.mmaShared(
+                            8,
+                            &row_sums,
+                            wgmma.advance(scores_transposed, key_step * 16 * ds_swizzle_bytes),
+                            scales_operand,
+                            key_step != 0,
+                            true,
+                            false,
+                        );
+                    }
                 }
                 wgmma.commit();
             }
@@ -794,6 +876,10 @@ pub fn FlashAttnBwdSm90(
             }
             if (writes_dq) {
                 wgmma.fenceOperand(&dq_accumulator);
+                if (sums_rows) {
+                    wgmma.fenceOperand(&row_sums);
+                    addPivotSums(params, vectors, step.block_info.row_count, query_box, row_sums);
+                }
                 const buffer = iteration % staging_buffers;
                 nvptx.barrierSyncAligned(placement.dq_empty.of(buffer), staging_threads);
                 ReduceStaging.store(
@@ -810,6 +896,24 @@ pub fn FlashAttnBwdSm90(
             wgmma.fenceOperand(&gradients.dv);
             if (elect.oneSync()) _ = query_empty[stage].arrive();
             elect.reconverge();
+        }
+
+        fn addPivotSums(
+            params: BackwardParams,
+            vectors: u64,
+            row_count: u32,
+            query_box: u32,
+            row_sums: wgmma.Accumulator(8),
+        ) void {
+            // The columns of `row_sums` are equal, so lanes 0 and 1 of a quad hold the same rows.
+            const lane = thread.lane();
+            const half = lane % 4;
+            const row = query_box * dq_rows + consumerWarp() % 4 * 16 + lane / 4 + half * 8;
+            if (half < 2 and row < row_count) {
+                const pivot_sums: [*]addrspace(.global) f32 = @ptrFromInt(params.pivot_sum);
+                const sum = if (half == 0) row_sums[0] else row_sums[2];
+                nvptx.red(.gpu, .monotonic, .add, &pivot_sums[vectors + row], sum);
+            }
         }
 
         fn storeDkv(params: BackwardParams, work: Work, gradients: Gradients) void {
@@ -958,6 +1062,7 @@ pub fn FlashAttnBwdSm90SinglePdsStage(
         var query_empty: [q_stage]nvptx.Mbarrier addrspace(.shared) = undefined;
         var do_full: nvptx.Mbarrier addrspace(.shared) = undefined;
         var do_empty: nvptx.Mbarrier addrspace(.shared) = undefined;
+        var row_partials: [2][block_m]f32 addrspace(.shared) = undefined;
 
         pub const init_scope: mbarrier.Scope = .cta;
         pub const initializer_warp: u32 = 0;
@@ -1140,9 +1245,67 @@ pub fn FlashAttnBwdSm90SinglePdsStage(
             return result;
         }
 
+        fn excludePivots(
+            ds: *wgmma.Accumulator(keys_per_compute_group),
+            probabilities: [keys_per_compute_group / 4]u32,
+            pivot_keys: [*]addrspace(.global) i32,
+            key: u32,
+        ) void {
+            const row_pivot_keys = pivot_keys + consumerWarp() % 4 * 16 + thread.lane() / 4;
+            inline for (0..keys_per_compute_group / 8) |tile| {
+                inline for (0..4) |element| {
+                    const index = tile * 4 + element;
+                    if (isPivot(probabilities, index)) {
+                        row_pivot_keys[element / 2 * 8] = @intCast(key + tile * 8 + element % 2);
+                        ds[index] = 0;
+                    }
+                }
+            }
+        }
+
+        const PdSWords = [keys_per_compute_group / 8][2]nvptx.Bf16x2;
+
+        fn packPdS(values: wgmma.Accumulator(keys_per_compute_group)) PdSWords {
+            var words: PdSWords = undefined;
+            inline for (&words, 0..) |*pair, tile| {
+                inline for (pair, 0..) |*word, half| word.* = nvptx.Bf16x2.fromF32(
+                    values[tile * 4 + half * 2],
+                    values[tile * 4 + half * 2 + 1],
+                );
+            }
+            return words;
+        }
+
+        fn storeRowPartials(ds: PdSWords) void {
+            var sums: fragments.RowPair = @splat(0);
+            inline for (ds) |pair| {
+                inline for (pair, 0..) |word, half| {
+                    const values = word.toF32();
+                    sums[half] += values[0] + values[1];
+                }
+            }
+            const totals = fragments.quadAllreduce(.sum, sums);
+            const lane = thread.lane();
+            if (lane % 4 == 0) {
+                const row = consumerWarp() % 4 * 16 + lane / 4;
+                row_partials[consumerGroup()][row] = totals[0];
+                row_partials[consumerGroup()][row + 8] = totals[1];
+            }
+        }
+
+        fn addPivotSums(params: BackwardParams, vectors: u64, row_count: u32) void {
+            const row = consumerThread();
+            if (row < row_count) {
+                const pivot_sums: [*]addrspace(.global) f32 = @ptrFromInt(params.pivot_sum);
+                const sum = row_partials[0][row] + row_partials[1][row];
+                const scaled = sum * BackwardParams.pivot_sum_scale;
+                nvptx.red(.gpu, .monotonic, .add, &pivot_sums[vectors + row], scaled);
+            }
+        }
+
         fn storePdS(
             destination: *addrspace(.shared) [block_m * block_n / 8]Chunk,
-            values: wgmma.Accumulator(keys_per_compute_group),
+            words: PdSWords,
         ) void {
             const lane = thread.lane();
             const row = consumerWarp() % 4 * 16 + lane / 4;
@@ -1154,10 +1317,7 @@ pub fn FlashAttnBwdSm90SinglePdsStage(
                     const word: *addrspace(.shared) u32 =
                         @ptrFromInt(base + chunk / 2 * score_rows + r * pds_swizzle_bytes +
                             smem.swizzledColumn(pds_swizzle_bytes, chunk % 2, r) * 16);
-                    word.* = @backingInt(nvptx.Bf16x2.fromF32(
-                        values[tile * 4 + half * 2],
-                        values[tile * 4 + half * 2 + 1],
-                    ));
+                    word.* = @backingInt(words[tile][half]);
                 }
             }
         }
@@ -1176,6 +1336,7 @@ pub fn FlashAttnBwdSm90SinglePdsStage(
             @setEvalBranchQuota(100_000);
             const group = consumerGroup();
             const work = splitWork(Work, tiling, specialization, params) orelse return;
+            nvptx.griddepcontrol(.wait);
             const iterations = work.iterations();
             var gradients: Gradients = .{ .dk = @splat(@splat(0)), .dv = @splat(@splat(0)) };
             if (iterations > 0) {
@@ -1191,6 +1352,8 @@ pub fn FlashAttnBwdSm90SinglePdsStage(
                 }
                 const unmasked = work.unmaskedRowLimits();
                 const first_column = work.first_key + group * keys_per_compute_group;
+                const pivot_key = work.sequence.offset_k + first_column + thread.lane() % 4 * 2;
+                const pivot_keys: [*]addrspace(.global) i32 = @ptrFromInt(params.pivot_key);
                 const key_base =
                     wgmma.address(&tiles.k) + group * keys_per_compute_group * swizzle_bytes;
                 const value_base =
@@ -1204,6 +1367,9 @@ pub fn FlashAttnBwdSm90SinglePdsStage(
                 while (iteration < iterations) : (iteration += 1) {
                     const step = work.step(iteration);
                     const stage = iteration % q_stage;
+                    const vectors: u64 = work.batch * params.lse_batch_stride +
+                        step.head * params.lse_head_stride + work.sequence.offset_q +
+                        step.block_info.first_row;
                     waitBarrierParity(&query_full[stage], iteration / q_stage);
                     waitBarrierParity(&do_full, iteration);
                     if (params.cu_seqlens_q != 0 and step.block_info.row_count < block_m) {
@@ -1262,14 +1428,21 @@ pub fn FlashAttnBwdSm90SinglePdsStage(
                         applyMask(&probabilities, first_column, limits, 0);
                     }
                     nvptx.barrierSyncAligned(NamedBarrier.consumers, consumer_threads);
-                    storePdS(&tiles.probabilities, probabilities);
+                    const packed_probabilities = packPdS(probabilities);
+                    storePdS(&tiles.probabilities, packed_probabilities);
                     wgmma.wait(0);
                     wgmma.fenceOperand(&dp);
-                    const ds = if (masked)
+                    var ds_values = if (masked)
                         computeDs(true, probabilities, dp)
                     else
                         computeDs(false, probabilities, dp);
+                    const words: [keys_per_compute_group / 4]u32 = @bitCast(packed_probabilities);
+                    if (nvptx.voteSync(.any, holdsPivot(words.len, words), .all)) {
+                        excludePivots(&ds_values, words, pivot_keys + vectors, pivot_key);
+                    }
+                    const ds = packPdS(ds_values);
                     storePdS(&tiles.ds, ds);
+                    storeRowPartials(ds);
                     nvptx.fenceProxyAsync(.shared);
                     nvptx.barrierSyncAligned(NamedBarrier.consumers, consumer_threads);
                     var dq: wgmma.Accumulator(group_columns) = undefined;
@@ -1330,6 +1503,7 @@ pub fn FlashAttnBwdSm90SinglePdsStage(
                         }
                     }
                     wgmma.commit();
+                    addPivotSums(params, vectors, step.block_info.row_count);
                     wgmma.wait(1);
                     wgmma.fenceOperand(&dq);
                     if (elect.oneSync()) _ = do_empty.arrive();
@@ -1496,7 +1670,8 @@ fn launch(params: BackwardParams, args: Backward.Args) void {
 }
 
 const Entry = entry.Entry(BackwardParams, Backward.Args, .{
-    "q_map", "k_map", "v_map", "do_map", "dq_accum_map", "lse_log2", "dpsum", "dk", "dv",
+    "q_map",     "k_map",     "v_map", "do_map", "dq_accum_map", "lse_log2", "dpsum",
+    "pivot_sum", "pivot_key", "dk",    "dv",
 } ++ entry.backward_sequence ++ entry.strides("dk") ++ entry.strides("dv") ++
     .{ "lse_batch_stride", "lse_head_stride", "num_batch" } ++
     if (variant.specialization.scheduler_metadata) .{"scheduler_metadata"} else .{}, .{
@@ -1516,6 +1691,11 @@ comptime {
                 .flashAttnBwdPostprocess,
             .{ .name = "flash_attn_bwd_postprocess" },
         );
+        @export(
+            &flash_bwd_postprocess.FlashAttnBwdFixDk(auxiliary).flashAttnBwdFixDk,
+            .{ .name = "flash_attn_bwd_fix_dk" },
+        );
+        @export(&flash_bwd_preprocess.flashAttnBwdClear, .{ .name = "flash_attn_bwd_clear" });
         if (variant.specialization.scheduler_metadata) {
             const options = schedulerOptions(backward_tiling, variant.specialization);
             const PrepareScheduler = prepare_scheduler.PrepareScheduler(

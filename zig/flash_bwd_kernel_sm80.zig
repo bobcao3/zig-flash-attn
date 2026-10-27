@@ -58,7 +58,7 @@ pub fn FlashAttnBwdSm80Kernel(comptime Components: type) type {
                         operands,
                         values,
                     );
-                Components.storePdS(probabilities, operands);
+                const pivot_sums = Components.storePdS(probabilities, operands);
                 if (scheduled) {
                     Steps.schedule.loopBarrier();
                 } else {
@@ -99,6 +99,7 @@ pub fn FlashAttnBwdSm80Kernel(comptime Components: type) type {
                     load.release(iteration, iterations, work);
                     Components.accumulateDq(params, work, step, load, iteration, operands);
                 }
+                Components.finishPivots(params, work, step, operands, pivot_sums);
                 load.finish(iteration, iterations, work);
             }
         }

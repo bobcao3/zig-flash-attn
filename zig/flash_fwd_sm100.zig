@@ -26,6 +26,18 @@ const minus_infinity = -std.math.inf(f32);
 
 const NamedBarrier = enum(u4) { correction = 1 };
 
+/// Returns 1 in each element where `a != b` or either is NaN, and 0 elsewhere (PTX ISA,
+/// comparison and selection instructions, set).
+fn differs(a: f32x2.Pair, b: f32x2.Pair) f32x2.Pair {
+    var result: f32x2.Pair = undefined;
+    inline for (0..2) |element| result[element] = asm ("set.neu.f32.f32 %[d], %[a], %[b];"
+        : [d] "=f" (-> f32),
+        : [a] "f" (a[element]),
+          [b] "f" (b[element]),
+    );
+    return result;
+}
+
 pub fn FlashAttnFwdSm100(
     comptime tiling: configurations.Sm100FwdTiling,
     comptime specialization: configurations.Specialization,
@@ -774,34 +786,38 @@ pub fn FlashAttnFwdSm100(
         const frg_cnt = block_n / 2 / fragment_pairs;
 
         fn exponentiateScores(
+            comptime counts_ones: bool,
             scores: Scores,
             softmax_scale_log2: f32,
+            max: f32,
             offset: f32,
             address: u32,
             sum: *f32,
+            ones: *f32,
             buffer: u32,
         ) Scores {
             const scale = f32x2.splat(softmax_scale_log2);
             const shift = f32x2.splat(-offset);
             var sums: [4]f32x2.Pair = @splat(f32x2.splat(0));
+            var kept = f32x2.splat(0);
             var values: Scores = undefined;
             var probabilities: @Vector(block_n / 2, u32) = undefined;
             inline for (0..block_n / 2) |pair| {
-                const exponent =
-                    f32x2.fma(.{ scores[2 * pair], scores[2 * pair + 1] }, scale, shift);
-                const emulated = switch (tiling.ex2_emulation_placement) {
-                    .interleaved => pair % 8 < ex2_emulated_pairs,
-                    .leading => pair < ex2_emulated_pairs * 8,
-                    .inner_fragments => pair / fragment_pairs != 0 and pair / fragment_pairs !=
-                        frg_cnt - 1 and pair % 8 >= 8 - 2 * ex2_emulated_pairs,
-                };
-                const value = if (emulated)
+                const pair_scores: f32x2.Pair = .{ scores[2 * pair], scores[2 * pair + 1] };
+                const exponent = f32x2.fma(pair_scores, scale, shift);
+                const value = if (comptime ex2Emulated(pair))
                     f32x2.ex2Emulation(exponent)
                 else
                     f32x2.exp2f(exponent);
                 values[2 * pair] = value[0];
                 values[2 * pair + 1] = value[1];
-                if (!tiling.late_row_sum) sums[pair % 4] = f32x2.add(sums[pair % 4], value);
+                if (!tiling.late_row_sum and counts_ones) {
+                    const keep = differs(pair_scores, f32x2.splat(max));
+                    kept = f32x2.add(kept, keep);
+                    sums[pair % 4] = f32x2.fma(value, keep, sums[pair % 4]);
+                } else if (!tiling.late_row_sum) {
+                    sums[pair % 4] = f32x2.add(sums[pair % 4], value);
+                }
                 probabilities[pair] = @backingInt(nvptx.Bf16x2.fromF32(value[0], value[1]));
                 if (tiling.fragment_stores and (pair + 1) % fragment_pairs == 0) {
                     const first: u32 = pair + 1 - fragment_pairs;
@@ -841,13 +857,47 @@ pub fn FlashAttnFwdSm100(
                 tcgen05.waitStore();
                 tcgen05.fenceBeforeSync();
             }
-            if (!tiling.late_row_sum) sum.* = softmaxTotal(sums);
+            if (!tiling.late_row_sum) {
+                sum.* = softmaxTotal(sums);
+                ones.* = if (counts_ones) tileOnes(max, kept) else 0;
+            }
             return values;
+        }
+
+        fn ex2Emulated(comptime pair: u32) bool {
+            return switch (tiling.ex2_emulation_placement) {
+                .interleaved => pair % 8 < ex2_emulated_pairs,
+                .leading => pair < ex2_emulated_pairs * 8,
+                .inner_fragments => pair / fragment_pairs != 0 and pair / fragment_pairs !=
+                    frg_cnt - 1 and pair % 8 >= 8 - 2 * ex2_emulated_pairs,
+            };
+        }
+
+        fn tileOnes(max: f32, kept: f32x2.Pair) f32 {
+            return if (max == minus_infinity) 0 else block_n - (kept[0] + kept[1]);
         }
 
         fn softmaxTotal(sums: [4]f32x2.Pair) f32 {
             const pair = f32x2.add(f32x2.add(sums[0], sums[1]), f32x2.add(sums[2], sums[3]));
             return pair[0] + pair[1];
+        }
+
+        /// Returns the base 2 log-sum-exp of a row and the sum of the exponentials of its keys
+        /// relative to `max * softmax_scale_log2`, given the stored maximum score `max`, the number
+        /// `ones` of keys that `runSoftmax` counts as scoring `max` and the sum `sum` of the
+        /// exponentials of the other keys. A key that scores `max` has the exponential 2^e, where
+        /// e is the exact product `max * softmax_scale_log2` minus its f32 rounding. The
+        /// exponentials far below 1 keep their accuracy, except that the columns that use
+        /// `f32x2.ex2Emulation` carry its relative error of up to 8.8e-5 and that the `.ftz`
+        /// instructions flush values below 2^-126 to zero.
+        fn rowTotals(max: f32, ones: f32, sum: f32, softmax_scale_log2: f32) struct { f32, f32 } {
+            if (max == minus_infinity) return .{ minus_infinity, 0 };
+            const high = max * softmax_scale_log2;
+            const low = @mulAdd(f32, max, softmax_scale_log2, -high);
+            const top = nvptx.math.ex2ApproxF32(true, low);
+            const rest = @mulAdd(f32, ones - 1, top, sum);
+            const total = top + rest;
+            return .{ high + fragments.log2Sum(low, rest, total), total };
         }
 
         pub fn runSoftmax(params: ForwardParams, _: Args) void {
@@ -878,6 +928,7 @@ pub fn FlashAttnFwdSm100(
                 const col_limit_right = work.block_info.colLimitRight(query);
                 var max: f32 = minus_infinity;
                 var sum: f32 = 0;
+                var ones: f32 = 0;
                 var index: u32 = 0;
                 while (index < count) : (index += 1) {
                     const n_block = nBlock(work, index);
@@ -910,6 +961,7 @@ pub fn FlashAttnFwdSm100(
                         @max(partial_max[2], partial_max[3]),
                     );
                     var scale: f32 = 1;
+                    var sets_max = index == 0;
                     if (index == 0) {
                         max = tile_max;
                     } else {
@@ -918,6 +970,9 @@ pub fn FlashAttnFwdSm100(
                         if (exponent < -fragments.rescale_threshold) {
                             scale = nvptx.math.ex2ApproxF32(true, exponent);
                             max = tile_max;
+                            sum = @mulAdd(f32, sum, scale, ones * scale);
+                            ones = 0;
+                            sets_max = true;
                         }
                         const softmax_corr_buffer = scoreBuffer(softmax_corr_index, stage);
                         row_scale[softmax_corr_buffer][tensorRow()] = scale;
@@ -926,12 +981,35 @@ pub fn FlashAttnFwdSm100(
                     }
                     const offset = if (max == minus_infinity) 0 else max * softmax_scale_log2;
                     var tile_sum: f32 = undefined;
-                    const values = exponentiateScores(
+                    var tile_ones: f32 = undefined;
+                    // A block counts the keys that score `max` only when a row of the warp sets
+                    // its `max` in the block, unless the tiling counts them in every block. With a
+                    // late row sum, the block counts the keys whose exponential equals that of
+                    // `max` instead. The other blocks add the exponential of such a key, about 1,
+                    // to `sum`, which is then at least about 1 and no longer needs the terms that
+                    // the addition rounds away. In the columns that use `f32x2.ex2Emulation`, that
+                    // exponential carries the relative error of the emulation, up to 8.8e-5.
+                    const counts_ones = tiling.counts_ties_every_block or
+                        nvptx.voteSync(.any, sets_max, .all);
+                    const values = if (!tiling.late_row_sum and counts_ones) exponentiateScores(
+                        true,
                         scores,
                         softmax_scale_log2,
+                        max,
                         offset,
                         scores_address,
                         &tile_sum,
+                        &tile_ones,
+                        buffer,
+                    ) else exponentiateScores(
+                        false,
+                        scores,
+                        softmax_scale_log2,
+                        max,
+                        offset,
+                        scores_address,
+                        &tile_sum,
+                        &tile_ones,
                         buffer,
                     );
                     if (p_split_pairs == 0) mbarrier.arrive(
@@ -943,7 +1021,7 @@ pub fn FlashAttnFwdSm100(
                         &softmax_corr_empty[scoreBuffer(softmax_corr_index, stage)],
                         scoreRound(softmax_corr_index) ^ 1,
                     );
-                    if (tiling.late_row_sum) {
+                    if (tiling.late_row_sum and !counts_ones) {
                         var sums: [4]f32x2.Pair = @splat(f32x2.splat(0));
                         inline for (0..block_n / 2) |pair| {
                             sums[pair % 4] = f32x2.add(
@@ -952,13 +1030,39 @@ pub fn FlashAttnFwdSm100(
                             );
                         }
                         tile_sum = softmaxTotal(sums);
+                        tile_ones = 0;
+                    } else if (tiling.late_row_sum) {
+                        // A key that scores `max` has the exponential `top_exact` or
+                        // `top_emulated`, depending on its column.
+                        const top_exponent = f32x2.fma(
+                            f32x2.splat(max),
+                            f32x2.splat(softmax_scale_log2),
+                            f32x2.splat(-offset),
+                        );
+                        const top_exact = f32x2.exp2f(top_exponent);
+                        const top_emulated = f32x2.ex2Emulation(top_exponent);
+                        var sums: [4]f32x2.Pair = @splat(f32x2.splat(0));
+                        var kept = f32x2.splat(0);
+                        inline for (0..block_n / 2) |pair| {
+                            const value: f32x2.Pair = .{ values[2 * pair], values[2 * pair + 1] };
+                            const keep = differs(
+                                value,
+                                if (comptime ex2Emulated(pair)) top_emulated else top_exact,
+                            );
+                            kept = f32x2.add(kept, keep);
+                            sums[pair % 4] = f32x2.fma(value, keep, sums[pair % 4]);
+                        }
+                        tile_sum = softmaxTotal(sums);
+                        tile_ones = tileOnes(max, kept);
                     }
-                    sum = sum * scale + tile_sum;
+                    sum += tile_sum;
+                    ones += tile_ones;
                     blocks += 1;
                 }
                 const softmax_corr_buffer = scoreBuffer(softmax_corr_index, stage);
-                row_scale[softmax_corr_buffer][tensorRow()] = max;
-                row_sum[softmax_corr_buffer][tensorRow()] = sum;
+                const lse_log2, const total = rowTotals(max, ones, sum, softmax_scale_log2);
+                row_scale[softmax_corr_buffer][tensorRow()] = lse_log2;
+                row_sum[softmax_corr_buffer][tensorRow()] = total;
                 mbarrier.arrive(.thread, &softmax_corr_full[softmax_corr_buffer]);
                 softmax_corr_index += 1;
             }
@@ -1030,7 +1134,7 @@ pub fn FlashAttnFwdSm100(
             work: Work,
             stage: u32,
             output: u32,
-            max: f32,
+            lse_log2: f32,
             sum: f32,
             stores: *u32,
         ) void {
@@ -1042,8 +1146,7 @@ pub fn FlashAttnFwdSm100(
             const empty_row = !(sum > 0);
             const inverse: f32 = if (empty_row) 0 else 1 / sum;
             const out: [*]addrspace(.global) Chunk = @ptrFromInt(params.o);
-            const total = max * params.softmax_scale_log2 + nvptx.math.lg2ApproxF32(true, sum);
-            const lse = if (empty_row) minus_infinity else total * std.math.ln2;
+            const lse = if (empty_row) minus_infinity else lse_log2 * std.math.ln2;
             inline for (0..boxes) |box_index| {
                 const box: u32 = box_index;
                 const buffer = stores.* % staging_buffers;
@@ -1128,11 +1231,11 @@ pub fn FlashAttnFwdSm100(
             stores: *u32,
         ) void {
             mbarrier.wait(.cta, &softmax_corr_full[buffer], round);
-            const max = row_scale[buffer][tensorRow()];
+            const lse_log2 = row_scale[buffer][tensorRow()];
             const sum = row_sum[buffer][tensorRow()];
             mbarrier.arrive(.thread, &softmax_corr_empty[buffer]);
             tcgen05.fenceAfterSync();
-            storeOutput(params, args, work, stage, output, max, sum, stores);
+            storeOutput(params, args, work, stage, output, lse_log2, sum, stores);
             tcgen05.fenceBeforeSync();
         }
 

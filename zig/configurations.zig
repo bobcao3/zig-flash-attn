@@ -1236,6 +1236,7 @@ pub const Sm100FwdTiling = struct {
         .{ .masks = Mask.bounded, .size_l2 = 64 << 20, .varlen = true },
     },
     late_row_sum: bool = false,
+    counts_ties_every_block: bool = false,
     p_split_pairs: u32 = 0,
     use_2cta_instrs: bool = false,
     scheduling_mode: SchedulingMode = .clc,
@@ -1333,6 +1334,7 @@ pub fn forwardSm100(head_dim: u32) Sm100FwdTiling {
             .q_stage = 1,
             .use_2cta_instrs = true,
             .prologue_loads = false,
+            .counts_ties_every_block = true,
         },
         else => @panic("unsupported head dimension"),
     };
@@ -1497,7 +1499,7 @@ pub const Sm100BwdTiling = struct {
                 2 * tiling.tileBytes(tiling.block_n) + 2 * tiling.tileBytes(tiling.block_m);
             const column_tiles = 2 * tiling.tileBytes(2 * tiling.block_m) / 2;
             const operands = 2 * tiling.block_n * 2 * tiling.block_m * Sm80FwdTiling.element_bytes;
-            const vectors = 2 * 2 * tiling.block_m * @sizeOf(f32);
+            const vectors = 4 * 2 * tiling.block_m * @sizeOf(f32);
             return half_tiles + column_tiles + operands + vectors;
         }
         const key_tiles = 2 * tiling.tileBytes(tiling.block_n);

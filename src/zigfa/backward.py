@@ -18,13 +18,14 @@ from .tensors import (
     view_of,
 )
 
-PREPROCESS_SIGNATURE = "p" * 7 + "u" + "p" * 11 + "u"
+PREPROCESS_SIGNATURE = "p" * 9 + "u" + "p" * 11 + "upu"
 SCALAR_SIGNATURE = "uuu" + "ff" + "ii"
-BACKWARD_SIGNATURE = "p" * 11 + SCALAR_SIGNATURE + "p" * 23 + "u"
-TENSOR_MAP_BACKWARD_SIGNATURE = "m" * 4 + "p" * 7 + SCALAR_SIGNATURE + "p" * 11 + "u"
-DQ_ACCUM_MAP_BACKWARD_SIGNATURE = "m" * 5 + "p" * 6 + SCALAR_SIGNATURE + "p" * 8 + "u"
-DQ_SIGNATURE = "m" * 4 + "p" * 5 + SCALAR_SIGNATURE + "p" * 5 + "u"
-POSTPROCESS_SIGNATURE = "ppp" + "uf" + "p" * 6 + "u"
+BACKWARD_SIGNATURE = "p" * 13 + SCALAR_SIGNATURE + "p" * 23 + "u"
+TENSOR_MAP_BACKWARD_SIGNATURE = "m" * 4 + "p" * 9 + SCALAR_SIGNATURE + "p" * 11 + "u"
+DQ_ACCUM_MAP_BACKWARD_SIGNATURE = "m" * 5 + "p" * 8 + SCALAR_SIGNATURE + "p" * 8 + "u"
+DQ_SIGNATURE = "m" * 4 + "p" * 8 + SCALAR_SIGNATURE + "p" * 8 + "u"
+POSTPROCESS_SIGNATURE = "p" * 9 + "uuf" + "p" * 17 + "u"
+FIX_DK_SIGNATURE = "ppp" + "uuu" + "ppp"
 PREPROCESS_ROWS = 32
 POSTPROCESS_ROWS = 16
 AUXILIARY_THREADS = 256
@@ -51,6 +52,7 @@ WAVE_SPLIT_TARGET_EFFICIENCY = 0.9
 TWO_CTA_HEAD_SPLIT_MIN_ROWS = 4096
 CLEAR_SIGNATURE = "pu"
 CLEAR_BLOCKS = 512
+FIX_DK_BLOCKS = 2048
 
 
 class BackwardWorkspace(NamedTuple):
@@ -58,12 +60,30 @@ class BackwardWorkspace(NamedTuple):
     lse_padding: int
     accumulator_padding: int
     dkv_accum: bool
+    # An FP32 buffer collects the dK products of the pivot keys for the kernels that write BF16 dK,
+    # followed by one flag per buffer row. A workspace with dkv_accum holds the buffer in its dK half
+    # and the flags in its dV half.
+    dk_fix: bool
     scheduler_metadata_rows: int
 
 
 def accumulator_shape(q_shape, padding_rows):
     total = q_shape[0] * q_shape[1] if len(q_shape) == 4 else q_shape[0]
     return q_shape[-2], total + padding_rows, q_shape[-1]
+
+
+def dk_fix_shape(k_shape, padding_rows):
+    heads, rows, head_dim = accumulator_shape(k_shape, padding_rows)
+    return (heads * rows * head_dim + 4 * dk_state_chunks(heads * rows, head_dim),)
+
+
+def dk_state_chunks(rows, head_dim):
+    return -(-rows * (head_dim // 8) // 4)
+
+
+def pivots_shape(lse_elements):
+    # The SM100 backward with head dimension 256 loads the pivot keys in 16-byte vectors.
+    return 2, -(-lse_elements // 4) * 4
 
 
 @functools.cache
@@ -74,15 +94,16 @@ def backward_workspace_layout(
     infos = specialization.reachable(device_id, "bwd", q_shape[-1], facts)
     aligned = cu_seqlens_shape is not None and any(info.arch == 80 for info in infos)
     alignment_rows = SM80_SEQUENCE_ROW_ALIGNMENT * facts.batch_size if aligned else 0
+    dkv_accum = k_shape is not None and any(
+        info.head_split and head_split_pays(device_id, info, q_shape, k_shape, window_size_left, window_size_right)
+        for info in infos
+    )
     return BackwardWorkspace(
         facts,
         max(max(info.block_m, info.dq_block_m) for info in infos),
         max(ACCUMULATOR_PADDING_ROWS, *(info.block_m for info in infos)) + alignment_rows,
-        k_shape is not None
-        and any(
-            info.head_split and head_split_pays(device_id, info, q_shape, k_shape, window_size_left, window_size_right)
-            for info in infos
-        ),
+        dkv_accum,
+        not dkv_accum and any(not info.dq_block_m for info in infos),
         min(((info.cluster_ctas or 1) * info.block_n for info in infos if info.scheduler_metadata), default=0),
     )
 
@@ -120,7 +141,7 @@ def backward_variant(
 def backward_workspace_shapes(
     q_shape,
     lse_shape,
-    k_shape=None,
+    k_shape,
     window_size_left=-1,
     window_size_right=-1,
     *,
@@ -140,9 +161,18 @@ def backward_workspace_shapes(
         max_seqlen_k,
     )
     lse_elements = math.prod(lse_shape) + layout.lse_padding
-    shapes = (lse_elements,), (lse_elements,), accumulator_shape(q_shape, layout.accumulator_padding)
+    shapes = (
+        (lse_elements,),
+        (lse_elements,),
+        pivots_shape(lse_elements),
+        accumulator_shape(q_shape, layout.accumulator_padding),
+    )
     if layout.dkv_accum:
         shapes += ((2, *accumulator_shape(k_shape, layout.accumulator_padding)),)
+    elif layout.dk_fix:
+        if k_shape is None:
+            raise ValueError("backward_workspace_shapes needs k_shape")
+        shapes += (dk_fix_shape(k_shape, layout.accumulator_padding),)
     if layout.scheduler_metadata_rows:
         if k_shape is None:
             raise ValueError("backward_workspace_shapes needs k_shape for varlen inputs")
@@ -249,10 +279,10 @@ def backward(
     window_size_right=-1,
     stream=None,
 ):
-    lse_log2, dpsum, dq_accum, *extra = workspace
+    lse_log2, dpsum, pivots, dq_accum, *extra = workspace
     views = {name: view_of(t) for name, t in dict(
         q=q, k=k, v=v, out=out, dout=dout, lse=softmax_lse, dq=dq, dk=dk, dv=dv,
-        lse_log2=lse_log2, dpsum=dpsum, dq_accum=dq_accum,
+        lse_log2=lse_log2, dpsum=dpsum, pivots=pivots, dq_accum=dq_accum,
     ).items()}
     head_dim = views["q"].shape[-1]
     num_head, num_head_kv = views["q"].shape[-2], views["k"].shape[-2]
@@ -273,7 +303,7 @@ def backward(
         max_seqlen_k,
     )
     layout = backward_workspace_layout(*key)
-    if len(extra) != layout.dkv_accum + bool(layout.scheduler_metadata_rows):
+    if len(extra) != (layout.dkv_accum or layout.dk_fix) + bool(layout.scheduler_metadata_rows):
         raise ValueError("pass the workspace that backward_workspace_shapes returns for these shapes and this window")
     (
         batch_size, seqlen_q, seqlen_k, cu_seqlens_q_pointer, cu_seqlens_k_pointer, row_axis_len_q, row_axis_len_k,
@@ -284,6 +314,10 @@ def backward(
     variant = backward_variant(*key)
     main, info = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd", variant)
     dkv_accum = extra[: layout.dkv_accum] if info.head_split else ()
+    fixes_dk = not dkv_accum and not info.dq_block_m
+    dk_accum = view_of(extra[0]).pointer if dkv_accum or fixes_dk else 0
+    dk_accum_strides = accumulator_strides(tuple(views["k"].shape), layout.accumulator_padding)
+    pivot_sum, pivot_key = pivot_pointers(views["pivots"])
 
     def blocks(rows, block):
         return varlen_blocks(rows, batch_size, block) if varlen else (rows + block - 1) // block
@@ -306,17 +340,18 @@ def backward(
         else 1
     )
     outputs = {name: views[name] for name in ("dk", "dv")}
-    if dkv_accum:
-        accumulator = view_of(dkv_accum[0])
+    dk_states, state_chunks = 0, 0
+    if dkv_accum or fixes_dk:
         _, accumulator_rows, _ = accumulator_shape(views["k"].shape, layout.accumulator_padding)
         half = num_head_kv * accumulator_rows * head_dim
+    if dkv_accum:
         strides = (seqlen_k * head_dim, head_dim, accumulator_rows * head_dim, 1)
         for index, name in enumerate(("dk", "dv")):
-            views[name] = View(accumulator.pointer + index * half * 4, views["k"].shape, strides)
-        clear, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_clear", variant)
-        runtime.run(
-            clear, (CLEAR_BLOCKS, 1, 1), AUXILIARY_THREADS, 0, CLEAR_SIGNATURE, (accumulator.pointer, half // 2), stream
-        )
+            views[name] = View(dk_accum + index * half * 4, views["k"].shape, strides)
+        clear, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_clear", variant, dynamic_shared=False)
+        runtime.run(clear, (CLEAR_BLOCKS, 1, 1), AUXILIARY_THREADS, 0, CLEAR_SIGNATURE, (dk_accum, half // 2), stream)
+    elif fixes_dk:
+        dk_states, state_chunks = dk_accum + half * 4, dk_state_chunks(num_head_kv * accumulator_rows, head_dim)
 
     def row_strides(name):
         view = views[name]
@@ -370,14 +405,15 @@ def backward(
                 )
             maps += (dq_accum_map,)
             main_values = (
-                *maps, views["lse_log2"].pointer, views["dpsum"].pointer, views["dk"].pointer, views["dv"].pointer,
+                *maps, views["lse_log2"].pointer, views["dpsum"].pointer, pivot_sum, pivot_key,
+                views["dk"].pointer, views["dv"].pointer,
                 *scalars, *row_strides("dk"), *row_strides("dv"), lse_batch_stride, lse_head_stride, batch_size,
             )
         else:
             signature = TENSOR_MAP_BACKWARD_SIGNATURE
             main_values = (
-                *maps, views["lse_log2"].pointer, views["dpsum"].pointer, views["dq_accum"].pointer,
-                views["dk"].pointer, views["dv"].pointer,
+                *maps, views["lse_log2"].pointer, views["dpsum"].pointer, pivot_sum, pivot_key,
+                views["dq_accum"].pointer, views["dk"].pointer, views["dv"].pointer,
                 *scalars, *row_strides("dk"), *row_strides("dv"), *accum_strides,
                 lse_batch_stride, lse_head_stride, batch_size,
             )
@@ -385,7 +421,7 @@ def backward(
         signature = BACKWARD_SIGNATURE
         main_values = (
             views["q"].pointer, views["k"].pointer, views["v"].pointer, views["dout"].pointer,
-            views["lse_log2"].pointer, views["dpsum"].pointer, views["dq_accum"].pointer,
+            views["lse_log2"].pointer, views["dpsum"].pointer, pivot_sum, pivot_key, views["dq_accum"].pointer,
             views["dk"].pointer, views["dv"].pointer, cu_seqlens_q_pointer, cu_seqlens_k_pointer,
             seqlen_q, seqlen_k, qhead_per_kvhead, softmax_scale * LOG2_E, softmax_scale,
             window_size_left, window_size_right,
@@ -415,10 +451,10 @@ def backward(
         PREPROCESS_SIGNATURE,
         (
             views["out"].pointer, views["dout"].pointer, views["lse"].pointer,
-            views["lse_log2"].pointer, views["dpsum"].pointer, views["dq_accum"].pointer,
+            views["lse_log2"].pointer, views["dpsum"].pointer, pivot_sum, pivot_key, views["dq_accum"].pointer,
             cu_seqlens_q_pointer, seqlen_q,
             *row_strides("out"), *row_strides("dout"), lse_batch_stride, lse_head_stride, *accum_strides,
-            batch_size,
+            batch_size, dk_states, state_chunks,
         ),
         stream,
     )
@@ -445,7 +481,7 @@ def backward(
                 (count for count in allowed if efficiency(count) >= WAVE_SPLIT_TARGET_EFFICIENCY),
                 max(allowed, key=efficiency),
             )
-    runtime.run(
+    main_launch = (
         main,
         (cluster_ctas * num_n_blocks * head_splits, num_head_kv * num_qhead_splits, grid_z),
         info.threads,
@@ -453,10 +489,10 @@ def backward(
         signature,
         main_values,
         stream,
-        pdl=info.pdl,
-        cluster_dims=(1, num_qhead_splits, 1) if num_qhead_splits > 1 else None,
     )
+    main_options = dict(pdl=info.pdl, cluster_dims=(1, num_qhead_splits, 1) if num_qhead_splits > 1 else None)
     if info.dq_block_m:
+        # The dK kernel reads the pivot keys and row sums that the dQ kernel writes.
         dq_kernel, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_dq", variant)
         runtime.run(
             dq_kernel,
@@ -465,16 +501,20 @@ def backward(
             info.shared_bytes,
             DQ_SIGNATURE,
             (
-                *maps, views["lse_log2"].pointer, views["dpsum"].pointer, views["dq"].pointer,
-                cu_seqlens_q_pointer, cu_seqlens_k_pointer, seqlen_q, seqlen_k, qhead_per_kvhead,
+                *maps, views["lse_log2"].pointer, views["dpsum"].pointer, pivot_sum, pivot_key, views["dq"].pointer,
+                views["k"].pointer, cu_seqlens_q_pointer, cu_seqlens_k_pointer, seqlen_q, seqlen_k, qhead_per_kvhead,
                 softmax_scale * LOG2_E, softmax_scale, window_size_left, window_size_right,
-                *row_strides("dq"), lse_batch_stride, lse_head_stride, batch_size,
+                *row_strides("dq"), *row_strides("k"), lse_batch_stride, lse_head_stride, batch_size,
             ),
             stream,
             pdl=info.pdl,
         )
+        runtime.run(*main_launch, **main_options)
         return
-    postprocess, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_postprocess", variant)
+    runtime.run(*main_launch, **main_options)
+    postprocess, _ = runtime.load_for(
+        device_id, "bwd", head_dim, "flash_attn_bwd_postprocess", variant, dynamic_shared=False
+    )
     runtime.run(
         postprocess,
         (row_blocks(row_axis_len_q, POSTPROCESS_ROWS), num_head, grid_z),
@@ -482,8 +522,10 @@ def backward(
         0,
         POSTPROCESS_SIGNATURE,
         (
-            views["dq_accum"].pointer, views["dq"].pointer, cu_seqlens_q_pointer, seqlen_q, softmax_scale,
-            *accum_strides, *row_strides("dq"), batch_size,
+            views["dq_accum"].pointer, views["dq"].pointer, pivot_sum, pivot_key, views["q"].pointer,
+            views["k"].pointer, dk_accum, dk_states, cu_seqlens_q_pointer, seqlen_q, qhead_per_kvhead, softmax_scale,
+            *accum_strides, *row_strides("dq"), *row_strides("q"), *row_strides("k"), *dk_accum_strides,
+            lse_batch_stride, lse_head_stride, batch_size,
         ),
         stream,
         pdl=info.pdl,
@@ -496,11 +538,31 @@ def backward(
             0,
             POSTPROCESS_SIGNATURE,
             (
-                views[name].pointer, output.pointer, cu_seqlens_k_pointer, seqlen_k, 1.0,
-                *accumulator_strides(views["k"].shape, layout.accumulator_padding),
-                (0 if varlen else output.strides[0]),
-                output.strides[-3], output.strides[-2], batch_size,
+                views[name].pointer, output.pointer, 0, 0, 0, 0, 0, 0, cu_seqlens_k_pointer, seqlen_k, 1, 1.0,
+                *dk_accum_strides, (0 if varlen else output.strides[0]), output.strides[-3], output.strides[-2],
+                *(0,) * 11, batch_size,
             ),
             stream,
             pdl=info.pdl,
         )
+    if fixes_dk:
+        fix_dk, _ = runtime.load_for(device_id, "bwd", head_dim, "flash_attn_bwd_fix_dk", variant, dynamic_shared=False)
+        launch_fix_dk(fix_dk, dk_accum, dk_states, views["dk"], layout.accumulator_padding, varlen, stream, info.pdl)
+
+
+def launch_fix_dk(kernel, dk_accum, dk_states, dk, padding_rows, varlen, stream, pdl):
+    num_head_kv, accumulator_rows, head_dim = accumulator_shape(dk.shape, padding_rows)
+    rows = num_head_kv * accumulator_rows
+    blocks = min(-(-rows * (head_dim // 8) // AUXILIARY_THREADS), FIX_DK_BLOCKS)
+    batch_rows, batch_stride = (accumulator_rows, 0) if varlen else (dk.shape[1], dk.strides[0])
+    runtime.run(
+        kernel, (blocks, 1, 1), AUXILIARY_THREADS, 0, FIX_DK_SIGNATURE,
+        (dk_accum, dk_states, dk.pointer, rows, accumulator_rows, batch_rows, batch_stride, *dk.strides[-3:-1]),
+        stream, pdl=pdl,
+    )
+
+
+def pivot_pointers(pivots):
+    # The workspace keeps the scaled FP32 row sums of dS in its first row and the int32 pivot keys
+    # in its second.
+    return pivots.pointer, pivots.pointer + pivots.strides[0] * 4

@@ -7,6 +7,8 @@ v: u64 = 0,
 do: u64 = 0,
 lse_log2: u64 = 0,
 dpsum: u64 = 0,
+pivot_sum: u64 = 0,
+pivot_key: u64 = 0,
 dq_accum: u64 = 0,
 dk: u64 = 0,
 dv: u64 = 0,
@@ -46,6 +48,14 @@ num_batch: u32 = 0,
 scheduler_metadata: u64 = 0,
 visibility_bits: u64 = 0,
 window_sizes: u64 = 0,
+
+/// `pivot_sum` holds `pivot_sum_scale` times the row sums of the BF16 dS. Kernels that sum a row in
+/// parts add the parts with `red.add.f32`, which flushes subnormal inputs and results to zero (PTX
+/// ISA 9.7.15.6). An FP32 sum of BF16 numbers is a multiple of 2^-133, the smallest BF16 subnormal
+/// number, so each scaled part and each total of scaled parts is zero or at least 2^-126, the
+/// smallest normal FP32 number, in magnitude. The scaled sums overflow once a row sum or one of its
+/// parts reaches 2^121 in magnitude.
+pub const pivot_sum_scale: f32 = 0x1p7;
 
 pub const Gradient = enum { dk, dv };
 

@@ -688,7 +688,7 @@ pub fn combineSplits(
         nvptx.cache.store(caching, &own[chunk][id], fragment);
     }
     const state: Accumulator = .{
-        softmax.row_max[0], softmax.row_max[1], softmax.row_sum[0], softmax.row_sum[1],
+        softmax.row_max[0], softmax.row_max[1], softmax.rest_sum[0], softmax.rest_sum[1],
     };
     nvptx.cache.store(caching, &own[output.len][id], state);
     nvptx.fence(.seq_cst, .gpu);
@@ -709,7 +709,7 @@ pub fn combineSplits(
         const other_state = nvptx.cache.load(loading, &other[output.len][id]);
         const own_scale, const other_scale = softmax.combine(.{
             .row_max = .{ other_state[0], other_state[1] },
-            .row_sum = .{ other_state[2], other_state[3] },
+            .rest_sum = .{ other_state[2], other_state[3] },
         }, params.softmax_scale_log2);
         inline for (output, 0..) |*fragment, chunk| {
             const vector = nvptx.cache.load(loading, &other[chunk][id]);
@@ -1127,7 +1127,12 @@ fn TileWorker(comptime head_dim: u32, comptime worker_warps: u32, comptime packs
                 }
                 trace.end(.scores);
                 trace.begin(.softmax);
-                const step = SliceOnline.step(&softmax, scores, params.softmax_scale_log2);
+                const step = SliceOnline.orderedStep(
+                    &softmax,
+                    .in_branch,
+                    scores,
+                    params.softmax_scale_log2,
+                );
                 trace.end(.softmax);
                 trace.begin(.output);
                 trace.begin(.wait_v);
@@ -1172,7 +1177,7 @@ fn TileWorker(comptime head_dim: u32, comptime worker_warps: u32, comptime packs
             const own = &states[worker.warp()];
             inline for (output, 0..) |fragment, chunk| own[chunk][lane] = fragment;
             own[row_chunks / 2][lane] = .{
-                softmax.row_max[0], softmax.row_max[1], softmax.row_sum[0], softmax.row_sum[1],
+                softmax.row_max[0], softmax.row_max[1], softmax.rest_sum[0], softmax.rest_sum[1],
             };
             worker.sync();
             if (key_slice == 0) {
@@ -1181,7 +1186,7 @@ fn TileWorker(comptime head_dim: u32, comptime worker_warps: u32, comptime packs
                     const state = other[row_chunks / 2][lane];
                     const own_scale, const other_scale = softmax.combine(.{
                         .row_max = .{ state[0], state[1] },
-                        .row_sum = .{ state[2], state[3] },
+                        .rest_sum = .{ state[2], state[3] },
                     }, params.softmax_scale_log2);
                     inline for (&output, 0..) |*fragment, chunk| {
                         fragment.* = fragment.* * own_scale + other[chunk][lane] * other_scale;
@@ -1336,7 +1341,12 @@ fn TileWorker(comptime head_dim: u32, comptime worker_warps: u32, comptime packs
                         }
                         trace.end(.scores);
                         trace.begin(.softmax);
-                        const step = Online.step(&softmax, scores, params.softmax_scale_log2);
+                        const step = Online.orderedStep(
+                            &softmax,
+                            .in_branch,
+                            scores,
+                            params.softmax_scale_log2,
+                        );
                         trace.end(.softmax);
                         trace.begin(.output);
                         trace.begin(.wait_v);
@@ -1413,7 +1423,8 @@ fn TileWorker(comptime head_dim: u32, comptime worker_warps: u32, comptime packs
                 const next_cursor = load.cursor;
                 if (load.cursor.valid()) load.advance(params);
                 trace.begin(.softmax);
-                const step = Online.step(&softmax, scores, params.softmax_scale_log2);
+                const step =
+                    Online.orderedStep(&softmax, .in_branch, scores, params.softmax_scale_log2);
                 trace.end(.softmax);
                 trace.begin(.output);
                 trace.begin(.pv_mma);

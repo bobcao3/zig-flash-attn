@@ -90,6 +90,8 @@ pub fn FlashAttnBwdSm100Dkdv(comptime tiling: configurations.Sm100BwdTiling) typ
             ds: [key_rows * operand_row_chunks]Chunk,
             lse_negated: [vector_chunks]Chunk,
             dpsum_negated: [vector_chunks]Chunk,
+            pivot_sum: [vector_chunks]Chunk,
+            pivot_key: [vector_chunks]Chunk,
         };
 
         comptime {
@@ -129,6 +131,7 @@ pub fn FlashAttnBwdSm100Dkdv(comptime tiling: configurations.Sm100BwdTiling) typ
         var vectors_full: Mbarrier addrspace(.shared) = undefined;
         var vectors_empty: Mbarrier addrspace(.shared) = undefined;
         var tmem_base: u32 addrspace(.shared) = undefined;
+        var holds_pivot: bool addrspace(.shared) = undefined;
 
         pub fn allocateTmem() void {
             tcgen05.allocate2Sm(&tmem_base, tcgen05.capacity);
@@ -366,6 +369,16 @@ pub fn FlashAttnBwdSm100Dkdv(comptime tiling: configurations.Sm100BwdTiling) typ
             }
         }
 
+        fn ownsPivot(work: Work, keys: Chunk, rows: u32) bool {
+            const first_key = work.sequence.offset_k + work.first_key;
+            var owns = false;
+            inline for (0..4) |element| {
+                if (thread.lane() * 4 + element < rows and
+                    keys[element] -% first_key < work.key_count) owns = true;
+            }
+            return owns;
+        }
+
         fn runLoadLseDpsum(params: BackwardParams) void {
             const work = Work.decode(params) orelse return;
             if (tiling.pdl) nvptx.griddepcontrol(.wait);
@@ -377,9 +390,16 @@ pub fn FlashAttnBwdSm100Dkdv(comptime tiling: configurations.Sm100BwdTiling) typ
                     work.sequence.offset_q + step.first_row;
                 const lse_negated = fragments.gather(params.lse_log2, vector, step.row_count);
                 const dpsum_negated = fragments.gather(params.dpsum, vector, step.row_count);
+                const pivot_sum = fragments.gather(params.pivot_sum, vector, step.row_count);
+                const pivot_key = fragments.gather(params.pivot_key, vector, step.row_count);
+                const pivots =
+                    nvptx.voteSync(.any, ownsPivot(work, pivot_key, step.row_count), .all);
                 mbarrier.wait(.cta, &vectors_empty, index ^ 1);
                 tiles.lse_negated[thread.lane()] = lse_negated;
                 tiles.dpsum_negated[thread.lane()] = dpsum_negated;
+                tiles.pivot_sum[thread.lane()] = pivot_sum;
+                tiles.pivot_key[thread.lane()] = pivot_key;
+                if (thread.lane() == 0) holds_pivot = pivots;
                 mbarrier.arrive(.warp_synced, &vectors_full);
             }
         }
@@ -516,6 +536,20 @@ pub fn FlashAttnBwdSm100Dkdv(comptime tiling: configurations.Sm100BwdTiling) typ
             return ds;
         }
 
+        fn substitutePivots(work: Work, ds: *Scores) void {
+            const key = work.sequence.offset_k + work.first_key + keyRow();
+            const keys = rowVectorSlice(&tiles.pivot_key);
+            const sums = rowVectorSlice(&tiles.pivot_sum);
+            inline for (0..queries_per_compute_group / 4) |quad| {
+                const sum: @Vector(4, f32) = @bitCast(sums[quad]);
+                inline for (0..4) |element| {
+                    const column = quad * 4 + element;
+                    const pivot_ds = sum[element] * (-1.0 / BackwardParams.pivot_sum_scale);
+                    ds[column] = if (keys[quad][element] == key) pivot_ds else ds[column];
+                }
+            }
+        }
+
         fn gradientElement(params: BackwardParams, work: Work, comptime value_gradient: bool) u64 {
             const row: u64 = work.sequence.offset_k + work.first_key + keyRow();
             return params.gradientElement(
@@ -603,6 +637,7 @@ pub fn FlashAttnBwdSm100Dkdv(comptime tiling: configurations.Sm100BwdTiling) typ
                 tcgen05.fenceBeforeSync();
                 mbarrier.arrive(.leader_cta, &dp_empty);
                 var ds = computeDs(probabilities, dp, rowVectorSlice(&tiles.dpsum_negated));
+                if (holds_pivot) substitutePivots(work, &ds);
                 if (!interior) maskR2p(&ds, lower, upper, 0);
                 mbarrier.arrive(.warp_synced, &vectors_empty);
                 if (index > 0) mbarrier.wait(.cta, &ds_empty, index - 1);

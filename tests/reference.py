@@ -1,4 +1,5 @@
 import math
+from typing import NamedTuple
 
 import torch
 
@@ -165,3 +166,95 @@ def inter_sequence_visible(cu_seqlens_q, cu_seqlens_k, visible, windows):
 def inter_sequence_attention_ref(q, k, v, mask, upcast=True, softmax_scale=None):
     out, lse = masked_attention(q[None], k[None], v[None], on_device(mask[None], q.device), upcast, softmax_scale)
     return out[0], lse[0]
+
+
+class StableAttention(NamedTuple):
+    out: torch.Tensor
+    lse: torch.Tensor
+    dq: torch.Tensor
+    dk: torch.Tensor
+    dv: torch.Tensor
+    top: torch.Tensor
+    margin: torch.Tensor
+    spread: torch.Tensor
+    visible: torch.Tensor
+    pivot: torch.Tensor
+    out_scale: torch.Tensor
+    dq_scale: torch.Tensor
+    dk_scale: torch.Tensor
+    dv_scale: torch.Tensor
+    corrected_keys: torch.Tensor
+
+
+PIVOT_PROBABILITY = 0.75
+
+
+def stable_attention_f64(q, k, v, dout, visible, softmax_scale=None):
+    """Attention in float64 with the log-sum-exp `top + log1p(rest)`, where `rest` sums the exponentials of
+    the keys other than the top one (eq. 5 of Barron et al., "A Fix for Softmax and Cross-Entropy"). The
+    score gradients are `dS_j = P_j ((dP_j - dP_top) - E)` with `E = sum_i P_i (dP_i - dP_top)`, so the top
+    key's term `-P_top E` equals the negated sum of the others (their eq. 7) without cancellation.
+    `dq_scale` and `dk_scale` sum the error weights of the terms of each gradient row. The weight of `dS_j`
+    is `|dS_j| + P_j sum(|out * dout|)`; to first order, 2**-8 times the weight bounds the error that
+    rounding `dS_j` and `out` to bfloat16 causes in `dS_j`. The top key of a row with a pivot carries the
+    sum of the weights of the other keys of the row."""
+    batch, seqlen_q, heads, head_dim = q.shape
+    groups = heads // k.shape[2]
+    scale = head_dim**-0.5 if softmax_scale is None else softmax_scale
+    q64, dout64 = (x.double().transpose(1, 2) for x in (q, dout))
+    k64, v64 = (x.double().transpose(1, 2).repeat_interleave(groups, dim=1) for x in (k, v))
+    mask = visible[:, None].to(q.device)
+    z = (scale * q64 @ k64.transpose(-1, -2)).masked_fill(~mask, float("-inf"))
+    live = mask.any(-1)
+    top, top_key = z.max(-1, keepdim=True)
+    top = top.masked_fill(~live[..., None], 0.0)
+    others = (z - top).exp().scatter(-1, top_key, 0.0)
+    rest = others.sum(-1, keepdim=True)
+    p = (others.scatter(-1, top_key, 1.0) / (1.0 + rest)).masked_fill(~live[..., None], 0.0)
+    dp = dout64 @ v64.transpose(-1, -2)
+    shifted = dp - dp.gather(-1, top_key)
+    ds = p * (shifted - (p * shifted).sum(-1, keepdim=True))
+    pivot = live & (p.amax(-1) > PIVOT_PROBABILITY)
+    out = p @ v64
+    weight = ds.abs() + p * (out.abs() * dout64.abs()).sum(-1, keepdim=True)
+    pivot_weight = weight.scatter(-1, top_key, 0.0).sum(-1, keepdim=True)
+    weight = torch.where(pivot[..., None], weight.scatter(-1, top_key, pivot_weight), weight)
+    spread = torch.where(mask, others * z.abs(), 0.0).sum(-1) / rest[..., 0]
+    pivot_counts = torch.zeros_like(p[..., 0, :]).scatter_add(-1, top_key[..., 0], pivot.double())
+
+    def per_kv_head(x):
+        return x.unflatten(1, (-1, groups)).sum(2).transpose(1, 2)
+
+    def magnitude(weights, vectors):
+        return (weights.abs() @ vectors.norm(dim=-1, keepdim=True))[..., 0]
+
+    return StableAttention(
+        out=out.transpose(1, 2),
+        lse=torch.where(live, top[..., 0] + rest[..., 0].log1p(), float("-inf")),
+        dq=(scale * ds @ k64).transpose(1, 2),
+        dk=per_kv_head(scale * ds.transpose(-1, -2) @ q64),
+        dv=per_kv_head(p.transpose(-1, -2) @ dout64),
+        top=top[..., 0],
+        margin=torch.where(live, -rest[..., 0].log(), float("nan")),
+        spread=spread,
+        visible=mask.sum(-1).expand(batch, heads, seqlen_q),
+        pivot=pivot,
+        out_scale=magnitude(p, v64).transpose(1, 2),
+        dq_scale=scale * magnitude(weight, k64).transpose(1, 2),
+        dk_scale=per_kv_head(scale * magnitude(weight.transpose(-1, -2), q64)[..., None])[..., 0],
+        dv_scale=per_kv_head(magnitude(p.transpose(-1, -2), dout64)[..., None])[..., 0],
+        corrected_keys=per_kv_head(pivot_counts[..., None])[..., 0] > 0,
+    )
+
+
+def varlen_visible(cu_seqlens_q, cu_seqlens_k, window_size=(-1, -1)):
+    cu_q, cu_k = cu_seqlens_q.cpu().long(), cu_seqlens_k.cpu().long()
+    lengths_q, lengths_k = cu_q[1:] - cu_q[:-1], cu_k[1:] - cu_k[:-1]
+    windows = visible_keys(
+        lengths_q, lengths_k, max(int(lengths_q.max()), 1), max(int(lengths_k.max()), 1), window_size
+    )
+    mask = torch.zeros(int(cu_q[-1]), int(cu_k[-1]), dtype=torch.bool)
+    for sequence, (length_q, length_k) in enumerate(zip(lengths_q.tolist(), lengths_k.tolist())):
+        rows, columns = slice(cu_q[sequence], cu_q[sequence + 1]), slice(cu_k[sequence], cu_k[sequence + 1])
+        mask[rows, columns] = windows[sequence, :length_q, :length_k]
+    return mask

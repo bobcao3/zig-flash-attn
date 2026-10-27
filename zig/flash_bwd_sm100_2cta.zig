@@ -114,6 +114,7 @@ pub fn FlashAttnBwdSm100TwoCta(
             std.debug.assert(
                 half_boxes == 1 and ds_row_bytes == swizzle_bytes and vector_chunks == 32,
             );
+            std.debug.assert(ds_row_bytes == 128 and reduce_warps * 32 == query_rows);
             std.debug.assert(!tiling.use_tma_store or (padded == head_dim and
                 @offsetOf(Tiles, "do") == @offsetOf(Tiles, "q") +
                     @sizeOf(@FieldType(Tiles, "q")) and
@@ -143,6 +144,7 @@ pub fn FlashAttnBwdSm100TwoCta(
         var p_ready: Mbarrier addrspace(.shared) = undefined;
         var dp_full: Mbarrier addrspace(.shared) = undefined;
         var ds_ready: Mbarrier addrspace(.shared) = undefined;
+        var ds_stored: Mbarrier addrspace(.shared) = undefined;
         var ds_empty: Mbarrier addrspace(.shared) = undefined;
         var dq_full: Mbarrier addrspace(.shared) = undefined;
         var dq_empty: Mbarrier addrspace(.shared) = undefined;
@@ -165,9 +167,11 @@ pub fn FlashAttnBwdSm100TwoCta(
             if (thread.warp() == initializer_warp and elect.oneSync()) {
                 inline for (.{
                     &k_full,   &v_full,  &kt_full,   &q_full,     &q_empty, &do_full, &do_empty,
-                    &qt_empty, &qt_full, &do_t_full, &do_t_empty, &s_full,  &dp_full, &ds_empty,
-                    &dq_full,  &dv_full, &dk_full,
+                    &qt_empty, &qt_full, &do_t_full, &do_t_empty, &s_full,  &dp_full, &dq_full,
+                    &dv_full,  &dk_full,
                 }) |barrier| barrier.init(1);
+                ds_stored.init(compute_warps);
+                ds_empty.init(1 + reduce_warps);
                 inline for (.{
                     &kt_tma_full, &qt_tma_full, &do_t_tma_full,
                 }) |barrier| barrier.init(1);
@@ -449,6 +453,11 @@ pub fn FlashAttnBwdSm100TwoCta(
             }
         }
 
+        fn rowVector(params: BackwardParams, work: Work, step: Work.Step) u64 {
+            return work.batch * params.lse_batch_stride + step.head * params.lse_head_stride +
+                work.sequence.offset_q + step.block_info.first_row;
+        }
+
         fn runLoadLseDpsum(params: BackwardParams) void {
             const work = decodeWork(params) orelse return;
             if (tiling.pdl) nvptx.griddepcontrol(.wait);
@@ -456,9 +465,7 @@ pub fn FlashAttnBwdSm100TwoCta(
             while (index < work.iterations()) : (index += 1) {
                 const step = work.step(index);
                 const slot = index % 2;
-                const vector =
-                    work.batch * params.lse_batch_stride + step.head * params.lse_head_stride +
-                    work.sequence.offset_q + step.block_info.first_row;
+                const vector = rowVector(params, work, step);
                 const lse_negated =
                     fragments.gather(params.lse_log2, vector, step.block_info.row_count);
                 const dpsum_negated =
@@ -630,6 +637,18 @@ pub fn FlashAttnBwdSm100TwoCta(
                 tcgen05.store(dp_address + piece * 16, words[piece]);
             }
             return words;
+        }
+
+        fn excludePivots(
+            params: BackwardParams,
+            work: Work,
+            step: Work.Step,
+            probabilities: *Scores,
+        ) void {
+            const keys: [*]addrspace(.global) i32 = @ptrFromInt(params.pivot_key);
+            const first = rowVector(params, work, step) + columnGroup() * queries_per_compute_group;
+            const key: i32 = @intCast(work.sequence.offset_k + ownKey(work) + keyRow());
+            f32x2.excludePivots(probabilities, keys + first, key);
         }
 
         fn storeDs(words: [pieces]@Vector(16, u32)) void {
@@ -832,6 +851,12 @@ pub fn FlashAttnBwdSm100TwoCta(
                 tcgen05.waitStore();
                 tcgen05.fenceBeforeSync();
                 mbarrier.arrive(.leader_cta, &p_ready);
+                if (f32x2.warpHasPivot(probabilities)) excludePivots(
+                    params,
+                    work,
+                    step,
+                    &probabilities,
+                );
                 mbarrier.wait(.cta, &dp_full, index);
                 tcgen05.fenceAfterSync();
                 const dpsum_negated =
@@ -845,6 +870,7 @@ pub fn FlashAttnBwdSm100TwoCta(
                 nvptx.fenceProxyAsync(.shared);
                 tcgen05.fenceBeforeSync();
                 if (group != cluster.rankIn2Cta()) sendDsExchange();
+                mbarrier.arrive(.warp_synced, &ds_stored);
                 mbarrier.arrive(.leader_cta, &ds_ready);
             }
             epilogueDkv(params, args, work);
@@ -853,11 +879,33 @@ pub fn FlashAttnBwdSm100TwoCta(
         pub fn runCompute(params: BackwardParams, args: Args) void {
             tcgen05.fenceAfterSync();
             const work = decodeWork(params) orelse return;
+            if (tiling.pdl) nvptx.griddepcontrol(.wait);
             if (work.iterations() == 0) {
                 writeZeroDkv(params, work);
                 return;
             }
             computeWorkTile(params, args, work);
+        }
+
+        fn sumChunk() u32 {
+            return thread.warp() % 2 * 4 + thread.lane() % 4;
+        }
+
+        fn addPivotSum(params: BackwardParams, work: Work, step: Work.Step) void {
+            const group = thread.warp() / 2;
+            const ds_tile: *addrspace(.shared) const [key_rows * ds_row_chunks]Chunk =
+                if (group == cluster.rankIn2Cta()) @ptrCast(&tiles.ds[
+                    cluster.rankIn2Cta() * key_rows * ds_row_chunks
+                ]) else &tiles.exchange;
+            const sum = f32x2.swizzledColumnSum(ds_tile, sumChunk());
+            mbarrier.arrive(.warp_synced, &ds_empty);
+            const query = group * queries_per_compute_group + sumChunk() * 8 + thread.lane() / 4;
+            if (query < step.block_info.row_count and sum != 0) {
+                const sums: [*]addrspace(.global) f32 = @ptrFromInt(params.pivot_sum);
+                const row = rowVector(params, work, step) + query;
+                const scaled = sum * BackwardParams.pivot_sum_scale;
+                nvptx.red(.gpu, .monotonic, .add, &sums[row], scaled);
+            }
         }
 
         pub fn runReduce(params: BackwardParams, args: Args) void {
@@ -876,6 +924,8 @@ pub fn FlashAttnBwdSm100TwoCta(
             var index: u32 = 0;
             while (index < steps) : (index += 1) {
                 const step = work.step(index);
+                mbarrier.wait(.cta, &ds_stored, index);
+                addPivotSum(params, work, step);
                 mbarrier.wait(.cta, &dq_full, index);
                 tcgen05.fenceAfterSync();
                 const values = tcgen05.loadColumns(half_columns, dq_address);

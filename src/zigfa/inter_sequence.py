@@ -14,6 +14,11 @@ from .backward import (
     SM80_SEQUENCE_ROW_ALIGNMENT,
     accumulator_shape,
     accumulator_strides,
+    dk_fix_shape,
+    dk_state_chunks,
+    launch_fix_dk,
+    pivot_pointers,
+    pivots_shape,
 )
 from .tensors import (
     LOG2_E,
@@ -250,7 +255,9 @@ def backward_workspace_shapes(q_shape, lse_shape, k_shape, num_sequences):
     return (
         (lse_elements,),
         (lse_elements,),
+        pivots_shape(lse_elements),
         accumulator_shape(q_shape, padding),
+        dk_fix_shape(k_shape, padding),
         (scheduler_metadata_entries(k_shape[0], num_sequences, info.block_n), 2),
     )
 
@@ -363,10 +370,10 @@ def backward(
     q, k, v, out, dout, softmax_lse, dq, dk, dv, workspace, sequences, *, softmax_scale=None, window_size_left=-1,
     window_size_right=-1, stream=None,
 ):
-    lse_log2, dpsum, dq_accum, table = workspace
+    lse_log2, dpsum, pivots, dq_accum, dk_accum, table = workspace
     views = {name: view_of(t) for name, t in dict(
         q=q, k=k, v=v, out=out, dout=dout, lse=softmax_lse, dq=dq, dk=dk, dv=dv,
-        lse_log2=lse_log2, dpsum=dpsum, dq_accum=dq_accum,
+        lse_log2=lse_log2, dpsum=dpsum, pivots=pivots, dq_accum=dq_accum, dk_accum=dk_accum,
     ).items()}
     head_dim = views["q"].shape[-1]
     num_head, num_head_kv = views["q"].shape[-2], views["k"].shape[-2]
@@ -384,25 +391,34 @@ def backward(
     load = functools.partial(runtime.load_for, device_id, "bwd", head_dim, variant=VARIANT, dynamic_shared=False)
     preprocess, _ = load(kernel_name="flash_attn_bwd_preprocess")
     postprocess, _ = load(kernel_name="flash_attn_bwd_postprocess")
+    fix_dk, _ = load(kernel_name="flash_attn_bwd_fix_dk")
     softmax_scale = default_softmax_scale(softmax_scale, head_dim)
     cu_seqlens_q, cu_seqlens_k = (view_of(t).pointer for t in (sequences.cu_seqlens_q, sequences.cu_seqlens_k))
     padding = max(ACCUMULATOR_PADDING_ROWS, info.block_m) + SM80_SEQUENCE_ROW_ALIGNMENT * num_sequences
     accum_strides = accumulator_strides(tuple(views["q"].shape), padding)
+    dk_accum_strides = accumulator_strides(tuple(views["k"].shape), padding)
     lse_strides = (0, views["lse"].strides[0])
+    pivot_sum, pivot_key = pivot_pointers(views["pivots"])
+    fixes_dk = bool(rows_q and rows_k)
+    key_heads, key_rows, _ = accumulator_shape(tuple(views["k"].shape), padding)
+    dk_accum = views["dk_accum"].pointer if fixes_dk else 0
+    dk_states = dk_accum + 4 * key_heads * key_rows * head_dim if fixes_dk else 0
+    state_chunks = dk_state_chunks(key_heads * key_rows, head_dim) if fixes_dk else 0
     if rows_q:
         runtime.run(
             preprocess, (-(-rows_q // PREPROCESS_ROWS), num_head, 1), AUXILIARY_THREADS, 0, PREPROCESS_SIGNATURE,
             (
                 views["out"].pointer, views["dout"].pointer, views["lse"].pointer, views["lse_log2"].pointer,
-                views["dpsum"].pointer, views["dq_accum"].pointer, cu_seqlens_q, 0,
+                views["dpsum"].pointer, pivot_sum, pivot_key, views["dq_accum"].pointer, cu_seqlens_q, 0,
                 *row_strides(views["out"]), *row_strides(views["dout"]), *lse_strides, *accum_strides, num_sequences,
+                dk_states, state_chunks,
             ),
             stream,
         )
     num_n_blocks = scheduler_metadata_entries(rows_k, num_sequences, info.block_n)
     values = (
         views["q"].pointer, views["k"].pointer, views["v"].pointer, views["dout"].pointer,
-        views["lse_log2"].pointer, views["dpsum"].pointer, views["dq_accum"].pointer,
+        views["lse_log2"].pointer, views["dpsum"].pointer, pivot_sum, pivot_key, views["dq_accum"].pointer,
         views["dk"].pointer, views["dv"].pointer, cu_seqlens_q, cu_seqlens_k,
         0, 0, num_head // num_head_kv, softmax_scale * LOG2_E, softmax_scale, window_size_left, window_size_right,
         *row_strides(views["q"]), *row_strides(views["k"]), *row_strides(views["v"]), *row_strides(views["dout"]),
@@ -422,8 +438,13 @@ def backward(
         runtime.run(
             postprocess, (-(-rows_q // POSTPROCESS_ROWS), num_head, 1), AUXILIARY_THREADS, 0, POSTPROCESS_SIGNATURE,
             (
-                views["dq_accum"].pointer, views["dq"].pointer, cu_seqlens_q, 0, softmax_scale, *accum_strides,
-                *row_strides(views["dq"]), num_sequences,
+                views["dq_accum"].pointer, views["dq"].pointer, pivot_sum, pivot_key, views["q"].pointer,
+                views["k"].pointer,
+                dk_accum, dk_states, cu_seqlens_q, 0,
+                num_head // num_head_kv, softmax_scale, *accum_strides, *row_strides(views["dq"]),
+                *row_strides(views["q"]), *row_strides(views["k"]), *dk_accum_strides, *lse_strides, num_sequences,
             ),
             stream,
         )
+    if fixes_dk:
+        launch_fix_dk(fix_dk, dk_accum, dk_states, views["dk"], padding, True, stream, False)
