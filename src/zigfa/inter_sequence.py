@@ -7,6 +7,7 @@ from .backward import (
     ACCUMULATOR_PADDING_ROWS,
     AUXILIARY_THREADS,
     BACKWARD_SIGNATURE,
+    DQ_ACCUM_MAP_BACKWARD_SIGNATURE,
     POSTPROCESS_ROWS,
     POSTPROCESS_SIGNATURE,
     PREPROCESS_ROWS,
@@ -16,10 +17,13 @@ from .backward import (
     accumulator_strides,
     dk_fix_shape,
     dk_state_chunks,
+    dq_accum_tensor_map,
     launch_fix_dk,
     pivot_pointers,
     pivots_shape,
+    qhead_splits,
 )
+from .tensormap import as_four_dimensional, tensor_map
 from .tensors import (
     LOG2_E,
     build_scheduler_metadata,
@@ -28,6 +32,7 @@ from .tensors import (
     require_supported_heads,
     require_window,
     scheduler_metadata_entries,
+    varlen_blocks,
     view_of,
 )
 
@@ -37,18 +42,24 @@ TRANSPOSE_WARPS = 8
 COUNT_THREADS = 1024
 TABLE_THREADS = 256
 FORWARD_SIGNATURE = "p" * 7 + "uuufii" + "p" * 14 + "u" + "pppp" + "u"
-BLOCK_TABLE_ROWS = (64, 128)
+BLOCK_TABLE_ROWS = (64, 128, 192, 256)
 BLOCK_TABLE_HEADER_BYTES = 16
 BLOCK_TABLE_BLOCK_BYTES = 32
 KEY_VALUE_ELEMENT_BYTES = 2
-PERSISTENT_SOURCE = "flash_fwd_persistent_sm80"
+PERSISTENT_PREFIX = runtime.PERSISTENT_PREFIX
 PERSISTENT_PACKED_VARIANT = "_gqa"
-PERSISTENT_SIGNATURE = "p" * 18 + "iif" + "uuu" + "ppp" + "uu" + "pu" + "u"
+PERSISTENT_SIGNATURE = "p" * 18 + "iif" + "uuu" + "ppppp" + "uu" + "pu" + "u"
+TMA_PERSISTENT_SIGNATURE = "mmm" + "p" * 15 + "iif" + "uuu" + "ppppp" + "uu" + "pu" + "u"
+# The SM90 persistent kernels are built for sm_90a, which only compute capability 9.0 runs.
+PERSISTENT_CAPABILITIES = {"sm90": (9, 0)}
 O_ACCUM_ALIGNMENT = 256
 SEQUENCE_RECORD_BYTES = 64
 ACCUMULATOR_BYTES = 16
 MAX_WARP_HEAD_DIM = 256
 SPLITS_PER_CTA = 4
+MAX_SPLITS = 4
+# The SM100 persistent forward combines no splits of a block.
+UNSPLIT_ARCHS = (100,)
 INTER_SEQUENCE_BACKWARD_SIGNATURE = BACKWARD_SIGNATURE + "ppp"
 
 
@@ -84,7 +95,15 @@ def packing_of(q_shape, num_head_kv):
 
 
 def persistent_instance(head_dim, packing):
-    return f"{PERSISTENT_SOURCE}{PERSISTENT_PACKED_VARIANT if packing > 1 else ''}_hd{head_dim}"
+    """Returns the persistent forward instance for this head dim and packing from the first source of
+    `persistent_sources` that builds it with a query box of whole groups of packed heads, or None."""
+    entries = runtime.manifest()[1]
+    variant = PERSISTENT_PACKED_VARIANT if packing > 1 else ""
+    for source in persistent_sources(runtime.current_device().device_id):
+        name = f"{source}{variant}_hd{head_dim}"
+        if name in entries and entries[name].q_box_rows % packing == 0:
+            return name
+    return None
 
 
 def metadata_shapes(num_sequences):
@@ -122,9 +141,10 @@ def o_accum_of(q_shape, num_sequences, num_head_kv=None):
         return OAccum(records_end, 0, 0)
     instance = persistent_instance(head_dim, packing_of(q_shape, num_head_kv))
     ctas = resident_ctas(device_id, instance)
-    if ctas > runtime.num_sm(device_id):
+    info = runtime.manifest()[1][instance]
+    if ctas > runtime.num_sm(device_id) or info.arch in UNSPLIT_ARCHS:
         return OAccum(records_end, 0, 0)
-    threads = runtime.manifest()[1][instance].threads
+    threads = info.threads
     accumulators = min(head_dim, MAX_WARP_HEAD_DIM) // 8 + 1
     return OAccum(offset, SPLITS_PER_CTA * ctas, accumulators * threads * ACCUMULATOR_BYTES)
 
@@ -163,7 +183,7 @@ def forward_head_dims(device_id):
     try:
         runtime.instance_name(device_id, "fwd", 0, VARIANT)
     except RuntimeError:
-        return ()
+        return persistent_head_dims(device_id)
     single_tile = {
         head_dim for head_dim in runtime.head_dims()
         if runtime.instance_name(device_id, "fwd", head_dim, VARIANT) in entries
@@ -178,6 +198,10 @@ def built_head_dims(device_id):
 @functools.cache
 def head_dims(device_id):
     entries = runtime.manifest()[1]
+    try:
+        runtime.instance_name(device_id, "bwd", 0, VARIANT)
+    except RuntimeError:
+        return ()
     return tuple(
         head_dim
         for head_dim in forward_head_dims(device_id)
@@ -201,7 +225,7 @@ def prepare_metadata(
 ):
     num_sequences = view_of(cu_seqlens_q).shape[0] - 1
     device_id = runtime.current_device().device_id
-    supported = head_dims(device_id)
+    supported = forward_head_dims(device_id)
     if not supported:
         raise NotImplementedError("no inter-sequence kernels are built for this GPU")
     persistent = persistent_head_dims(device_id)
@@ -231,12 +255,24 @@ def prepare_metadata(
 
 
 @functools.cache
-def persistent_head_dims(device_id):
+def persistent_sources(device_id):
+    """Returns the persistent forward sources that run on this GPU, preferred first: the GPU's own arch where its
+    kernels run here, then the SM80 kernels where the SM80 inter-sequence kernels run."""
+    archs = []
     try:
-        runtime.arch_name(device_id, inter_sequence=True)
+        arch = runtime.arch_name(device_id)
+        if PERSISTENT_CAPABILITIES.get(arch, ()) in ((), tuple(runtime.Device(device_id).compute_capability)):
+            archs.append(arch)
+        archs.append(runtime.arch_name(device_id, inter_sequence=True))
     except RuntimeError:
-        return ()
-    names = (name for name in runtime.manifest()[1] if name.startswith(PERSISTENT_SOURCE))
+        pass
+    return tuple(dict.fromkeys(f"{PERSISTENT_PREFIX}{name}" for name in archs))
+
+
+@functools.cache
+def persistent_head_dims(device_id):
+    sources = persistent_sources(device_id)
+    names = (name for name in runtime.manifest()[1] if name.startswith(sources))
     return tuple(sorted({int(name.rsplit("_hd", 1)[1]) for name in names}))
 
 
@@ -345,9 +381,29 @@ def forward_persistent(
     kernel, info = runtime.load_instance(device_id, instance, "flash_attn_fwd")
     grid = resident_ctas(device_id, instance)
     o_accum = o_accum_of(q_view.shape, num_sequences, num_head_kv)
+    if info.scheduling_mode == "clc":
+        # One CTA per tile: the blocks of the table of block_m rows, and the extra splits that the kernel
+        # plans for the resident CTAs. A CTA past the tile count that the device computes takes no tile.
+        blocks = varlen_blocks(q_view.shape[0] * packing, num_sequences, info.block_m)
+        grid = blocks * (num_head // packing) + (MAX_SPLITS - 1) * grid * bool(o_accum.splits)
     records = workspace + sequence_records_offset(q_view.shape, num_sequences, num_head_kv)
+    if info.box_columns:
+        boxes = ((q_view, info.q_box_rows, packing), (k_view, info.block_n, 1), (v_view, info.block_n, 1))
+        maps = [
+            tensor_map(
+                view.pointer, *as_four_dimensional(view), rows, info.box_columns, info.swizzle_bytes, heads=heads
+            )
+            if view.shape[0] else None
+            for view, rows, heads in boxes
+        ]
+        # The kernel loads no tile of a tensor without rows, but each map it takes must be valid.
+        inputs = tuple(tensor if tensor is not None else maps[0] for tensor in maps)
+        signature = TMA_PERSISTENT_SIGNATURE
+    else:
+        inputs = (q_view.pointer, k_view.pointer, v_view.pointer)
+        signature = PERSISTENT_SIGNATURE
     values = (
-        q_view.pointer, k_view.pointer, v_view.pointer, out_view.pointer, lse_view.pointer,
+        *inputs, out_view.pointer, lse_view.pointer,
         *row_strides(q_view)[1:], *row_strides(k_view)[1:], *row_strides(v_view)[1:], *row_strides(out_view)[1:],
         lse_view.strides[0], view_of(sequences.cu_seqlens_q).pointer, view_of(sequences.cu_seqlens_k).pointer,
         view_of(sequences.visibility_bits).pointer, window_pointer(sequences), window_size_left, window_size_right,
@@ -363,7 +419,7 @@ def forward_persistent(
         build, workspace, capacity, sequences, window_size_left, window_size_right, stream, records=records,
         split_counters=o_accum.split_counters(workspace), split_counter_count=o_accum.splits, packing=packing,
     )
-    runtime.run(kernel, (grid, 1, 1), info.threads, info.shared_bytes, PERSISTENT_SIGNATURE, values, stream)
+    runtime.run(kernel, (grid, 1, 1), info.threads, info.shared_bytes, signature, values, stream, pdl=info.pdl)
 
 
 def backward(
@@ -404,9 +460,15 @@ def backward(
     dk_accum = views["dk_accum"].pointer if fixes_dk else 0
     dk_states = dk_accum + 4 * key_heads * key_rows * head_dim if fixes_dk else 0
     state_chunks = dk_state_chunks(key_heads * key_rows, head_dim) if fixes_dk else 0
+    pdl = bool(info.box_columns and info.pdl)
+
+    def row_blocks(rows, block):
+        # Without scheduler metadata, the auxiliary kernels take the blocks of each sequence.
+        return -(-rows // block) if info.scheduler_metadata else varlen_blocks(rows, num_sequences, block)
+
     if rows_q:
         runtime.run(
-            preprocess, (-(-rows_q // PREPROCESS_ROWS), num_head, 1), AUXILIARY_THREADS, 0, PREPROCESS_SIGNATURE,
+            preprocess, (row_blocks(rows_q, PREPROCESS_ROWS), num_head, 1), AUXILIARY_THREADS, 0, PREPROCESS_SIGNATURE,
             (
                 views["out"].pointer, views["dout"].pointer, views["lse"].pointer, views["lse_log2"].pointer,
                 views["dpsum"].pointer, pivot_sum, pivot_key, views["dq_accum"].pointer, cu_seqlens_q, 0,
@@ -415,36 +477,84 @@ def backward(
             ),
             stream,
         )
-    num_n_blocks = scheduler_metadata_entries(rows_k, num_sequences, info.block_n)
-    values = (
-        views["q"].pointer, views["k"].pointer, views["v"].pointer, views["dout"].pointer,
-        views["lse_log2"].pointer, views["dpsum"].pointer, pivot_sum, pivot_key, views["dq_accum"].pointer,
-        views["dk"].pointer, views["dv"].pointer, cu_seqlens_q, cu_seqlens_k,
-        0, 0, num_head // num_head_kv, softmax_scale * LOG2_E, softmax_scale, window_size_left, window_size_right,
-        *row_strides(views["q"]), *row_strides(views["k"]), *row_strides(views["v"]), *row_strides(views["dout"]),
-        *row_strides(views["dk"]), *row_strides(views["dv"]), *accum_strides, *lse_strides, num_sequences,
-        build_scheduler_metadata(
+    cluster_ctas = info.cluster_ctas or 1
+    key_block = cluster_ctas * info.block_n
+    qhead_per_kvhead = num_head // num_head_kv
+    if info.scheduler_metadata:
+        num_n_blocks = scheduler_metadata_entries(rows_k, num_sequences, key_block)
+        scheduler_metadata = (build_scheduler_metadata(
             table, "bwd", head_dim, VARIANT, "flash_attn_bwd", cu_seqlens_k, view_of(sequences.cu_visible_q).pointer,
             num_sequences, num_n_blocks, "backward_workspace_shapes", stream,
-        ),
-        view_of(sequences.visibility_bits_t).pointer, window_pointer(sequences),
+        ),)
+    else:
+        num_n_blocks = varlen_blocks(rows_k, num_sequences, key_block)
+        scheduler_metadata = ()
+    visibility = (view_of(sequences.visibility_bits_t).pointer, window_pointer(sequences))
+    scalars = (
+        cu_seqlens_q, cu_seqlens_k, 0, 0, qhead_per_kvhead, softmax_scale * LOG2_E, softmax_scale,
+        window_size_left, window_size_right,
     )
+    num_qhead_splits = 1
+    if info.box_columns:
+        accumulator_map = dq_accum_tensor_map(info, views["dq_accum"].pointer, tuple(views["q"].shape), padding)
+        # The kernel loads no tile of a tensor without rows, but each map it takes must be valid.
+        maps = tuple(
+            tensor_map(
+                views[name].pointer, *as_four_dimensional(views[name]), rows, info.box_columns, info.swizzle_bytes
+            )
+            if views[name].shape[0] else accumulator_map
+            for name, rows in (("q", info.block_m), ("k", info.block_n), ("v", info.block_n), ("dout", info.block_m))
+        ) + (accumulator_map,)
+        signature = DQ_ACCUM_MAP_BACKWARD_SIGNATURE + "p" * len(scheduler_metadata)
+        values = (
+            *maps, views["lse_log2"].pointer, views["dpsum"].pointer, pivot_sum, pivot_key,
+            views["dk"].pointer, views["dv"].pointer,
+            *scalars, *row_strides(views["dk"]), *row_strides(views["dv"]), *lse_strides, num_sequences,
+            *scheduler_metadata,
+        )
+        if info.dkv_box_rows:
+            signature += "mm"
+            values += tuple(
+                tensor_map(views[name].pointer, *as_four_dimensional(views[name]), info.dkv_box_rows,
+                           info.box_columns, info.swizzle_bytes)
+                if rows_k else accumulator_map
+                for name in ("dk", "dv")
+            )
+        signature += "pp"
+        values += visibility
+        if not info.cluster_ctas:
+            num_qhead_splits = qhead_splits(
+                device_id, info, qhead_per_kvhead, window_size_left, window_size_right, num_n_blocks * num_head_kv
+            )
+    else:
+        signature = INTER_SEQUENCE_BACKWARD_SIGNATURE
+        values = (
+            views["q"].pointer, views["k"].pointer, views["v"].pointer, views["dout"].pointer,
+            views["lse_log2"].pointer, views["dpsum"].pointer, pivot_sum, pivot_key, views["dq_accum"].pointer,
+            views["dk"].pointer, views["dv"].pointer, *scalars,
+            *row_strides(views["q"]), *row_strides(views["k"]), *row_strides(views["v"]), *row_strides(views["dout"]),
+            *row_strides(views["dk"]), *row_strides(views["dv"]), *accum_strides, *lse_strides, num_sequences,
+            *scheduler_metadata, *visibility,
+        )
     if num_n_blocks:
         runtime.run(
-            main, (num_n_blocks, num_head_kv, 1), info.threads, info.shared_bytes, INTER_SEQUENCE_BACKWARD_SIGNATURE,
-            values, stream,
+            main, (cluster_ctas * num_n_blocks, num_head_kv * num_qhead_splits, 1), info.threads, info.shared_bytes,
+            signature,
+            values, stream, pdl=pdl,
+            cluster_dims=(1, num_qhead_splits, 1) if num_qhead_splits > 1 else None,
         )
     if rows_q:
         runtime.run(
-            postprocess, (-(-rows_q // POSTPROCESS_ROWS), num_head, 1), AUXILIARY_THREADS, 0, POSTPROCESS_SIGNATURE,
+            postprocess, (row_blocks(rows_q, POSTPROCESS_ROWS), num_head, 1), AUXILIARY_THREADS, 0,
+            POSTPROCESS_SIGNATURE,
             (
                 views["dq_accum"].pointer, views["dq"].pointer, pivot_sum, pivot_key, views["q"].pointer,
                 views["k"].pointer,
                 dk_accum, dk_states, cu_seqlens_q, 0,
-                num_head // num_head_kv, softmax_scale, *accum_strides, *row_strides(views["dq"]),
+                qhead_per_kvhead, softmax_scale, *accum_strides, *row_strides(views["dq"]),
                 *row_strides(views["q"]), *row_strides(views["k"]), *dk_accum_strides, *lse_strides, num_sequences,
             ),
-            stream,
+            stream, pdl=pdl,
         )
     if fixes_dk:
-        launch_fix_dk(fix_dk, dk_accum, dk_states, views["dk"], padding, True, stream, False)
+        launch_fix_dk(fix_dk, dk_accum, dk_states, views["dk"], padding, True, stream, pdl)

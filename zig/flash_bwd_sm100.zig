@@ -5,6 +5,7 @@ const entry = @import("entry.zig");
 const configurations = @import("configurations.zig");
 const BackwardParams = @import("BackwardParams.zig");
 const SeqlenInfoQK = @import("SeqlenInfoQK.zig");
+const BlockInfo = @import("BlockInfo.zig");
 const WarpSpecializedKernel = @import("warp_specialized_kernel.zig").WarpSpecializedKernel;
 const tile_scheduler = @import("tile_scheduler.zig");
 const prepare_scheduler = @import("prepare_scheduler.zig");
@@ -69,7 +70,9 @@ pub fn FlashAttnBwdSm100(
     const reduce_warps = 4;
     const compute_warps = 4 * compute_groups;
     const group_warps = compute_warps / compute_groups;
-    const Work = @import("n_block_work.zig").NBlockWork(block_m, block_n, .{});
+    const Work = @import("n_block_work.zig").NBlockWork(block_m, block_n, .{
+        .inter_sequence = specialization.inter_sequence,
+    });
     const scheduler_options: tile_scheduler.Options = .{
         .block_m = block_n,
         .row_bytes = 8 * head_dim,
@@ -138,6 +141,7 @@ pub fn FlashAttnBwdSm100(
         comptime {
             std.debug.assert(@sizeOf(Tiles) == shared_bytes);
             std.debug.assert(dq_column + part_columns <= tcgen05.capacity);
+            std.debug.assert(!specialization.inter_sequence or head_dim_parts == 1);
             std.debug.assert(other_warp + 4 == thread_count / 32);
             std.debug.assert(!dq_shares_dp or part_columns <= block_m);
             std.debug.assert(ds_row_bytes == 128 and reduce_warps * 32 == block_m);
@@ -182,6 +186,7 @@ pub fn FlashAttnBwdSm100(
         var prepared_work: ?Work addrspace(.shared) = undefined;
         var row_vectors: [q_stage]u64 addrspace(.shared) = undefined;
         var ones: [32]Chunk align(128) addrspace(.shared) = undefined;
+        var published_steps: [q_stage]Work.Step addrspace(.shared) = undefined;
 
         pub fn allocateTmem() void {
             tcgen05.allocate(&tmem_base, tcgen05.capacity);
@@ -234,10 +239,10 @@ pub fn FlashAttnBwdSm100(
                 do_full[0].init(1);
                 mbarrier.pipelineInitFence();
                 if (work) |tile| {
-                    const steps = tile.iterations();
-                    if (steps != 0) {
-                        copyKeys(args, tile, tensorBatch(params, tile));
-                        copyQueries(args, tile, tensorBatch(params, tile), steps, 0, 0, false);
+                    if (tile.iterations() != 0) {
+                        const batch = tensorBatch(params, tile);
+                        copyKeys(args, tile, batch);
+                        copyQueries(args, tile.branchedStep(0), tile.sequence.offset_q, batch, 0, false);
                     }
                 }
             }
@@ -251,6 +256,12 @@ pub fn FlashAttnBwdSm100(
 
         fn blockStep(index: u32, steps: u32) u32 {
             return if (head_dim_parts == 1) index else index % steps;
+        }
+
+        /// The step of block `index`, which `walk` reaches next.
+        fn nextStep(walk: *Work.Walk, params: BackwardParams, index: u32, steps: u32) Work.Step {
+            if (head_dim_parts == 1) return walk.next(params);
+            return walk.segment.branchedStep(blockStep(index, steps));
         }
 
         fn blockPart(index: u32, steps: u32) u32 {
@@ -288,15 +299,13 @@ pub fn FlashAttnBwdSm100(
 
         fn copyQueries(
             args: Args,
-            work: Work,
+            step: Work.Step,
+            offset_q: u32,
             batch: u32,
-            steps: u32,
-            index: u32,
             block_index: u32,
             comptime waits: bool,
         ) void {
-            const step = work.branchedStep(blockStep(index, steps));
-            const row = work.sequence.offset_q + step.block_info.first_row;
+            const row = offset_q + step.block_info.first_row;
             const q_slot = block_index % q_stage;
             if (waits) mbarrier.wait(.cta, &q_empty[q_slot], block_index / q_stage ^ 1);
             _ = q_full[q_slot].arriveExpectTx(block_m * padded * 2);
@@ -318,7 +327,7 @@ pub fn FlashAttnBwdSm100(
                 ctaid = persistent_scheduler.advanceToNextWork() orelse break;
             }) {
                 const work = currentWork(params, splits, ctaid) orelse continue;
-                const steps = work.iterations();
+                const steps = work.remainingIterations(params);
                 if (steps == 0 or (!persistent and !elect.oneSync())) continue;
                 if (!persistent or elect.oneSync()) {
                     const batch = tensorBatch(params, work);
@@ -326,9 +335,13 @@ pub fn FlashAttnBwdSm100(
                         mbarrier.wait(.cta, &kv_empty, loaded ^ 1);
                         copyKeys(args, work, batch);
                     }
+                    var walk: Work.Walk = .{ .segment = work };
+                    if (!persistent) _ = nextStep(&walk, params, 0, steps);
                     var index: u32 = @intFromBool(!persistent);
                     while (index < steps * head_dim_parts) : (index += 1) {
-                        copyQueries(args, work, batch, steps, index, blocks + index, true);
+                        const step = nextStep(&walk, params, index, steps);
+                        const offset_q = walk.segment.sequence.offset_q;
+                        copyQueries(args, step, offset_q, batch, blocks + index, true);
                     }
                 }
                 if (persistent) {
@@ -353,14 +366,15 @@ pub fn FlashAttnBwdSm100(
             var blocks: Count = 0;
             while (true) : (ctaid = persistent_scheduler.advanceToNextWork() orelse break) {
                 const work = currentWork(params, splits, ctaid) orelse continue;
-                const steps = work.iterations();
+                const steps = work.remainingIterations(params);
                 if (!persistent and tiling.pdl) nvptx.griddepcontrol(.wait);
+                var walk: Work.Walk = .{ .segment = work };
                 var index: u32 = 0;
                 while (index < steps * head_dim_parts) : (index += 1) {
-                    const step = work.branchedStep(blockStep(index, steps));
+                    const step = nextStep(&walk, params, index, steps);
                     const block_index = blocks + index;
                     const slot = block_index % q_stage;
-                    const vector = rowVector(params, work, step);
+                    const vector = rowVector(params, walk.segment, step);
                     const lse_negated =
                         fragments.gather(params.lse_log2, vector, step.block_info.row_count);
                     const dpsum_negated =
@@ -371,6 +385,9 @@ pub fn FlashAttnBwdSm100(
                         tiles.dpsum_negated[slot][thread.lane()] = dpsum_negated;
                     }
                     if (thread.lane() == 0) row_vectors[slot] = vector;
+                    if (specialization.inter_sequence and thread.lane() == 0) {
+                        published_steps[slot] = step;
+                    }
                     mbarrier.arrive(.warp_synced, &vectors_full[slot]);
                 }
                 if (persistent) blocks += steps * head_dim_parts;
@@ -491,7 +508,7 @@ pub fn FlashAttnBwdSm100(
             blocks: Count,
             finished: Count,
         ) void {
-            const steps = work.iterations();
+            const steps = work.remainingIterations(params);
             mbarrier.wait(.cta, &kv_full, finished);
             const key_start = work.sequence.offset_k + work.first_key;
             clearRows(&tiles.k, block_n, SeqlenInfoQK.rowsBeforeEnd(
@@ -501,10 +518,11 @@ pub fn FlashAttnBwdSm100(
                 block_n,
             ));
             const total = steps * head_dim_parts;
+            var walk: Work.Walk = .{ .segment = work };
             var index: u32 = 0;
             while (index < total) : (index += 1) {
-                const step = work.branchedStep(blockStep(index, steps));
-                const row_start = work.sequence.offset_q + step.block_info.first_row;
+                const step = nextStep(&walk, params, index, steps);
+                const row_start = walk.segment.sequence.offset_q + step.block_info.first_row;
                 const valid_rows = SeqlenInfoQK.rowsBeforeEnd(
                     params.cu_seqlens_q,
                     params.num_batch,
@@ -566,7 +584,7 @@ pub fn FlashAttnBwdSm100(
             var blocks: Count = 0;
             while (true) : (ctaid = persistent_scheduler.advanceToNextWork() orelse break) {
                 const work = currentWork(params, splits, ctaid) orelse continue;
-                const steps = work.iterations();
+                const steps = work.remainingIterations(params);
                 if (steps == 0) continue;
                 mmaWorkTile(params, work, tmem, blocks, finished);
                 if (persistent) {
@@ -835,6 +853,12 @@ pub fn FlashAttnBwdSm100(
             inline for (0..head_dim / 8) |chunk| out[element / 8 + chunk] = @splat(0);
         }
 
+        fn keyRowLimits(block_info: BlockInfo, key_count: u32, key_row: u32, key: i32) [2]i32 {
+            const seqlen_q: i32 = @intCast(block_info.seqlen_q);
+            const top = if (key_row < key_count) block_info.rowLimitTop(key) else seqlen_q;
+            return .{ top, block_info.rowLimitBot(key) };
+        }
+
         fn computeWorkTile(
             params: BackwardParams,
             args: Args,
@@ -842,16 +866,11 @@ pub fn FlashAttnBwdSm100(
             blocks: Count,
             finished: Count,
         ) void {
-            const steps = work.iterations();
+            const steps = work.remainingIterations(params);
             const key_row = keyRow();
             const group = columnGroup();
             const key: i32 = @intCast(work.first_key + key_row);
-            const seqlen_q: i32 = @intCast(work.sequence.seqlen_q);
-            const row_limit_top = if (key_row < work.key_count)
-                work.block_info.rowLimitTop(key)
-            else
-                seqlen_q;
-            const row_limit_bot = work.block_info.rowLimitBot(key);
+            const tile_limits = keyRowLimits(work.block_info, work.key_count, key_row, key);
             const s_address =
                 tcgen05.warpAddress(tmem_base, s_column + group * queries_per_compute_group);
             const dp_address =
@@ -859,16 +878,29 @@ pub fn FlashAttnBwdSm100(
             const vectors = group * queries_per_compute_group / 4;
             var index: u32 = 0;
             while (index < steps * head_dim_parts) : (index += 1) {
-                const step = work.branchedStep(blockStep(index, steps));
                 const block_index = blocks + index;
                 const q_slot = block_index % q_stage;
+                const vectors_phase = block_index / q_stage;
+                if (specialization.inter_sequence) {
+                    mbarrier.wait(.cta, &vectors_full[q_slot], vectors_phase);
+                }
+                const step = if (specialization.inter_sequence)
+                    published_steps[q_slot]
+                else
+                    work.branchedStep(blockStep(index, steps));
+                const row_limit_top, const row_limit_bot = if (specialization.inter_sequence)
+                    keyRowLimits(step.block_info, work.key_count, key_row, key)
+                else
+                    tile_limits;
                 const first: i32 =
                     @intCast(step.block_info.first_row + group * queries_per_compute_group);
                 const lower = row_limit_top - first;
                 const upper = row_limit_bot - first;
                 const interior = nvptx.voteSync(.all, lower <= 0 and upper >=
                     queries_per_compute_group, .all);
-                mbarrier.wait(.cta, &vectors_full[q_slot], block_index / q_stage);
+                if (!specialization.inter_sequence) {
+                    mbarrier.wait(.cta, &vectors_full[q_slot], vectors_phase);
+                }
                 mbarrier.wait(.cta, &s_full, block_index);
                 tcgen05.fenceAfterSync();
                 const scores = tcgen05.loadColumns(queries_per_compute_group, s_address);
@@ -921,7 +953,7 @@ pub fn FlashAttnBwdSm100(
             var blocks: Count = 0;
             while (true) : (ctaid = persistent_scheduler.advanceToNextWork() orelse break) {
                 const work = currentWork(params, splits, ctaid) orelse continue;
-                const steps = work.iterations();
+                const steps = work.remainingIterations(params);
                 if (steps == 0) {
                     writeZeroDkv(params, work);
                     continue;
@@ -976,24 +1008,25 @@ pub fn FlashAttnBwdSm100(
             blocks: Count,
             carried_stores: *Count,
         ) void {
-            const steps = work.iterations();
-            const row_base = work.sequence.offset_q +
-                if (params.cu_seqlens_q == 0) work.batch * params.seqlen_q else 0;
+            const steps = work.remainingIterations(params);
+            const batch_rows = if (params.cu_seqlens_q == 0) work.batch * params.seqlen_q else 0;
             const dq_address = tmem_base + tcgen05.address(thread.warp() * 32, dq_column);
             const row_sum_address =
                 tmem_base + tcgen05.address(thread.warp() * 32, row_sum_column);
             if (!persistent and tiling.pdl) nvptx.griddepcontrol(.wait);
             var stores: u32 = carried_stores.*;
+            var walk: Work.Walk = .{ .segment = work };
             var index: u32 = 0;
             while (index < steps * head_dim_parts) : (index += 1) {
-                const step = work.branchedStep(blockStep(index, steps));
+                const step = nextStep(&walk, params, index, steps);
+                const row_base = walk.segment.sequence.offset_q + batch_rows;
                 const part = blockPart(index, steps);
                 if (!mma_row_sums) {
                     mbarrier.wait(.cta, &ds_ready, blocks + index);
                     const pivot_sum =
                         f32x2.swizzledColumnSum(&tiles.ds[thread.warp() / 2], sumChunk());
                     mbarrier.arrive(.warp_synced, &ds_empty);
-                    if (part == 0) addPivotSum(params, work, step, sumQuery(), pivot_sum);
+                    if (part == 0) addPivotSum(params, walk.segment, step, sumQuery(), pivot_sum);
                 }
                 mbarrier.wait(.cta, &dq_full, blocks + index);
                 tcgen05.fenceAfterSync();
@@ -1004,7 +1037,7 @@ pub fn FlashAttnBwdSm100(
                 tcgen05.fenceBeforeSync();
                 mbarrier.arrive(.warp_synced, &dq_empty);
                 if (mma_row_sums and part == 0) {
-                    addPivotSum(params, work, step, dqStagingRow(), row_sums[0]);
+                    addPivotSum(params, walk.segment, step, dqStagingRow(), row_sums[0]);
                 }
                 inline for (0..part_columns / dq_reduce_ncol) |chunk_index| {
                     const chunk: u32 = chunk_index;
@@ -1052,7 +1085,7 @@ pub fn FlashAttnBwdSm100(
             while (true) : (ctaid = persistent_scheduler.advanceToNextWork() orelse break) {
                 const work = currentWork(params, splits, ctaid) orelse continue;
                 reduceWorkTile(params, args, work, blocks, &stores);
-                if (persistent) blocks += work.iterations() * head_dim_parts;
+                if (persistent) blocks += work.remainingIterations(params) * head_dim_parts;
             }
             if (persistent) waitDqReduceReads();
             tcgen05.fenceBeforeSync();
@@ -1068,6 +1101,7 @@ const backward_tiling = variant.tiling;
 const Backward = if (backward_tiling.use_2cta_instrs) two_cta_kernel.FlashAttnBwdSm100TwoCta(
     backward_tiling,
     variant.specialization.head_split,
+    variant.specialization.inter_sequence,
 ) else FlashAttnBwdSm100(backward_tiling, variant.specialization);
 
 fn launch(params: BackwardParams, args: Backward.Args) void {
@@ -1083,7 +1117,8 @@ const Entry = entry.Entry(BackwardParams, Backward.Args, .{
 } ++ entry.backward_sequence ++ entry.strides("dk") ++ entry.strides("dv") ++
     .{ "lse_batch_stride", "lse_head_stride", "num_batch" } ++
     (if (variant.specialization.scheduler_metadata) .{"scheduler_metadata"} else .{}) ++
-    if (backward_tiling.use_tma_store) .{ "dk_map", "dv_map" } else .{}, .{
+    (if (backward_tiling.use_tma_store) .{ "dk_map", "dv_map" } else .{}) ++
+    if (variant.specialization.inter_sequence) .{ "visibility_bits", "window_sizes" } else .{}, .{
     .required_work_group_size = .{ .x = Backward.thread_count },
     .max_registers_per_work_item = Backward.max_registers,
     .cluster_size = if (backward_tiling.use_2cta_instrs) .{ .x = 2 } else null,

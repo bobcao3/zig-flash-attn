@@ -283,7 +283,10 @@ def test_split_kv_matches_reference(head_dim, shape_name):
     (batch, seqlen_q, seqlen_k, num_head, num_head_kv), window = SPLIT_KV_SHAPES[shape_name]
     cuda_seed(head_dim + seqlen_q)
     q_shape, k_shape = (batch, seqlen_q, num_head, head_dim), (batch, seqlen_k, num_head_kv, head_dim)
-    variant = forward_variant(runtime.current_device().device_id, q_shape, k_shape, None, None, None, window)
+    device_id = runtime.current_device().device_id
+    if not any("split_kv" in variant for variant in runtime.variant_names(device_id, "fwd", head_dim)):
+        pytest.skip("the forward kernels of this GPU have no split-KV variant")
+    variant = forward_variant(device_id, q_shape, k_shape, None, None, None, window)
     assert "split_kv" in variant
     causal = window[1] == 0
     case = batched_case(batch, seqlen_q, seqlen_k, num_head, num_head_kv, head_dim, causal, window)

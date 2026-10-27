@@ -1,5 +1,6 @@
 """Writes the JSON records of benchmarks/benchmark_attn.py and benchmarks/benchmark_inter_sequence.py into
-perf_report.html as the points of one device, replacing the points that the device had for those shapes.
+perf_report.html as the points of one device, replacing the points that the device had for those shapes, and records
+the GPU, date and library versions of each benchmark's run.
 
     python reports/update_perf_report.py sm90 attention.jsonl inter_sequence.jsonl
     python reports/update_perf_report.py pro6000 --name "RTX PRO 6000" --sub "SM120 and SM80 kernels" \\
@@ -8,7 +9,6 @@ perf_report.html as the points of one device, replacing the points that the devi
 
 import argparse
 import datetime
-import html
 import json
 import re
 from pathlib import Path
@@ -35,7 +35,7 @@ def cudnn_version(number):
 
 def reference_name(benchmark, backends):
     if benchmark == "inter_sequence":
-        return "FlexAttention"
+        return "FlexAttn"
     found = {backend for values in backends.values() for backend in values if backend}
     names = [name for name in BACKEND_NAMES.values() if name in found]
     return f"torch SDPA ({' or '.join(names)})" if names else "torch SDPA"
@@ -67,10 +67,13 @@ def update_data(data, device, records):
     inter_keys = [f"mixed/{head}" for head in INTER_SEQUENCE_HEADS]
     groups = {}
     for record in records:
-        shape = "interseq" if record["benchmark"] == "inter_sequence" else record["shape"]
+        if record["benchmark"] == "inter_sequence":
+            shape = "interseqGqa" if record.get("gqa", 1) > 1 else "interseq"
+        else:
+            shape = record["shape"]
         groups.setdefault((shape, record["direction"]), []).append(record)
     for (shape, direction), group in groups.items():
-        if shape == "interseq":
+        if shape.startswith("interseq"):
             value = entry(
                 group,
                 inter_keys,
@@ -85,28 +88,22 @@ def update_data(data, device, records):
                 lambda r: (f"{r['mask']}/{r['head_dim']}", seqs.index(r["seqlen"])),
             )
         data["perf"].setdefault(shape, {}).setdefault(direction, {})[device] = value
-    first = records[0]
-    versions = first.get("versions", {})
-    data.setdefault("runs", {})[device] = {
-        "gpu": first["device"],
-        "date": datetime.date.today().isoformat(),
-        "torch": versions.get("torch"),
-        "cudnn": cudnn_version(versions["cudnn"]) if versions.get("cudnn") else None,
-        "fa4": versions.get("flash-attn-4"),
-    }
-
-
-def runs_text(data, devices):
-    parts = []
-    for device, run in data.get("runs", {}).items():
-        name = devices.get(device, run["gpu"])
-        libraries = [f"PyTorch {run['torch']}"]
-        if run.get("cudnn"):
-            libraries.append(f"cuDNN {run['cudnn']}")
-        if run.get("fa4"):
-            libraries.append(f"flash-attn-4 {run['fa4']}")
-        parts.append(f"{name} ({run['gpu']}) on {run['date']} with {', '.join(libraries)}.")
-    return " ".join(parts)
+    for record in records:
+        if record["benchmark"] == "inter_sequence" and "tokens" in record:
+            data.setdefault("layouts", {})[record["layout"]] = {
+                "tokens": record["tokens"],
+                "sequences": record["sequences"],
+            }
+    runs = data.setdefault("runs", {}).setdefault(device, {})
+    for record in {record["benchmark"]: record for record in records}.values():
+        versions = record.get("versions", {})
+        runs[record["benchmark"]] = {
+            "gpu": record["device"],
+            "date": datetime.date.today().isoformat(),
+            "torch": versions.get("torch"),
+            "cudnn": cudnn_version(versions["cudnn"]) if versions.get("cudnn") else None,
+            "fa4": versions.get("flash-attn-4"),
+        }
 
 
 def device_names(text):
@@ -139,8 +136,6 @@ def main():
     data, length = json.JSONDecoder().raw_decode(text[start:])
     update_data(data, arguments.device, records)
     text = text[:start] + json.dumps(data, ensure_ascii=False, separators=(",", ":")) + text[start + length :]
-    runs = f'<p class="note" id="perf-runs">Measured: {html.escape(runs_text(data, devices))}</p>'
-    text = re.sub(r'<p class="note" id="perf-runs">.*?</p>', lambda _: runs, text, flags=re.S)
     REPORT.write_text(text)
 
 

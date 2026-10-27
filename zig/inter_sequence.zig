@@ -172,7 +172,7 @@ pub const BlockTable = extern struct {
         block_work: u32,
     };
 
-    pub const block_rows = [_]u32{ 64, 128 };
+    pub const block_rows = [_]u32{ 64, 128, 192, 256 };
     pub const work_unit = block_rows[0];
     const m64_max_rows = 384;
     const short_max_rows = 8;
@@ -635,6 +635,7 @@ pub fn TableKernel(comptime block_rows: []const u32, comptime summarize: bool) t
         ) callconv(.{ .nvptx_kernel = .{
             .required_work_group_size = .{ .x = table_threads },
         } }) void {
+            if (comptime nvptx.gpu.sm >= 90) nvptx.griddepcontrol(.launch_dependents);
             const sequences: Sequences = .{
                 .cu_seqlens_q = @ptrFromInt(cu_seqlens_q),
                 .cu_seqlens_k = @ptrFromInt(cu_seqlens_k),

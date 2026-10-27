@@ -258,6 +258,59 @@ def accumulator_strides(q_shape, padding_rows):
     return batch_stride, head_dim, rows * head_dim
 
 
+def dq_accum_tensor_map(info, pointer, q_shape, padding_rows):
+    """Returns the tensor map through which the backward of `info` reduces into the query gradient
+    accumulator of `accumulator_shape(q_shape, padding_rows)`."""
+    heads, rows, head_dim = accumulator_shape(q_shape, padding_rows)
+    if info.dq_accum_interleave:
+        return tiled_tensor_map(
+            pointer,
+            (heads, info.block_m // 8, rows, 2, head_dim),
+            (rows * head_dim, 8 * head_dim, head_dim, 4 * head_dim, 1),
+            (1, info.block_m // 8, 4, 2, info.dq_accum_box_columns),
+            info.dq_accum_box_columns * 4,
+            element_bytes=4,
+        )
+    return tensor_map(
+        pointer,
+        (1, rows, heads, head_dim),
+        (heads * rows * head_dim, head_dim, rows * head_dim, 1),
+        info.dq_accum_box_rows or info.block_m,
+        info.dq_accum_box_columns,
+        info.dq_accum_box_columns * 4,
+        element_bytes=4,
+    )
+
+
+def qhead_splits(device_id, info, qhead_per_kvhead, window_size_left, window_size_right, ctas):
+    """Returns how many CTAs of a cluster share the query heads of one key block, for a grid of `ctas`
+    CTAs without splits."""
+    num_qhead_splits = 1
+    while (
+        info.min_qhead_per_split and window_size_left < 0 and 2 * num_qhead_splits <= info.max_qhead_splits
+        and qhead_per_kvhead % (2 * num_qhead_splits) == 0 and qhead_per_kvhead // (2 * num_qhead_splits) >= info.min_qhead_per_split
+        and (not info.qhead_split_bounded_only or window_size_right >= 0)
+    ):
+        num_qhead_splits *= 2
+    if num_qhead_splits == 1 and info.qhead_split_by_waves:
+        num_sm = runtime.num_sm(device_id)
+
+        def efficiency(count):
+            return specialization.fill(ctas * count, num_sm)
+
+        allowed = [
+            count for count in (1 << power for power in range(max(1, info.max_qhead_splits).bit_length()))
+            if qhead_per_kvhead % count == 0
+            and (count == 1 or qhead_per_kvhead // count >= info.min_qhead_per_split)
+        ]
+        if efficiency(1) < WAVE_SPLIT_TRIGGER_EFFICIENCY:
+            num_qhead_splits = next(
+                (count for count in allowed if efficiency(count) >= WAVE_SPLIT_TARGET_EFFICIENCY),
+                max(allowed, key=efficiency),
+            )
+    return num_qhead_splits
+
+
 def backward(
     q,
     k,
@@ -370,40 +423,7 @@ def backward(
         )
         if info.bulk_reduce:
             signature = DQ_ACCUM_MAP_BACKWARD_SIGNATURE
-            accumulator_heads, accumulator_rows, accumulator_head_dim = accumulator_shape(
-                tuple(views["q"].shape), layout.accumulator_padding
-            )
-            if info.dq_accum_interleave:
-                dq_accum_map = tiled_tensor_map(
-                    views["dq_accum"].pointer,
-                    (accumulator_heads, info.block_m // 8, accumulator_rows, 2, accumulator_head_dim),
-                    (
-                        accumulator_rows * accumulator_head_dim,
-                        8 * accumulator_head_dim,
-                        accumulator_head_dim,
-                        4 * accumulator_head_dim,
-                        1,
-                    ),
-                    (1, info.block_m // 8, 4, 2, info.dq_accum_box_columns),
-                    info.dq_accum_box_columns * 4,
-                    element_bytes=4,
-                )
-            else:
-                dq_accum_map = tensor_map(
-                    views["dq_accum"].pointer,
-                    (1, accumulator_rows, accumulator_heads, accumulator_head_dim),
-                    (
-                        accumulator_heads * accumulator_rows * accumulator_head_dim,
-                        accumulator_head_dim,
-                        accumulator_rows * accumulator_head_dim,
-                        1,
-                    ),
-                    info.dq_accum_box_rows or info.block_m,
-                    info.dq_accum_box_columns,
-                    info.dq_accum_box_columns * 4,
-                    element_bytes=4,
-                )
-            maps += (dq_accum_map,)
+            maps += (dq_accum_tensor_map(info, views["dq_accum"].pointer, tuple(views["q"].shape), layout.accumulator_padding),)
             main_values = (
                 *maps, views["lse_log2"].pointer, views["dpsum"].pointer, pivot_sum, pivot_key,
                 views["dk"].pointer, views["dv"].pointer,
@@ -458,29 +478,10 @@ def backward(
         ),
         stream,
     )
-    num_qhead_splits = 1
-    while (
-        info.min_qhead_per_split and window_size_left < 0 and 2 * num_qhead_splits <= info.max_qhead_splits
-        and qhead_per_kvhead % (2 * num_qhead_splits) == 0 and qhead_per_kvhead // (2 * num_qhead_splits) >= info.min_qhead_per_split
-        and (not info.qhead_split_bounded_only or window_size_right >= 0)
-    ):
-        num_qhead_splits *= 2
-    if num_qhead_splits == 1 and info.qhead_split_by_waves:
-        num_sm = runtime.num_sm(device_id)
-
-        def efficiency(count):
-            return specialization.fill(cluster_ctas * num_n_blocks * num_head_kv * count * grid_z, num_sm)
-
-        allowed = [
-            count for count in (1 << power for power in range(max(1, info.max_qhead_splits).bit_length()))
-            if qhead_per_kvhead % count == 0
-            and (count == 1 or qhead_per_kvhead // count >= info.min_qhead_per_split)
-        ]
-        if efficiency(1) < WAVE_SPLIT_TRIGGER_EFFICIENCY:
-            num_qhead_splits = next(
-                (count for count in allowed if efficiency(count) >= WAVE_SPLIT_TARGET_EFFICIENCY),
-                max(allowed, key=efficiency),
-            )
+    num_qhead_splits = qhead_splits(
+        device_id, info, qhead_per_kvhead, window_size_left, window_size_right,
+        cluster_ctas * num_n_blocks * num_head_kv * grid_z,
+    )
     main_launch = (
         main,
         (cluster_ctas * num_n_blocks * head_splits, num_head_kv * num_qhead_splits, grid_z),

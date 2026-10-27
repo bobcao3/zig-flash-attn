@@ -5,6 +5,7 @@ const BackwardParams = @import("BackwardParams.zig");
 const WarpSpecializedKernel = @import("warp_specialized_kernel.zig").WarpSpecializedKernel;
 const tile_scheduler = @import("tile_scheduler.zig");
 const SeqlenInfoQK = @import("SeqlenInfoQK.zig");
+const BlockInfo = @import("BlockInfo.zig");
 const fragments = @import("fragments.zig");
 const smem = @import("smem.zig");
 const dsPiece = @import("f32x2.zig").dsPiece;
@@ -22,6 +23,7 @@ const Mbarrier = nvptx.Mbarrier;
 pub fn FlashAttnBwdSm100TwoCta(
     comptime tiling: configurations.Sm100BwdTiling,
     comptime head_split: bool,
+    comptime inter_sequence: bool,
 ) type {
     const Sm100BwdTiling = configurations.Sm100BwdTiling;
     const head_dim = tiling.head_dim;
@@ -56,7 +58,9 @@ pub fn FlashAttnBwdSm100TwoCta(
     const reduce_warps = 4;
     const compute_warps = 4 * compute_groups;
     const other_warp = reduce_warps + compute_warps;
-    const Work = @import("n_block_work.zig").NBlockWork(query_rows, cluster_keys, .{});
+    const Work = @import("n_block_work.zig").NBlockWork(query_rows, cluster_keys, .{
+        .inter_sequence = inter_sequence,
+    });
     const TileScheduler = tile_scheduler.TileScheduler(.{
         .block_m = cluster_keys,
         .row_bytes = 8 * head_dim,
@@ -154,6 +158,8 @@ pub fn FlashAttnBwdSm100TwoCta(
         var exchange_ready: Mbarrier addrspace(.shared) = undefined;
         var vectors_full: [2]Mbarrier addrspace(.shared) = undefined;
         var vectors_empty: [2]Mbarrier addrspace(.shared) = undefined;
+        var published_steps: [2]Work.Step addrspace(.shared) = undefined;
+        var published_rows: [2]u64 addrspace(.shared) = undefined;
         var tmem_base: u32 addrspace(.shared) = undefined;
         var kt_tma_full: Mbarrier addrspace(.shared) = undefined;
         var qt_tma_full: Mbarrier addrspace(.shared) = undefined;
@@ -304,7 +310,7 @@ pub fn FlashAttnBwdSm100TwoCta(
 
         fn runLoad(params: BackwardParams, args: Args) void {
             const work = decodeWork(params) orelse return;
-            const steps = work.iterations();
+            const steps = work.remainingIterations(params);
             if (steps == 0) return;
             const batch = if (params.cu_seqlens_q == 0) work.batch else 0;
             const cluster_row = work.sequence.offset_k + work.first_key;
@@ -324,10 +330,11 @@ pub fn FlashAttnBwdSm100TwoCta(
             }
             elect.reconverge();
             var cleared: u32 = 0;
+            var walk: Work.Walk = .{ .segment = work };
             var index: u32 = 0;
             while (index < steps) : (index += 1) {
-                const step = work.step(index);
-                const row = work.sequence.offset_q + step.block_info.first_row;
+                const step = walk.next(params);
+                const row = walk.segment.sequence.offset_q + step.block_info.first_row;
                 const own_row = row + cluster.rankIn2Cta() * half_queries;
                 mbarrier.wait(.cta, &q_empty, index ^ 1);
                 if (elect.oneSync()) {
@@ -446,8 +453,9 @@ pub fn FlashAttnBwdSm100TwoCta(
 
         fn runExchange(params: BackwardParams) void {
             const work = decodeWork(params) orelse return;
+            const steps = work.remainingIterations(params);
             var index: u32 = 0;
-            while (index < work.iterations()) : (index += 1) {
+            while (index < steps) : (index += 1) {
                 mbarrier.wait(.cta, &exchange_full, index);
                 mbarrier.arrive(.leader_cta, &exchange_ready);
             }
@@ -461,11 +469,13 @@ pub fn FlashAttnBwdSm100TwoCta(
         fn runLoadLseDpsum(params: BackwardParams) void {
             const work = decodeWork(params) orelse return;
             if (tiling.pdl) nvptx.griddepcontrol(.wait);
+            const steps = work.remainingIterations(params);
+            var walk: Work.Walk = .{ .segment = work };
             var index: u32 = 0;
-            while (index < work.iterations()) : (index += 1) {
-                const step = work.step(index);
+            while (index < steps) : (index += 1) {
+                const step = walk.next(params);
                 const slot = index % 2;
-                const vector = rowVector(params, work, step);
+                const vector = rowVector(params, walk.segment, step);
                 const lse_negated =
                     fragments.gather(params.lse_log2, vector, step.block_info.row_count);
                 const dpsum_negated =
@@ -473,6 +483,10 @@ pub fn FlashAttnBwdSm100TwoCta(
                 mbarrier.wait(.cta, &vectors_empty[slot], index / 2 ^ 1);
                 tiles.lse_negated[slot][thread.lane()] = lse_negated;
                 tiles.dpsum_negated[slot][thread.lane()] = dpsum_negated;
+                if (inter_sequence and thread.lane() == 0) {
+                    published_steps[slot] = step;
+                    published_rows[slot] = vector;
+                }
                 mbarrier.arrive(.warp_synced, &vectors_full[slot]);
             }
         }
@@ -568,7 +582,7 @@ pub fn FlashAttnBwdSm100TwoCta(
 
         fn runMma(params: BackwardParams) void {
             const work = decodeWork(params) orelse return;
-            const steps = work.iterations();
+            const steps = work.remainingIterations(params);
             if (cluster.rankIn2Cta() != 0 or steps == 0) return;
             tcgen05.fenceAfterSync();
             const tmem = tmem_base;
@@ -642,11 +656,11 @@ pub fn FlashAttnBwdSm100TwoCta(
         fn excludePivots(
             params: BackwardParams,
             work: Work,
-            step: Work.Step,
+            row_vector: u64,
             probabilities: *Scores,
         ) void {
             const keys: [*]addrspace(.global) i32 = @ptrFromInt(params.pivot_key);
-            const first = rowVector(params, work, step) + columnGroup() * queries_per_compute_group;
+            const first = row_vector + columnGroup() * queries_per_compute_group;
             const key: i32 = @intCast(work.sequence.offset_k + ownKey(work) + keyRow());
             f32x2.excludePivots(probabilities, keys + first, key);
         }
@@ -806,15 +820,18 @@ pub fn FlashAttnBwdSm100TwoCta(
             inline for (0..head_dim / 8) |chunk| out[element / 8 + chunk] = @splat(0);
         }
 
+        fn keyRowLimits(block_info: BlockInfo, key_count: u32, key_row: u32, key: i32) [2]i32 {
+            const seqlen_q: i32 = @intCast(block_info.seqlen_q);
+            const top = if (key_row < key_count) block_info.rowLimitTop(key) else seqlen_q;
+            return .{ top, block_info.rowLimitBot(key) };
+        }
+
         fn computeWorkTile(params: BackwardParams, args: Args, work: Work) void {
-            const steps = work.iterations();
+            const steps = work.remainingIterations(params);
             const key_row = keyRow();
             const group = columnGroup();
             const key: i32 = @intCast(ownKey(work) + key_row);
-            const seqlen_q: i32 = @intCast(work.sequence.seqlen_q);
-            const row_limit_top =
-                if (key_row < ownKeys(work)) work.block_info.rowLimitTop(key) else seqlen_q;
-            const row_limit_bot = work.block_info.rowLimitBot(key);
+            const tile_limits = keyRowLimits(work.block_info, ownKeys(work), key_row, key);
             const s_address =
                 tcgen05.warpAddress(tmem_base, s_column + group * queries_per_compute_group);
             const p_address = tcgen05.warpAddress(tmem_base, s_column + group *
@@ -824,15 +841,20 @@ pub fn FlashAttnBwdSm100TwoCta(
             const vectors = group * queries_per_compute_group / 4;
             var index: u32 = 0;
             while (index < steps) : (index += 1) {
-                const step = work.step(index);
                 const slot = index % 2;
+                if (inter_sequence) mbarrier.wait(.cta, &vectors_full[slot], index / 2);
+                const step = if (inter_sequence) published_steps[slot] else work.step(index);
+                const row_limit_top, const row_limit_bot = if (inter_sequence)
+                    keyRowLimits(step.block_info, ownKeys(work), key_row, key)
+                else
+                    tile_limits;
                 const first: i32 =
                     @intCast(step.block_info.first_row + group * queries_per_compute_group);
                 const lower = row_limit_top - first;
                 const upper = row_limit_bot - first;
                 const interior = nvptx.voteSync(.all, lower <= 0 and upper >=
                     queries_per_compute_group, .all);
-                mbarrier.wait(.cta, &vectors_full[slot], index / 2);
+                if (!inter_sequence) mbarrier.wait(.cta, &vectors_full[slot], index / 2);
                 mbarrier.wait(.cta, &s_full, index);
                 tcgen05.fenceAfterSync();
                 const scores = tcgen05.loadColumns(queries_per_compute_group, s_address);
@@ -854,7 +876,7 @@ pub fn FlashAttnBwdSm100TwoCta(
                 if (f32x2.warpHasPivot(probabilities)) excludePivots(
                     params,
                     work,
-                    step,
+                    if (inter_sequence) published_rows[slot] else rowVector(params, work, step),
                     &probabilities,
                 );
                 mbarrier.wait(.cta, &dp_full, index);
@@ -880,7 +902,7 @@ pub fn FlashAttnBwdSm100TwoCta(
             tcgen05.fenceAfterSync();
             const work = decodeWork(params) orelse return;
             if (tiling.pdl) nvptx.griddepcontrol(.wait);
-            if (work.iterations() == 0) {
+            if (work.remainingIterations(params) == 0) {
                 writeZeroDkv(params, work);
                 return;
             }
@@ -911,21 +933,21 @@ pub fn FlashAttnBwdSm100TwoCta(
         pub fn runReduce(params: BackwardParams, args: Args) void {
             tcgen05.fenceAfterSync();
             const work = decodeWork(params) orelse return;
-            const steps = work.iterations();
+            const steps = work.remainingIterations(params);
             if (steps == 0) return;
-            const row_base = work.sequence.offset_q +
-                if (params.cu_seqlens_q == 0) work.batch * params.seqlen_q else 0;
+            const batch_rows = if (params.cu_seqlens_q == 0) work.batch * params.seqlen_q else 0;
             const dq_address = tmem_base + tcgen05.address(thread.warp() * 32, dq_column);
-            const first_row =
-                row_base + cluster.rankIn2Cta() * half_queries + thread.warp() % 2 * 32;
+            const own_rows = batch_rows + cluster.rankIn2Cta() * half_queries + thread.warp() % 2 * 32;
             const half = thread.warp() / 2;
             const staging = &tiles.staging[thread.warp()];
             if (tiling.pdl) nvptx.griddepcontrol(.wait);
+            var walk: Work.Walk = .{ .segment = work };
             var index: u32 = 0;
             while (index < steps) : (index += 1) {
-                const step = work.step(index);
+                const step = walk.next(params);
+                const first_row = walk.segment.sequence.offset_q + own_rows;
                 mbarrier.wait(.cta, &ds_stored, index);
-                addPivotSum(params, work, step);
+                addPivotSum(params, walk.segment, step);
                 mbarrier.wait(.cta, &dq_full, index);
                 tcgen05.fenceAfterSync();
                 const values = tcgen05.loadColumns(half_columns, dq_address);

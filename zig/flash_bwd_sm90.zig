@@ -12,7 +12,8 @@ const prepare_scheduler = @import("prepare_scheduler.zig");
 const fragments = @import("fragments.zig");
 const applyMask = @import("mask.zig").applyMask;
 const applyMaskTiles = @import("mask.zig").applyMaskTiles;
-const ColLimits = @import("BlockInfo.zig").ColLimits;
+const BlockInfo = @import("BlockInfo.zig");
+const ColLimits = BlockInfo.ColLimits;
 const tma = @import("tma.zig");
 const wgmma = @import("wgmma.zig");
 const elect = @import("elect.zig");
@@ -199,7 +200,7 @@ pub fn FlashAttnBwdSm90(
     const DsOperands = wgmma.Operands(ds_swizzle_bytes);
     const DsLayout = tma.SwizzledLayout(block_m / 8, ds_swizzle_bytes);
     const ds_box_chunks = DsLayout.swizzle_columns;
-    const Work = NBlockWork(block_m, block_n, .{});
+    const Work = NBlockWork(block_m, block_n, .{ .inter_sequence = specialization.inter_sequence });
     const dq_split = tiling.dq_split;
     const dq_groups: u32 = if (dq_split == .none) 1 else 2;
     const dq_columns = if (dq_split == .by_columns) padded / 2 else padded;
@@ -212,6 +213,7 @@ pub fn FlashAttnBwdSm90(
     const early_exp_tiles = tiling.early_exp_tiles;
     const separate_do_pipeline = tiling.separate_do_pipeline;
     comptime std.debug.assert(block_n == 128 and dq_rows == 64);
+    comptime std.debug.assert(!specialization.inter_sequence or !tiling.separate_masking_iterations);
 
     return struct {
         pub const thread_count = tiling.threads();
@@ -243,6 +245,8 @@ pub fn FlashAttnBwdSm90(
         var do_empty: [stages]nvptx.Mbarrier addrspace(.shared) = undefined;
         var scales: [8 * sum_swizzle_bytes / 4]u32 align(8 * sum_swizzle_bytes) addrspace(.shared) =
             undefined;
+        var steps: [stages]Work.Step addrspace(.shared) = undefined;
+        var step_vectors: [stages]u64 addrspace(.shared) = undefined;
 
         pub const init_scope: mbarrier.Scope = .cta;
         pub const initializer_warp: u32 = 0;
@@ -279,7 +283,7 @@ pub fn FlashAttnBwdSm90(
 
         fn loadQueryTiles(params: BackwardParams, args: Args) void {
             const lane = thread.lane();
-            const work = splitWork(Work, tiling, specialization, params) orelse return;
+            var work = splitWork(Work, tiling, specialization, params) orelse return;
             const iterations = work.iterations();
             if (iterations == 0) return;
             const batch = if (params.cu_seqlens_q == 0) work.batch else 0;
@@ -293,127 +297,143 @@ pub fn FlashAttnBwdSm90(
             nvptx.griddepcontrol(.wait);
             const lse: [*]addrspace(.global) const f32 = @ptrFromInt(params.lse_log2);
             const dpsum: [*]addrspace(.global) const f32 = @ptrFromInt(params.dpsum);
-            var iteration: u32 = 0;
-            while (iteration < iterations) : (iteration += 1) {
-                const step = work.step(iteration);
-                const stage = iteration % stages;
-                const reuse = iteration / stages;
-                if (reuse > 0) {
-                    while (!query_empty[stage].tryWaitParity(@intCast((reuse - 1) & 1))) {}
-                }
-                const row = work.sequence.offset_q + step.block_info.first_row;
-                if (elect.oneSync()) {
-                    _ = query_full[stage]
-                        .arriveExpectTx(comptime (if (separate_do_pipeline) 1 else 2) *
-                        tiling.tileBytes(block_m));
-                    Layout.copyTile(
-                        &tiles.q[stage],
-                        args.q,
-                        &query_full[stage],
-                        step.head,
-                        row,
-                        batch,
-                    );
-                    if (!separate_do_pipeline) Layout.copyTile(
-                        &tiles.do[stage],
-                        args.do,
-                        &query_full[stage],
-                        step.head,
-                        row,
-                        batch,
-                    );
-                }
-                elect.reconverge();
-                const vectors: u64 = work.batch * params.lse_batch_stride +
-                    step.head * params.lse_head_stride + row;
-                inline for (0..block_m / 32) |element| {
-                    const column = element * 32 + lane;
-                    cp_async.copy(
-                        .cache_all_levels,
-                        &tiles.lse[stage][column],
-                        &lse[vectors + column],
-                    );
-                    if (!separate_do_pipeline) cp_async.copy(
-                        .cache_all_levels,
-                        &tiles.dpsum[stage][column],
-                        &dpsum[vectors + column],
-                    );
-                }
-                cp_async.mbarrierArriveNoinc(&query_full[stage]);
-                if (separate_do_pipeline) {
+            var count: u32 = 0;
+            while (true) : (if (!specialization.inter_sequence or !work.nextSegment(params)) break) {
+                var iteration: u32 = 0;
+                while (iteration < work.iterations()) : ({
+                    iteration += 1;
+                    count += 1;
+                }) {
+                    const step = work.step(iteration);
+                    const stage = count % stages;
+                    const reuse = count / stages;
                     if (reuse > 0) {
-                        while (!do_empty[stage].tryWaitParity(@intCast((reuse - 1) & 1))) {}
+                        while (!query_empty[stage].tryWaitParity(@intCast((reuse - 1) & 1))) {}
                     }
+                    const row = work.sequence.offset_q + step.block_info.first_row;
                     if (elect.oneSync()) {
-                        _ = do_full[stage].arriveExpectTx(comptime tiling.tileBytes(block_m));
+                        if (specialization.inter_sequence) {
+                            steps[stage] = step;
+                            step_vectors[stage] = rowVector(params, work, step);
+                        }
+                        _ = query_full[stage]
+                            .arriveExpectTx(comptime (if (separate_do_pipeline) 1 else 2) *
+                            tiling.tileBytes(block_m));
                         Layout.copyTile(
+                            &tiles.q[stage],
+                            args.q,
+                            &query_full[stage],
+                            step.head,
+                            row,
+                            batch,
+                        );
+                        if (!separate_do_pipeline) Layout.copyTile(
                             &tiles.do[stage],
                             args.do,
-                            &do_full[stage],
+                            &query_full[stage],
                             step.head,
                             row,
                             batch,
                         );
                     }
                     elect.reconverge();
+                    const vectors: u64 = work.batch * params.lse_batch_stride +
+                        step.head * params.lse_head_stride + row;
                     inline for (0..block_m / 32) |element| {
                         const column = element * 32 + lane;
                         cp_async.copy(
+                            .cache_all_levels,
+                            &tiles.lse[stage][column],
+                            &lse[vectors + column],
+                        );
+                        if (!separate_do_pipeline) cp_async.copy(
                             .cache_all_levels,
                             &tiles.dpsum[stage][column],
                             &dpsum[vectors + column],
                         );
                     }
-                    cp_async.mbarrierArriveNoinc(&do_full[stage]);
+                    cp_async.mbarrierArriveNoinc(&query_full[stage]);
+                    if (separate_do_pipeline) {
+                        if (reuse > 0) {
+                            while (!do_empty[stage].tryWaitParity(@intCast((reuse - 1) & 1))) {}
+                        }
+                        if (elect.oneSync()) {
+                            _ = do_full[stage].arriveExpectTx(comptime tiling.tileBytes(block_m));
+                            Layout.copyTile(
+                                &tiles.do[stage],
+                                args.do,
+                                &do_full[stage],
+                                step.head,
+                                row,
+                                batch,
+                            );
+                        }
+                        elect.reconverge();
+                        inline for (0..block_m / 32) |element| {
+                            const column = element * 32 + lane;
+                            cp_async.copy(
+                                .cache_all_levels,
+                                &tiles.dpsum[stage][column],
+                                &dpsum[vectors + column],
+                            );
+                        }
+                        cp_async.mbarrierArriveNoinc(&do_full[stage]);
+                    }
                 }
             }
         }
 
         fn reduceDqStaging(params: BackwardParams, args: Args) void {
-            const work = splitWork(Work, tiling, specialization, params) orelse return;
+            var work = splitWork(Work, tiling, specialization, params) orelse return;
             nvptx.griddepcontrol(.wait);
-            const iterations = work.iterations();
-            const row_base = work.sequence.offset_q +
-                if (params.cu_seqlens_q == 0) work.batch * params.seqlen_q else 0;
+            const iterations = work.remainingIterations(params);
             inline for (0..staging_buffers) |buffer| {
                 if (buffer < iterations) releaseStaging(buffer);
             }
-            var iteration: u32 = 0;
-            while (iteration < iterations) : (iteration += 1) {
-                const step = work.step(iteration);
-                const row = row_base + step.block_info.first_row;
-                const buffer = iteration % staging_buffers;
-                inline for (0..dq_groups) |group| {
-                    nvptx.barrierSyncAligned(NamedBarrier.dq_full.of(
-                        @as(u32, group) * staging_buffers + buffer,
-                    ), staging_threads);
-                    if (dq_split == .by_columns) {
+            var count: u32 = 0;
+            while (true) : (if (!specialization.inter_sequence or !work.nextSegment(params)) break) {
+                const row_base = work.sequence.offset_q +
+                    if (params.cu_seqlens_q == 0) work.batch * params.seqlen_q else 0;
+                var iteration: u32 = 0;
+                while (iteration < work.iterations()) : ({
+                    iteration += 1;
+                    count += 1;
+                }) {
+                    const step = work.step(iteration);
+                    const row = row_base + step.block_info.first_row;
+                    const buffer = count % staging_buffers;
+                    inline for (0..dq_groups) |group| {
+                        nvptx.barrierSyncAligned(NamedBarrier.dq_full.of(
+                            @as(u32, group) * staging_buffers + buffer,
+                        ), staging_threads);
+                        if (dq_split == .by_columns) {
+                            if (elect.oneSync()) ReduceStaging.reduce(
+                                args.dq_accum,
+                                &tiles.staging[buffer],
+                                group * dq_columns / box_columns,
+                                dq_columns / box_columns,
+                                0,
+                                row,
+                                step.head,
+                            );
+                            elect.reconverge();
+                        }
+                    }
+                    if (dq_split != .by_columns) {
                         if (elect.oneSync()) ReduceStaging.reduce(
                             args.dq_accum,
                             &tiles.staging[buffer],
-                            group * dq_columns / box_columns,
-                            dq_columns / box_columns,
+                            0,
+                            staging_boxes,
                             0,
                             row,
                             step.head,
                         );
                         elect.reconverge();
                     }
+                    tma.waitBulkReads();
+                    if (count + staging_buffers < iterations) releaseStaging(buffer);
                 }
-                if (dq_split != .by_columns) {
-                    if (elect.oneSync()) ReduceStaging.reduce(
-                        args.dq_accum,
-                        &tiles.staging[buffer],
-                        0,
-                        staging_boxes,
-                        0,
-                        row,
-                        step.head,
-                    );
-                    elect.reconverge();
-                }
-                tma.waitBulkReads();
-                if (iteration + staging_buffers < iterations) releaseStaging(buffer);
             }
         }
 
@@ -601,7 +621,7 @@ pub fn FlashAttnBwdSm90(
             const warp_in_group = consumerWarp() % 4;
             const work = splitWork(Work, tiling, specialization, params) orelse return;
             nvptx.griddepcontrol(.wait);
-            const iterations = work.iterations();
+            const iterations = work.remainingIterations(params);
             var gradients: Gradients = .{ .dk = @splat(0), .dv = @splat(0) };
             if (iterations > 0) {
                 // The fence and consumer barrier before each dQ product publish `scales` to the
@@ -685,6 +705,23 @@ pub fn FlashAttnBwdSm90(
             storeDkv(params, work, gradients);
         }
 
+        fn rowVector(params: BackwardParams, work: Work, step: Work.Step) u64 {
+            return work.batch * params.lse_batch_stride + step.head * params.lse_head_stride +
+                work.sequence.offset_q + step.block_info.first_row;
+        }
+
+        fn segmentPlacement(work: Work, block_info: BlockInfo, placement: Placement) Placement {
+            var segment = work;
+            segment.block_info = block_info;
+            const key_row = work.first_key + consumerGroup() * 64 + consumerWarp() % 4 * 16 +
+                thread.lane() / 4;
+            var result = placement;
+            result.unmasked = segment.unmaskedRowLimits();
+            result.near = segment.rowLimits(key_row);
+            result.far = segment.rowLimits(key_row + 8);
+            return result;
+        }
+
         const Placement = struct {
             unmasked: Work.RowLimits,
             near: Work.RowLimits,
@@ -705,20 +742,25 @@ pub fn FlashAttnBwdSm90(
             params: BackwardParams,
             work: Work,
             iteration: u32,
-            placement: Placement,
+            tile_placement: Placement,
             gradients: *Gradients,
         ) void {
             @setEvalBranchQuota(100_000);
-            const matrix_base = placement.matrix_base;
-            const query_box = placement.query_box;
-            const key_box = placement.key_box;
-            const step = work.step(iteration);
+            const matrix_base = tile_placement.matrix_base;
+            const query_box = tile_placement.query_box;
+            const key_box = tile_placement.key_box;
             const stage = iteration % stages;
-            const vectors: u64 = work.batch * params.lse_batch_stride +
-                step.head * params.lse_head_stride + work.sequence.offset_q +
-                step.block_info.first_row;
             const pivot_keys: [*]addrspace(.global) i32 = @ptrFromInt(params.pivot_key);
             while (!query_full[stage].tryWaitParity(@intCast((iteration / stages) & 1))) {}
+            const step = if (specialization.inter_sequence) steps[stage] else work.step(iteration);
+            const vectors = if (specialization.inter_sequence)
+                step_vectors[stage]
+            else
+                rowVector(params, work, step);
+            const placement = if (specialization.inter_sequence)
+                segmentPlacement(work, step.block_info, tile_placement)
+            else
+                tile_placement;
             const lse = rowVectors(&tiles.lse[stage]);
             const query_base = wgmma.address(&tiles.q[stage]);
             const do_base = wgmma.address(&tiles.do[stage]);
@@ -1026,6 +1068,7 @@ pub fn FlashAttnBwdSm90SinglePdsStage(
     const score_rows = block_m * pds_swizzle_bytes;
     const Layout = tma.SwizzledLayout(row_chunks, swizzle_bytes);
     const Work = NBlockWork(block_m, block_n, .{});
+    comptime std.debug.assert(!specialization.inter_sequence);
     const staging_boxes = tiling.residentStagingBoxes();
     const box_columns = configurations.Sm90BwdTiling.dq_accum_box_columns;
     const ReduceStaging = tma.InterleavedReduceStaging(block_m, box_columns);
@@ -1674,7 +1717,8 @@ const Entry = entry.Entry(BackwardParams, Backward.Args, .{
     "pivot_sum", "pivot_key", "dk",    "dv",
 } ++ entry.backward_sequence ++ entry.strides("dk") ++ entry.strides("dv") ++
     .{ "lse_batch_stride", "lse_head_stride", "num_batch" } ++
-    if (variant.specialization.scheduler_metadata) .{"scheduler_metadata"} else .{}, .{
+    (if (variant.specialization.scheduler_metadata) .{"scheduler_metadata"} else .{}) ++
+    if (variant.specialization.inter_sequence) .{ "visibility_bits", "window_sizes" } else .{}, .{
     .required_work_group_size = .{ .x = Backward.thread_count },
     .max_registers_per_work_item = Backward.max_registers,
 }, launch);

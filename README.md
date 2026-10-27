@@ -93,7 +93,7 @@ cap.save("fwd.jsonl.gz")
 print(cap.summary(by="sm"))
 ```
 
-The SM80 and SM120 forward kernels and the persistent inter-sequence forward
+The SM80 and SM120 forward kernels and the persistent inter-sequence forwards
 mark their zones. `python -m zigfa.view fwd.jsonl.gz --open` serves the trace
 viewer on localhost and opens the trace; without `--open`, it prints the link. A
 link takes `group` (`sm`, `cluster`, `cta`, `wg` or `warp`), `start` and `end`
@@ -108,10 +108,18 @@ naming the exceptions), for example
 `benchmarks/benchmark_attn.py` times zigfa against torch SDPA, which runs cuDNN where cuDNN accepts
 the case and FlashAttention otherwise, and against FlashAttention-4 on SM90, SM100 and SM120 GPUs.
 `benchmarks/benchmark_inter_sequence.py` times inter-sequence attention against compiled
-FlexAttention and FlashAttention-4 with a `mask_mod` of the same visibility. Their default
-arguments measure the points of `reports/perf_report.html`; with `--json PATH`, each script writes
-one record per point, and `python reports/update_perf_report.py DEVICE PATH...` writes the records
-of one device into the report.
+FlexAttention with a block mask of the same visibility, on its Triton kernels and, on SM90 and SM100
+GPUs, on its FlashAttention-4 kernels (`kernel_options={"BACKEND": "FLASH"}`); `--gqa 4` gives the
+keys and values a quarter of the query heads. Their default arguments measure the points of
+`reports/perf_report.html`; with `--json PATH`, each script writes one record per point, and
+`python reports/update_perf_report.py DEVICE PATH...` writes the records of one device into the
+report.
+
+## Tests
+
+`pytest tests` runs the test suite on the current GPU. At the end it lists the built kernel
+instances that the library can dispatch to on that GPU and whose main kernel no test launched;
+`--kernel-coverage=require` fails the run when it lists any.
 
 ## Build from source
 

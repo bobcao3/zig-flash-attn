@@ -10,7 +10,7 @@ from cuda.core import Device, LaunchConfig, ObjectCode, Stream, launch
 from . import profile
 
 ARCHS = {8: "sm80", 9: "sm90", 10: "sm100", 12: "sm120"}
-INTER_SEQUENCE_ARCHS = {8: "sm80", 12: "sm80"}
+INTER_SEQUENCE_ARCHS = {8: "sm80", 9: "sm90", 10: "sm100", 12: "sm80"}
 INTER_SEQUENCE = "inter_sequence"
 PERSISTENT_PREFIX = "flash_fwd_persistent_"
 SCALAR_TYPES = {"p": np.uint64, "u": np.uint32, "i": np.int32, "f": np.float32}

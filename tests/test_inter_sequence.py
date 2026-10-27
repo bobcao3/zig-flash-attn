@@ -52,7 +52,8 @@ TITI_PARTS_SEEN = {
 WINDOWS = [(-1, -1), (-1, 0), (-1, 7), (5, -1), (9, 3), (0, 0)]
 OPCHECK_TESTS = ("test_schema", "test_autograd_registration", "test_faketensor", "test_aot_dispatch_dynamic")
 
-pytestmark = pytest.mark.skipif(not HEAD_DIMS, reason="no inter-sequence kernels run on this GPU")
+pytestmark = pytest.mark.skipif(not FORWARD_HEAD_DIMS, reason="no inter-sequence kernels run on this GPU")
+requires_backward = pytest.mark.skipif(not HEAD_DIMS, reason="no inter-sequence backward kernels run on this GPU")
 
 
 @dataclass(frozen=True)
@@ -209,7 +210,7 @@ def test_scalar_windows_match_reference(head_dim, options):
 
 
 def test_rows_that_see_no_keys_return_zeros():
-    head_dim = HEAD_DIMS[0]
+    head_dim = FORWARD_HEAD_DIMS[0]
     layout = build_layout("i2t", 4)
     layout.visible[2] = False
     layout.visible[5, 5] = False
@@ -219,14 +220,15 @@ def test_rows_that_see_no_keys_return_zeros():
     blind = ~mask.any(dim=-1).cuda()
     queue_requirement("rows without keys return zeros", (out[blind] == 0).all())
     queue_requirement("rows without keys have an lse of -inf", (lse[:, blind] == FULLY_MASKED_LSE).all())
-    queue_requirement("rows without keys get no query gradient", (gradients[0][blind] == 0).all())
+    if gradients is not None:
+        queue_requirement("rows without keys get no query gradient", (gradients[0][blind] == 0).all())
 
 
 @pytest.mark.parametrize("lengths_q, lengths_k", [([0, 0], [300, 256]), ([10, 30], [0, 0])])
 def test_batches_without_queries_or_keys_return_zeros(lengths_q, lengths_k):
     layout = Layout(lengths_q, lengths_k, torch.tensor([[True, False], [True, True]]), [CAUSAL, DENSE])
     cu_q, cu_k, bits, window_sizes = layout_tensors(layout)
-    for head_dim in HEAD_DIMS:
+    for head_dim in FORWARD_HEAD_DIMS:
         with case(head_dim=head_dim):
             cuda_seed(12)
             q, k, v = leaves(layout, 4, 2, head_dim)
@@ -234,9 +236,11 @@ def test_batches_without_queries_or_keys_return_zeros(lengths_q, lengths_k):
                 q, k, v, cu_q, cu_k, max(lengths_q), max(lengths_k), bits, window_sizes=window_sizes,
                 return_attn_probs=True,
             )
-            gradients = torch.autograd.grad(out, (q, k, v), torch.randn_like(out))
             queue_requirement("the output is zero", (out == 0).all())
             queue_requirement("the lse is -inf", (lse == FULLY_MASKED_LSE).all())
+            if head_dim not in HEAD_DIMS:
+                continue
+            gradients = torch.autograd.grad(out, (q, k, v), torch.randn_like(out))
             for name, gradient in zip(("dq", "dk", "dv"), gradients):
                 queue_requirement(f"{name} is zero", (gradient == 0).all())
 
@@ -246,9 +250,10 @@ def test_many_sequences_span_several_words():
     layout = random_layout(70, generator)
     cuda_seed(5)
     lengths = [length // 4 + 1 for length in layout.lengths_q]
-    check_layout(Layout(lengths, lengths, layout.visible, layout.windows), 4, 2, HEAD_DIMS[0])
+    check_layout(Layout(lengths, lengths, layout.visible, layout.windows), 4, 2, FORWARD_HEAD_DIMS[0])
 
 
+@requires_backward
 def test_kvpacked_matches_unpacked():
     head_dim = HEAD_DIMS[-1]
     layout = build_layout("gapped", 6)
@@ -270,7 +275,7 @@ def test_kvpacked_matches_unpacked():
 def test_scheduler_metadata_is_reusable():
     layout = build_layout("it2i", 7)
     cuda_seed(7)
-    q, k, v = (tensor.detach() for tensor in leaves(layout, 4, 4, HEAD_DIMS[0]))
+    q, k, v = (tensor.detach() for tensor in leaves(layout, 4, 4, FORWARD_HEAD_DIMS[0]))
     cu_q, cu_k, bits, window_sizes = layout_tensors(layout)
     metadata = get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits)
     arguments = (q, k, v, cu_q, cu_k, max(layout.lengths_q), max(layout.lengths_k), bits)
@@ -351,6 +356,7 @@ def length_class(length):
     return exponent << 2 | (length << 2 >> exponent) & 3
 
 
+@requires_backward
 def test_invalid_arguments_raise():
     layout = build_layout("i2t", 8)
     q, k, v = (tensor.detach() for tensor in leaves(layout, 4, 2, HEAD_DIMS[0]))
@@ -380,6 +386,7 @@ def op_arguments():
     return q, k, v, (cu_q, cu_k, bits, *metadata, window_sizes), HEAD_DIMS[0] ** -0.5
 
 
+@requires_backward
 def test_ops_pass_opcheck():
     q, k, v, layout, scale = op_arguments()
     opcheck(inter_sequence_metadata, layout[:3], test_utils=OPCHECK_TESTS)
@@ -392,6 +399,7 @@ def test_ops_pass_opcheck():
     opcheck(inter_sequence_backward_packed, (*arguments, dq, dkv), test_utils=OPCHECK_TESTS)
 
 
+@requires_backward
 def test_compiled_attention_matches_eager():
     torch._dynamo.reset()
     layout = build_layout("i2t", 10)
@@ -418,7 +426,7 @@ def test_compiled_attention_matches_eager():
     torch._dynamo.reset()
 
 
-@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("head_dim", FORWARD_HEAD_DIMS)
 def test_long_image_and_text_sequences(head_dim):
     layouts = {
         "i2t": sample_layout([(1024, 300), (560, 777)], [DENSE, CAUSAL]),

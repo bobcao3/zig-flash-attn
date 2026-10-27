@@ -39,6 +39,13 @@ pub const Zone = enum(u7) {
     combine,
     wait_k,
     wait_v,
+    wait_scores,
+    wait_probabilities,
+    wait_row_scale,
+    wait_output,
+    rescale,
+    wait_correction,
+    wait_turn,
 };
 
 const Span = struct {

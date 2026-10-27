@@ -28,6 +28,22 @@ pub fn NBlockWork(comptime block_m: u32, comptime block_n: u32, comptime options
             block_info: BlockInfo,
         };
 
+        /// Walks the steps of the current query segment and then of each later one.
+        pub const Walk = struct {
+            segment: Work,
+            position: u32 = 0,
+
+            /// Returns the next step; `segment` then describes the query segment of that step.
+            pub fn next(walk: *Walk, params: BackwardParams) Step {
+                if (options.inter_sequence and walk.position == walk.segment.iterations()) {
+                    _ = walk.segment.nextSegment(params);
+                    walk.position = 0;
+                }
+                defer walk.position += 1;
+                return walk.segment.branchedStep(walk.position);
+            }
+        };
+
         pub const RowLimits = struct {
             top: i32,
             bot: i32,
@@ -154,6 +170,16 @@ pub fn NBlockWork(comptime block_m: u32, comptime block_n: u32, comptime options
         }
         pub fn iterations(work: *const Work) u32 {
             return work.m_block_count * work.qhead_per_kvhead;
+        }
+
+        /// The iterations of the current query segment and of every later one.
+        pub fn remainingIterations(work: Work, params: BackwardParams) u32 {
+            var segment = work;
+            var total = segment.iterations();
+            if (options.inter_sequence) {
+                while (segment.nextSegment(params)) total += segment.iterations();
+            }
+            return total;
         }
 
         pub fn step(work: *const Work, iteration: u32) Step {

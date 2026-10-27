@@ -51,6 +51,8 @@ pub const Params = struct {
     qhead_per_kvhead: u32 = 0,
     block_table_m64: u64 = 0,
     block_table_m128: u64 = 0,
+    block_table_m192: u64 = 0,
+    block_table_m256: u64 = 0,
     sequence_records: u64 = 0,
     section_heads: u32 = 0,
     table_capacity: u32 = 0,
@@ -92,6 +94,8 @@ pub const TileCountSemaphore = packed struct(u64) {
         nvptx.fence(.seq_cst, .gpu);
         m128.* = 0;
         m64.* = 0;
+        BlockTable.at(params.block_table_m192).tile_count_semaphore = 0;
+        BlockTable.at(params.block_table_m256).tile_count_semaphore = 0;
     }
 };
 
@@ -192,8 +196,8 @@ pub const Work = struct {
 
     pub fn splitNBlocks(work: Work, block_m: u32, n_block_size: u32) [2]u32 {
         const work_unit = BlockTable.work_unit;
-        const n_blocks =
-            work.summary.block_work / (block_m / work_unit) * (work_unit / n_block_size);
+        const units = work.summary.block_work / (block_m / work_unit);
+        const n_blocks = (units * work_unit + n_block_size - 1) / n_block_size;
         const first = n_blocks * work.split_idx / work.num_splits;
         if (work.split_idx + 1 == work.num_splits) return .{ first, std.math.maxInt(u32) };
         return .{ first, n_blocks * (work.split_idx + 1) / work.num_splits - first };
@@ -281,10 +285,25 @@ pub const TileScheduler = struct {
         comptime block_m: u32,
         comptime has_warp_group_queue: bool,
     ) TileScheduler {
-        const cta_table =
-            if (block_m == cta_block_m) params.block_table_m128 else params.block_table_m64;
+        return initForCtas(params, packs, block_m, has_warp_group_queue, nvptx.nctaid(0));
+    }
+
+    /// Plans the tiles for `ctas` CTAs that run at once.
+    pub fn initForCtas(
+        params: Params,
+        comptime packs: bool,
+        comptime block_m: u32,
+        comptime has_warp_group_queue: bool,
+        ctas: u32,
+    ) TileScheduler {
+        const cta_table = switch (block_m) {
+            64 => params.block_table_m64,
+            128 => params.block_table_m128,
+            192 => params.block_table_m192,
+            256 => params.block_table_m256,
+            else => @compileError("no block table has this many rows"),
+        };
         const cta_table_blocks = BlockTable.at(cta_table).blocks;
-        const ctas = nvptx.nctaid(0);
         const packing = if (packs) params.qhead_per_kvhead else 1;
         const heads = params.num_head / packing;
         const section_heads = @max(1, params.section_heads / packing);

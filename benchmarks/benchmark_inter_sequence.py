@@ -10,7 +10,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 import timing
 from benchmark_attn import attention_bytes, attention_flops, gradient_of, versions, visible_pairs
-from zigfa import runtime
+from zigfa import inter_sequence, runtime
 from zigfa.torch import flash_attn_inter_sequence_func, get_inter_sequence_scheduler_metadata
 
 DENSE = (-1, -1)
@@ -44,8 +44,18 @@ LAYOUTS = {
 }
 HEAD_DIMS = (64, 128, 256, 512)
 MAX_PARTS = 8
-FA4_MAJORS = (9, 10, 12)
-RECOMPILE_LIMIT = 64
+# FlashAttention-4 supports block sparsity on SM90 and SM100 GPUs; on SM120 GPUs it rejects block-sparse tensors.
+# Its SM100 forward needs query blocks of a multiple of 256 rows, two query tiles of 128 rows.
+FLASH_BLOCK_SIZES = {9: (128, 128), 10: (256, 128)}
+# With PyTorch 2.14.1, the Triton kernels of torch.compile(flex_attention) above head dim 256 fail to compile on most
+# GPUs, and on a B300 they fault with a misaligned address, which ends the CUDA context of the process.
+# FlashAttention-4 rejects head dims above 256.
+FLEX_MAX_HEAD_DIM = 256
+RECOMPILE_LIMIT = 128
+# Autotuning makes the Triton FlexAttention faster in some cases and slower in others, so each case times both
+# modes and keeps the faster.
+AUTOTUNE_MODE = "max-autotune-no-cudagraphs"
+AUTOTUNED_FLEX = "FlexAttention autotuned"
 
 
 def visibility_bits_of(visible):
@@ -117,96 +127,83 @@ def mask_tensors(samples, parts):
     ]
 
 
-def flex_functions(q, k, v, dout, tensors):
-    """Returns the forward and backward functions of compiled FlexAttention with a block mask of the visibility."""
+def block_mask_of(tensors, total, block_size=128):
+    """Returns the FlexAttention block mask of the visibility of `mask_tensors`, with blocks of `block_size` query
+    and key rows."""
     sample, part, table = tensors
 
     def mask_mod(batch, head, query, key):
         rule = table[part[query] * MAX_PARTS + part[key]]
         return (sample[query] == sample[key]) & ((rule == 1) | ((rule == 2) & (key <= query)))
 
-    total = q.shape[0]
-    block_mask = create_block_mask(mask_mod, None, None, total, total)
+    return create_block_mask(mask_mod, None, None, total, total, BLOCK_SIZE=block_size)
+
+
+def flex_functions(q, k, v, dout, block_mask, backend, mode=None):
+    """Returns the forward and backward functions of FlexAttention with `block_mask`, compiled in the torch.compile
+    `mode`, on the kernel backend `backend`: "TRITON" for the Triton kernels, or "FLASH" for the FlashAttention-4
+    kernels."""
     inputs = [x.detach().transpose(0, 1).unsqueeze(0).contiguous().requires_grad_() for x in (q, k, v)]
     grad = dout.transpose(0, 1).unsqueeze(0).contiguous()
-    compiled = compiled_flex_attention()
+    compiled = compiled_flex_attention(mode)
+    grouped = k.shape[1] != q.shape[1]
+    options = {"BACKEND": backend}
 
     def forward():
-        return compiled(*inputs, block_mask=block_mask)
+        return compiled(*inputs, block_mask=block_mask, enable_gqa=grouped, kernel_options=options)
 
     return forward, gradient_of(forward, inputs, grad)
 
 
 @functools.cache
-def compiled_flex_attention():
-    """Returns `torch.compile(flex_attention)`. Each case has its own token count, so the compiler may compile
-    once per case; a backward that donates its saved buffers could not run a second time."""
+def compiled_flex_attention(mode):
+    """Returns `torch.compile(flex_attention, mode=mode)`. Each case has its own token count, so the compiler may
+    compile once per case and backend; a backward that donates its saved buffers could not run a second time."""
     for name in ("recompile_limit", "cache_size_limit"):
         if hasattr(torch._dynamo.config, name):
             setattr(torch._dynamo.config, name, RECOMPILE_LIMIT)
     torch._functorch.config.donated_buffer = False
-    return torch.compile(flex_attention)
+    return torch.compile(flex_attention, mode=mode)
+
+
+def keep_faster_flex(results):
+    """Keeps, as FlexAttention, the faster of the default and the autotuned Triton FlexAttention in `results`, and
+    names the torch.compile mode of the one it keeps."""
+    autotuned = results.pop(AUTOTUNED_FLEX, None)
+    default = results.get("FlexAttention")
+    if autotuned and (default is None or autotuned["seconds"] < default["seconds"]):
+        results["FlexAttention"] = {**autotuned, "mode": AUTOTUNE_MODE}
+    elif default:
+        default["mode"] = "default"
 
 
 @functools.cache
-def fa4_flex():
-    """Returns the FlashAttention-4 interface and a CuTe mask_mod of the visibility of `mask_tensors`, or None
-    where FlashAttention-4 is not installed."""
-    if torch.cuda.get_device_capability()[0] not in FA4_MAJORS:
+def flash_block_size():
+    """Returns the block size of the block mask for FlexAttention's FLASH backend on this GPU, or None where
+    FlashAttention-4 is not installed or has no block sparsity."""
+    block_size = FLASH_BLOCK_SIZES.get(torch.cuda.get_device_capability()[0])
+    if block_size is None:
         return None
     try:
-        interface = importlib.import_module("flash_attn.cute.interface")
-        cutlass = importlib.import_module("cutlass")
-        cute = importlib.import_module("cutlass.cute")
-        utils = importlib.import_module("flash_attn.cute.utils")
+        importlib.import_module("flash_attn.cute.interface")
     except ImportError:
         return None
-
-    @cute.jit
-    def clamped(values, index, count):
-        """Reads `values` at `index`, or at its last entry for the positions past the end that a tile pads."""
-        index_fragment = cute.make_rmem_tensor(1, cutlass.Int32)
-        index_fragment.store(index)
-        value_fragment = cute.make_rmem_tensor(1, cutlass.Int32)
-        value_fragment[0] = values[cutlass.min(index_fragment[0], count - 1)]
-        return value_fragment.load()
-
-    @cute.jit
-    def mask_mod(batch, head, query, key, seqlen_info, aux_tensors):
-        sample, part, table = aux_tensors
-        parts = utils.scalar_to_ssa(MAX_PARTS, cutlass.Int32)
-        entry = clamped(part, query, seqlen_info.seqlen_q) * parts + clamped(part, key, seqlen_info.seqlen_k)
-        rule = clamped(table, entry, MAX_PARTS * MAX_PARTS)
-        same_sample = clamped(sample, query, seqlen_info.seqlen_q) == clamped(sample, key, seqlen_info.seqlen_k)
-        one, two = utils.scalar_to_ssa(1, cutlass.Int32), utils.scalar_to_ssa(2, cutlass.Int32)
-        return same_sample & ((rule == one) | ((rule == two) & (key <= query)))
-
-    return interface, mask_mod
-
-
-def fa4_functions(q, k, v, dout, tensors):
-    """Returns the forward and backward functions of FlashAttention-4 with the mask_mod of the visibility."""
-    flex = fa4_flex()
-    if flex is None:
-        return None
-    interface, mask_mod = flex
-    inputs = [x.detach().unsqueeze(0).requires_grad_() for x in (q, k, v)]
-
-    def forward():
-        return interface.flash_attn_func(*inputs, mask_mod=mask_mod, aux_tensors=tensors)
-
-    return forward, gradient_of(forward, inputs, dout.unsqueeze(0))
+    return block_size
 
 
 def run(name, point, samples, parts, head_dim, arguments, output):
     lengths, visible, windows = layout(samples, parts)
     total = sum(lengths)
     heads = arguments.dim // head_dim
+    heads_kv = heads // arguments.gqa
     cu_seqlens = cu_seqlens_of(lengths)
     bits = visibility_bits_of(visible).cuda()
     window_sizes = torch.tensor(windows, dtype=torch.int32).t().contiguous().cuda()
     q = torch.randn(total, heads, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    k, v = (torch.randn_like(q).requires_grad_() for _ in range(2))
+    k, v = (
+        torch.randn(total, heads_kv, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        for _ in range(2)
+    )
     dout = torch.randn_like(q)
     longest = max(lengths)
     metadata = get_inter_sequence_scheduler_metadata(cu_seqlens, cu_seqlens, bits)
@@ -228,10 +225,14 @@ def run(name, point, samples, parts, head_dim, arguments, output):
     tensors = mask_tensors(samples, parts)
     forward = {"zigfa": zigfa_forward}
     backward = {"zigfa": gradient_of(zigfa_forward, (q, k, v), dout)}
-    forward["FlexAttention"], backward["FlexAttention"] = flex_functions(q, k, v, dout, tensors)
-    fa4 = fa4_functions(q, k, v, dout, tensors)
-    if fa4 is not None:
-        forward["FA4 FlexAttention"], backward["FA4 FlexAttention"] = fa4
+    if head_dim <= FLEX_MAX_HEAD_DIM:
+        block_mask = block_mask_of(tensors, total)
+        for label, mode in (("FlexAttention", None), (AUTOTUNED_FLEX, AUTOTUNE_MODE)):
+            forward[label], backward[label] = flex_functions(q, k, v, dout, block_mask, "TRITON", mode)
+    if head_dim <= FLEX_MAX_HEAD_DIM and flash_block_size():
+        forward["FA4 FlexAttention"], backward["FA4 FlexAttention"] = flex_functions(
+            q, k, v, dout, block_mask_of(tensors, total, flash_block_size()), "FLASH"
+        )
     pairs = useful_pairs(lengths, lengths, visible, windows)
     case_seconds = timing.CASE_SECONDS / len(arguments.directions)
     line = f"{name:30} tokens={total:6} sequences={len(lengths):4}"
@@ -239,12 +240,13 @@ def run(name, point, samples, parts, head_dim, arguments, output):
         functions = {"fwd": forward, "bwd": backward}[direction]
         is_backward = direction == "bwd"
         flop_count = attention_flops(pairs, heads, head_dim, is_backward)
-        byte_count = attention_bytes(total, total, heads, heads, head_dim, is_backward)
+        byte_count = attention_bytes(total, total, heads, heads_kv, head_dim, is_backward)
         estimate = timing.estimated_seconds(flop_count, byte_count, is_backward)
         measurement = timing.measure(f"{name} {direction}", functions, estimate, case_seconds)
         line += f" | {direction} " + timing.summary(measurement, list(functions), flop_count, byte_count)
         if output is not None:
             record = timing.record(measurement, flop_count, byte_count)
+            keep_faster_flex(record["results"])
             output.write(json.dumps({"benchmark": "inter_sequence", **point, "direction": direction, **record}) + "\n")
             output.flush()
     return line
@@ -252,17 +254,18 @@ def run(name, point, samples, parts, head_dim, arguments, output):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Times inter-sequence attention against compiled FlexAttention and FlashAttention-4 with a "
-        "mask_mod of the same visibility"
+        description="Times inter-sequence attention against compiled FlexAttention with a block mask of the same "
+        "visibility, on its Triton kernels and on its FlashAttention-4 kernels"
     )
     parser.add_argument("--layouts", nargs="+", choices=list(LAYOUTS), default=list(LAYOUTS))
     parser.add_argument("--head-dims", type=int, nargs="+", default=list(HEAD_DIMS))
     parser.add_argument("--directions", nargs="+", choices=("fwd", "bwd"), default=["fwd", "bwd"])
     parser.add_argument("--tokens", type=int, default=16384)
     parser.add_argument("--dim", type=int, default=2048)
+    parser.add_argument("--gqa", type=int, default=1, help="query heads per key and value head")
     parser.add_argument("--json", help="append one JSON record per case and direction to this file")
     arguments = parser.parse_args()
-    if torch.cuda.get_device_capability()[0] not in runtime.INTER_SEQUENCE_ARCHS:
+    if not inter_sequence.forward_head_dims(runtime.current_device().device_id):
         print(f"zigfa builds no inter-sequence kernels for {torch.cuda.get_device_name()}.", flush=True)
         return
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
@@ -272,7 +275,8 @@ def main():
     print(timing.header(), flush=True)
     print(
         "Inputs are bfloat16 values drawn from N(0, 1). Each line times inter-sequence attention against compiled "
-        "FlexAttention, and FlashAttention-4 with a mask_mod where it runs, over the same visibility. TF/s count "
+        "FlexAttention with a block mask of the same visibility, on its Triton kernels (FlexAttention) and on its "
+        "FlashAttention-4 kernels (FA4 FlexAttention) where they run. TF/s count "
         "only the visible query-key pairs; a percent after a rate is of the roofline, and (zigfa N%) is the speed "
         "of zigfa as a percent of the speed of that implementation.",
         flush=True,
@@ -286,7 +290,14 @@ def main():
             continue
         for head_dim in arguments.head_dims:
             case_started = time.perf_counter()
-            point = {**common, "layout": name, "head_dim": head_dim}
+            point = {
+                **common,
+                "layout": name,
+                "head_dim": head_dim,
+                "gqa": arguments.gqa,
+                "tokens": sum(map(sum, samples)),
+                "sequences": sum(map(len, samples)),
+            }
             line = run(f"{name} hd={head_dim:3}", point, samples, parts, head_dim, arguments, output)
             durations.append(time.perf_counter() - case_started)
             print(f"{line} [{durations[-1]:.2f} s]", flush=True)

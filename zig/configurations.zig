@@ -183,6 +183,221 @@ pub const PersistentTiling = struct {
     }
 };
 
+pub const inter_sequence_sm120 = struct {
+    pub const block_m = inter_sequence_persistent.cta_warps * 16;
+    pub const block_n = inter_sequence_persistent.block_n;
+    pub const consumer_warps = inter_sequence_persistent.cta_warps;
+    pub const producer_warps = warps_per_warp_group;
+    pub const producer_registers = 40;
+    pub const consumer_registers = 232;
+    pub const slot_rows = 64;
+    pub const work_slots = 8;
+    pub const box_columns = 64;
+    pub const swizzle_bytes = 128;
+    pub const supported_head_dims = [_]u32{ 64, 128 };
+    pub const ring_bytes = 96 * 1024;
+    pub const max_slots = 12;
+
+    pub fn threads() u32 {
+        return (consumer_warps + producer_warps) * 32;
+    }
+
+    pub fn overlapsScores(head_dim: u32) bool {
+        return head_dim <= overlap_max_head_dim;
+    }
+
+    pub const overlap_max_head_dim = 64;
+
+    pub fn slotBytes(head_dim: u32) u32 {
+        return slot_rows * head_dim * Sm80FwdTiling.element_bytes;
+    }
+
+    pub fn slots(head_dim: u32) u32 {
+        return @min(max_slots, ring_bytes / slotBytes(head_dim));
+    }
+
+    pub fn sharedBytes(head_dim: u32) u32 {
+        return slots(head_dim) * slotBytes(head_dim);
+    }
+};
+
+pub const inter_sequence_sm90 = struct {
+    pub const block_n = 128;
+    pub const producer_warps = warps_per_warp_group;
+    pub const query_box_rows = 64;
+    pub const query_buffers = 2;
+    pub const work_slots = 8;
+    pub const box_columns = 64;
+    pub const swizzle_bytes = 128;
+    pub const supported_head_dims = [_]u32{ 64, 128 };
+    /// The dynamic and static shared memory of one CTA on an H100, less what the barriers and
+    /// the scheduler state take.
+    pub const tile_bytes_limit = 227 * 1024 - 3 * 1024;
+    pub const max_slots = 12;
+
+    /// The consumer warp groups of the varlen SM90 forward of the same head dimension.
+    pub fn groups(head_dim: u32) u32 {
+        return forwardSm90(head_dim).consumerGroups();
+    }
+
+    pub fn blockM(head_dim: u32) u32 {
+        return groups(head_dim) * query_box_rows;
+    }
+
+    pub fn consumerWarps(head_dim: u32) u32 {
+        return groups(head_dim) * warps_per_warp_group;
+    }
+
+    pub fn producerRegisters(head_dim: u32) u32 {
+        return registerRequirements(groups(head_dim))[0];
+    }
+
+    pub fn consumerRegisters(head_dim: u32) u32 {
+        return registerRequirements(groups(head_dim))[1];
+    }
+
+    pub fn threads(head_dim: u32) u32 {
+        return (consumerWarps(head_dim) + producer_warps) * 32;
+    }
+
+    pub fn slotBytes(head_dim: u32) u32 {
+        return block_n * head_dim * Sm80FwdTiling.element_bytes;
+    }
+
+    pub fn queryBytes(head_dim: u32) u32 {
+        return query_buffers * blockM(head_dim) * head_dim * Sm80FwdTiling.element_bytes;
+    }
+
+    pub fn slots(head_dim: u32) u32 {
+        return @min(max_slots, (tile_bytes_limit - queryBytes(head_dim)) / slotBytes(head_dim));
+    }
+
+    pub fn sharedBytes(head_dim: u32) u32 {
+        return queryBytes(head_dim) + slots(head_dim) * slotBytes(head_dim);
+    }
+};
+
+pub const inter_sequence_sm100 = struct {
+    pub const supported_head_dims = [_]u32{ 64, 128 };
+
+    /// The SM100 forward with two query stages of 128 rows, which a block of the 256-row block
+    /// table fills.
+    pub fn forward(head_dim: u32) Sm100FwdTiling {
+        var tiling = forwardSm100(head_dim);
+        tiling.divmod_decode = false;
+        tiling.prologue_loads = false;
+        tiling.scheduling_mode = .clc;
+        return tiling;
+    }
+};
+
+pub const PersistentSm100Tiling = struct {
+    head_dim: u32,
+    block_m: u32 = 256,
+    block_n: u32 = 128,
+    scheduling_mode: SchedulingMode = .clc,
+
+    pub fn forward(tiling: PersistentSm100Tiling) Sm100FwdTiling {
+        return inter_sequence_sm100.forward(tiling.head_dim);
+    }
+
+    pub fn threads(tiling: PersistentSm100Tiling) u32 {
+        return tiling.forward().threads();
+    }
+
+    pub fn sharedBytes(tiling: PersistentSm100Tiling) u32 {
+        return tiling.forward().sharedBytes();
+    }
+
+    pub fn boxColumns(tiling: PersistentSm100Tiling) u32 {
+        return tiling.forward().boxColumns();
+    }
+
+    pub fn swizzleBytes(tiling: PersistentSm100Tiling) u32 {
+        return tiling.forward().swizzleBytes();
+    }
+
+    fn variants(comptime head_dim: u32) Variants(PersistentSm100Tiling) {
+        comptime {
+            const tiling: PersistentSm100Tiling = .{ .head_dim = head_dim };
+            std.debug.assert(tiling.forward().ctaTilerM() == tiling.block_m);
+            std.debug.assert(tiling.forward().block_n == tiling.block_n);
+            var list: VariantList(PersistentSm100Tiling) = .{};
+            list.add(tiling, .{});
+            list.add(tiling, .{ .grouped = true, .pack_gqa = true });
+            return list.slice();
+        }
+    }
+};
+
+pub const PersistentSm120Tiling = struct {
+    head_dim: u32,
+    block_m: u32 = inter_sequence_sm120.block_m,
+    block_n: u32 = inter_sequence_sm120.block_n,
+    scheduling_mode: SchedulingMode = .clc,
+
+    pub fn threads(_: PersistentSm120Tiling) u32 {
+        return inter_sequence_sm120.threads();
+    }
+
+    pub fn sharedBytes(tiling: PersistentSm120Tiling) u32 {
+        return inter_sequence_sm120.sharedBytes(tiling.head_dim);
+    }
+
+    pub fn boxColumns(_: PersistentSm120Tiling) u32 {
+        return inter_sequence_sm120.box_columns;
+    }
+
+    pub fn swizzleBytes(_: PersistentSm120Tiling) u32 {
+        return inter_sequence_sm120.swizzle_bytes;
+    }
+
+    fn variants(comptime head_dim: u32) Variants(PersistentSm120Tiling) {
+        comptime {
+            const tiling: PersistentSm120Tiling = .{ .head_dim = head_dim };
+            var list: VariantList(PersistentSm120Tiling) = .{};
+            list.add(tiling, .{});
+            list.add(tiling, .{ .grouped = true, .pack_gqa = true });
+            return list.slice();
+        }
+    }
+};
+pub const PersistentSm90Tiling = struct {
+    head_dim: u32,
+    block_m: u32,
+    block_n: u32 = inter_sequence_sm90.block_n,
+    scheduling_mode: SchedulingMode = .dynamic,
+
+    pub fn threads(tiling: PersistentSm90Tiling) u32 {
+        return inter_sequence_sm90.threads(tiling.head_dim);
+    }
+
+    pub fn sharedBytes(tiling: PersistentSm90Tiling) u32 {
+        return inter_sequence_sm90.sharedBytes(tiling.head_dim);
+    }
+
+    pub fn boxColumns(_: PersistentSm90Tiling) u32 {
+        return inter_sequence_sm90.box_columns;
+    }
+
+    pub fn swizzleBytes(_: PersistentSm90Tiling) u32 {
+        return inter_sequence_sm90.swizzle_bytes;
+    }
+
+    fn variants(comptime head_dim: u32) Variants(PersistentSm90Tiling) {
+        comptime {
+            const tiling: PersistentSm90Tiling = .{
+                .head_dim = head_dim,
+                .block_m = inter_sequence_sm90.blockM(head_dim),
+            };
+            var list: VariantList(PersistentSm90Tiling) = .{};
+            list.add(tiling, .{});
+            list.add(tiling, .{ .grouped = true, .pack_gqa = true });
+            return list.slice();
+        }
+    }
+};
+
 fn persistentVariants(comptime head_dim: u32) Variants(PersistentTiling) {
     comptime {
         var tiling: PersistentTiling = .{ .head_dim = head_dim };
@@ -228,13 +443,16 @@ pub const Source = enum {
     flash_fwd_sm100,
     flash_bwd_sm100,
     flash_bwd_sm120,
+    flash_fwd_persistent_sm120,
+    flash_fwd_persistent_sm90,
+    flash_fwd_persistent_sm100,
 
     pub fn arch(source: Source) u32 {
         return switch (source) {
             .flash_fwd_sm80, .flash_fwd_persistent_sm80, .flash_bwd_sm80 => 80,
-            .flash_fwd_sm120, .flash_bwd_sm120 => 120,
-            .flash_fwd_sm90, .flash_bwd_sm90 => 90,
-            .flash_fwd_sm100, .flash_bwd_sm100 => 100,
+            .flash_fwd_sm120, .flash_bwd_sm120, .flash_fwd_persistent_sm120 => 120,
+            .flash_fwd_sm90, .flash_bwd_sm90, .flash_fwd_persistent_sm90 => 90,
+            .flash_fwd_sm100, .flash_bwd_sm100, .flash_fwd_persistent_sm100 => 100,
         };
     }
 
@@ -247,12 +465,18 @@ pub const Source = enum {
             .flash_bwd_sm90 => Sm90BwdTiling,
             .flash_fwd_sm100 => Sm100FwdTiling,
             .flash_bwd_sm100 => Sm100BwdTiling,
+            .flash_fwd_persistent_sm120 => PersistentSm120Tiling,
+            .flash_fwd_persistent_sm90 => PersistentSm90Tiling,
+            .flash_fwd_persistent_sm100 => PersistentSm100Tiling,
         };
     }
 
     pub fn headDims(comptime source: Source) []const u32 {
         return switch (source) {
             .flash_fwd_persistent_sm80 => &inter_sequence_persistent.supported_head_dims,
+            .flash_fwd_persistent_sm120 => &inter_sequence_sm120.supported_head_dims,
+            .flash_fwd_persistent_sm90 => &inter_sequence_sm90.supported_head_dims,
+            .flash_fwd_persistent_sm100 => &inter_sequence_sm100.supported_head_dims,
             else => &head_dims,
         };
     }
@@ -269,6 +493,9 @@ pub fn variants(comptime source: Source, comptime head_dim: u32) Variants(source
         .flash_fwd_sm100 => forwardSm100Variants(head_dim),
         .flash_bwd_sm100 => backwardSm100Variants(head_dim),
         .flash_bwd_sm120 => backwardSm120Variants(head_dim),
+        .flash_fwd_persistent_sm120 => PersistentSm120Tiling.variants(head_dim),
+        .flash_fwd_persistent_sm90 => PersistentSm90Tiling.variants(head_dim),
+        .flash_fwd_persistent_sm100 => PersistentSm100Tiling.variants(head_dim),
     };
     comptime {
         @setEvalBranchQuota(2_000_000);
@@ -336,6 +563,14 @@ pub fn launch(comptime source: Source, comptime head_dim: u32, comptime index: u
             result.pdl = @intFromBool(tile.pdl);
         },
         .flash_fwd_sm90 => result.pdl = result.scheduler_metadata,
+        .flash_fwd_persistent_sm120, .flash_fwd_persistent_sm90 => {
+            result.q_box_rows = inter_sequence_sm120.slot_rows;
+            result.pdl = 1;
+        },
+        .flash_fwd_persistent_sm100 => {
+            result.q_box_rows = tile.forward().m_block_size;
+            result.pdl = 1;
+        },
         .flash_bwd_sm90 => {
             result.bulk_reduce = 1;
             result.dq_accum_box_columns = Sm90BwdTiling.dq_accum_box_columns;
@@ -1211,6 +1446,7 @@ pub fn backwardSm90Variants(comptime head_dim: u32) Variants(Sm90BwdTiling) {
         var list: VariantList(Sm90BwdTiling) = .{};
         if (head_dim == 64) list.add(one_dq_part, varlenSorted(maxq128));
         if (head_dim == 64 or head_dim == 128) list.add(regular, varlen_sorted);
+        if (head_dim == 64 or head_dim == 128) list.add(regular, inter_sequence_sorted);
         if (head_dim == 64) list.add(one_dq_part, .{ .limits = maxq128 });
         if (head_dim == 96) {
             var tiling = regular;
@@ -1537,6 +1773,7 @@ pub fn backwardSm100Variants(comptime head_dim: u32) Variants(Sm100BwdTiling) {
     comptime {
         const plain = backwardSm100(head_dim);
         var list: VariantList(Sm100BwdTiling) = .{};
+        if (head_dim == 64) list.add(plain, inter_sequence_sorted);
         if (head_dim != 128) {
             if (head_dim == 64) list.add(plain, varlen_sorted);
             list.add(plain, .{});
@@ -1558,6 +1795,7 @@ pub fn backwardSm100Variants(comptime head_dim: u32) Variants(Sm100BwdTiling) {
         list.add(plain, .{ .inputs = .batched, .grouped = true });
         list.add(plain, .{ .limits = .{ .max_seqlen_q = 1024 } });
         list.add(two_cta_tiling, .{ .head_split = true });
+        list.add(two_cta_tiling, inter_sequence_block_table);
         return list.slice();
     }
 }

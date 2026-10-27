@@ -5,8 +5,16 @@ implementation, a CUDA graph of calls that takes about `BLOCK_SECONDS`, and the 
 with the next implementation, so that clock and temperature changes affect all of them alike. The
 first measurement of a process first runs the blocks for `CLOCK_WARMUP_SECONDS`, which brings the
 GPU to the clock that its power limit sustains; later cases call each function once before timing.
+
+CUDA events time a block that is a CUDA graph. A block that CUDA graphs cannot capture, such as an
+autograd backward, runs its calls one after another, and the host may then launch kernels slower
+than the GPU runs them. The torch profiler times such a block: the block runs alone inside a
+`record_function` range, and its time is the time during which the GPU ran at least one kernel,
+copy or memset that started inside the range.
 """
 
+import bisect
+import contextlib
 import dataclasses
 import functools
 import os
@@ -17,6 +25,8 @@ import time
 
 import torch
 from cuda.bindings import nvml
+from torch.autograd import DeviceType
+from torch.profiler import ProfilerActivity, profile, record_function
 
 CLOCK_WARMUP_SECONDS = 1.0
 CASE_SECONDS = 0.3
@@ -29,6 +39,7 @@ HOST_SECONDS = 2.0
 SLOW_SETUP_SECONDS = 0.2
 TIMEOUT_ESTIMATE_MULTIPLE = 200
 TELEMETRY_PERIOD_SECONDS = 0.02
+RANGE_PREFIX = "timing:"
 clock_warm = False
 
 
@@ -175,6 +186,32 @@ def block_of(function, calls):
     return eager, False
 
 
+def busy_seconds(events, labels):
+    """Returns for each label the GPU time of each of its `record_function` ranges in `events`, in the order of the
+    ranges: the length of the union of the intervals of the kernels, copies and memsets that start inside it."""
+    ranges = sorted(
+        (event.time_range.start, event.time_range.end, event.name.removeprefix(RANGE_PREFIX))
+        for event in events
+        if event.device_type == DeviceType.CPU and event.name.startswith(RANGE_PREFIX)
+    )
+    starts = [start for start, _, _ in ranges]
+    spans = [[] for _ in ranges]
+    for event in events:
+        if event.device_type != DeviceType.CUDA or getattr(event, "is_user_annotation", False):
+            continue
+        index = bisect.bisect_right(starts, event.time_range.start) - 1
+        if index >= 0 and event.time_range.start <= ranges[index][1]:
+            spans[index].append((event.time_range.start, event.time_range.end))
+    busy = {label: [] for label in labels}
+    for (_, _, label), intervals in zip(ranges, spans):
+        total, covered = 0.0, float("-inf")
+        for start, end in sorted(intervals):
+            total += max(0.0, end - max(start, covered))
+            covered = max(covered, end)
+        busy[label].append(total * 1e-6)
+    return busy
+
+
 def measure(name, functions, estimate, case_seconds=CASE_SECONDS):
     """Returns the median device time of one call of each of `functions`, a dict of named functions whose
     first entry is the implementation under test, and the median ratio of the time of each to the time of
@@ -208,24 +245,39 @@ def measure(name, functions, estimate, case_seconds=CASE_SECONDS):
             for label in labels:
                 blocks[label][0]()
             torch.cuda.synchronize()
-        clock_warm = True
-        samples = {label: [] for label in labels}
-        measured = 0.0
-        with Telemetry() as telemetry:
-            while measured < case_seconds or len(samples[labels[0]]) < MIN_ROUNDS:
-                shift = len(samples[labels[0]]) % len(labels)
-                events = {}
-                for label in labels[shift:] + labels[:shift]:
-                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                    start.record()
-                    blocks[label][0]()
-                    end.record()
-                    events[label] = (start, end)
-                torch.cuda.synchronize()
-                for label, (start, end) in events.items():
-                    seconds = start.elapsed_time(end) * 1e-3
-                    measured += seconds
-                    samples[label].append(seconds / calls)
+    clock_warm = True
+    eager = [label for label in labels if not blocks[label][1]]
+    profiler = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) if eager else contextlib.nullcontext()
+    samples = {label: [] for label in labels}
+    measured = 0.0
+    with profiler, Watchdog(name, limit), Telemetry() as telemetry:
+        while measured < case_seconds or len(samples[labels[0]]) < MIN_ROUNDS:
+            shift = len(samples[labels[0]]) % len(labels)
+            events = {}
+            for label in labels[shift:] + labels[:shift]:
+                if label in eager:
+                    torch.cuda.synchronize()
+                    started = time.perf_counter()
+                    with record_function(RANGE_PREFIX + label):
+                        blocks[label][0]()
+                        torch.cuda.synchronize()
+                    measured += time.perf_counter() - started
+                    samples[label].append(None)
+                    continue
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                blocks[label][0]()
+                end.record()
+                events[label] = (start, end)
+            torch.cuda.synchronize()
+            for label, (start, end) in events.items():
+                seconds = start.elapsed_time(end) * 1e-3
+                measured += seconds
+                samples[label].append(seconds / calls)
+    if eager:
+        for label, values in busy_seconds(profiler.events(), eager).items():
+            assert len(values) == len(samples[label])
+            samples[label] = [seconds / calls for seconds in values]
     first = samples[labels[0]] if labels[0] == next(iter(functions)) else None
     timings = {
         label: Timing(

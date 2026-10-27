@@ -1,3 +1,4 @@
+import itertools
 import math
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -16,8 +17,9 @@ from reference import (
 from shapes import HEAD_DIMS, cu_seqlens_of, cuda_seed
 from test_inter_sequence import CAUSAL, DENSE, build_layout, layout_tensors, sample_layout
 from zigfa import inter_sequence, runtime, specialization
-from zigfa.backward import SM80_HEAD_SPLIT_MINIMUM_SEQLEN, backward_variant
-from zigfa.forward import forward_variant, split_kv
+from zigfa.backward import HEAD_SPLIT_MINIMUM_GROUP, SM80_HEAD_SPLIT_MINIMUM_SEQLEN, backward_variant
+from zigfa.forward import SPLIT_KV_KEYS_PER_QUERY, SPLIT_KV_MIN_BLOCKS, forward_variant, split_kv
+from zigfa.specialization import SCHEDULER_METADATA_MIN_BATCH
 from zigfa.torch import flash_attn_func, flash_attn_inter_sequence_func, flash_attn_varlen_func
 
 DEVICE_ID = runtime.current_device().device_id
@@ -31,12 +33,14 @@ QUERY_SPREAD = 0.25
 ZERO_MAXIMUM_MARGINS = (17.0, 80.0)
 PEAK_MARGINS = (2.0, 60.0)
 PEAKED_FRACTION = 0.75
-# ex2.approx.ftz flushes results below 2**-126 (e**-87.3) to zero. The checked margins keep the terms of a
-# row above that limit, and the gradient bounds allow FLUSHED_TERM per summand: a flushed term times a
-# vector of norm up to 256.
+# ex2.approx.ftz and the .ftz products flush results below FLUSH_LIMIT = 2**-126 (e**-87.3) to zero. The
+# checked margins keep the terms of a row above that limit. The bounds of out and dv allow FLUSHED_TERM per
+# summand: a flushed term times a row of v or dout, whose norms stay below 256. The bounds of dq and dk take
+# their allowance from `flush_allowances`.
 FLUSH_MARGIN = 84.0
 RECOVERABLE_MARGIN = 76.0
-FLUSHED_TERM = 2.0**-118
+FLUSH_LIMIT = 2.0**-126
+FLUSHED_TERM = 256 * FLUSH_LIMIT
 # Rounding a score z to FP32 changes exp(z) by up to about |z| * 2**-24 relative. The lse of a zero-maximum
 # row is about the sum of the exponentials of its other keys, so its bound allows LSE_UNIT = 8 * 2**-24 per
 # unit of the mean |z| of those keys, weighted by their exponentials, plus 8 * LSE_UNIT.
@@ -252,17 +256,33 @@ def queue_unseen_key_checks(dk, dv, seers):
     queue_requirement("dk and dv are zero for the keys that no row sees", zeros)
 
 
-def queue_gradient_checks(dq, dk, dv, ref, seers, pivots_required=False):
+def flush_allowances(problem):
+    """Returns, for each row of dq and each row of dk, the largest change that flushing can make: a flushed P_ij,
+    or a flushed product with P_ij, takes at most FLUSH_LIMIT * max(1, |dP_ij - D_i|) from dS_ij, and
+    |dP_ij - D_i| <= |dout_i| (|v_j| + |out_i|) <= 2 |dout_i| max_j |v_j|."""
+    q, k, v, dout = (x.double() for x in (problem.q, problem.k, problem.v, problem.dout))
+    groups = q.shape[1] // k.shape[1]
+    scale = q.shape[-1] ** -0.5 if problem.softmax_scale is None else problem.softmax_scale
+    largest_v = v.norm(dim=-1).amax(0).repeat_interleave(groups)
+    ds_limit = FLUSH_LIMIT * scale * (2 * dout.norm(dim=-1) * largest_v).clamp(min=1)
+    mask = problem.mask.to(q.device, torch.float64)
+    dq_allowance = ds_limit * (mask @ k.norm(dim=-1).repeat_interleave(groups, dim=1))
+    dk_allowance = (mask.T @ (ds_limit * q.norm(dim=-1))).unflatten(1, (-1, groups)).sum(2)
+    return dq_allowance, dk_allowance
+
+
+def queue_gradient_checks(dq, dk, dv, ref, seers, flushed, pivots_required=False):
     rows, pivot = checked_rows(ref), ref.pivot.T
-    dq_ratio = (dq.double() - ref.dq).norm(dim=-1) / (GRADIENT_UNIT * ref.dq_scale + FLUSHED_TERM * ref.visible.T)
+    dq_flushed, dk_flushed = flushed
+    dq_ratio = (dq.double() - ref.dq).norm(dim=-1) / (GRADIENT_UNIT * ref.dq_scale + dq_flushed)
     queue_worst("dq of rows with a pivot", dq_ratio, rows & pivot, pivots_required)
     queue_worst("dq of rows without a pivot", dq_ratio, rows & ~pivot)
     half_units = torch.where(ref.corrected_keys, 0.5 * bf16_spacing(ref.dk).norm(dim=-1), 0.0)
-    flushed = FLUSHED_TERM * seers[:, None] * (dq.shape[1] // dk.shape[1])
-    dk_ratio = (dk.double() - ref.dk).norm(dim=-1) / (GRADIENT_UNIT * ref.dk_scale + half_units + flushed)
+    dk_ratio = (dk.double() - ref.dk).norm(dim=-1) / (GRADIENT_UNIT * ref.dk_scale + half_units + dk_flushed)
     seen = ref.dk_scale > 0
     queue_worst("dk of pivot keys", dk_ratio, seen & ref.corrected_keys, pivots_required)
     queue_worst("dk of other keys", dk_ratio, seen & ~ref.corrected_keys)
+    flushed = FLUSHED_TERM * seers[:, None] * (dq.shape[1] // dk.shape[1])
     dv_ratio = (dv.double() - ref.dv).norm(dim=-1) / (GRADIENT_UNIT * ref.dv_scale + flushed)
     queue_worst("dv", dv_ratio, ref.dv_scale > 0)
 
@@ -285,7 +305,7 @@ def check(problem, gradients=True, accuracy=True, zero_maximum=False, pivots_req
     if gradients:
         queue_unseen_key_checks(dk, dv, problem.mask.sum(0))
     if gradients and accuracy:
-        queue_gradient_checks(dq, dk, dv, ref, problem.mask.sum(0), pivots_required)
+        queue_gradient_checks(dq, dk, dv, ref, problem.mask.sum(0), flush_allowances(problem), pivots_required)
     return ref, (out, lse, dq, dk, dv)
 
 
@@ -406,8 +426,111 @@ def test_zero_maximum_and_peaked_varlen_rows(head_dim, window_name, case_name):
                 check(peaked_problem(tensors, mask, attend, pivot_choice, softmax_scale), pivots_required=True)
 
 
+@dataclass(frozen=True)
+class VariantCase:
+    varlen: bool
+    batch: int
+    seqlen_q: int
+    seqlen_k: int
+    num_head: int
+    num_head_kv: int
+    window: tuple
+
+    def dispatch_arguments(self, head_dim):
+        """Returns the q shape, k shape, cu_seqlens shape and maximum lengths that the dispatch of this case sees."""
+        if self.varlen:
+            return (
+                (self.batch * self.seqlen_q, self.num_head, head_dim),
+                (self.batch * self.seqlen_k, self.num_head_kv, head_dim),
+                (self.batch + 1,), self.seqlen_q, self.seqlen_k,
+            )
+        return (
+            (self.batch, self.seqlen_q, self.num_head, head_dim),
+            (self.batch, self.seqlen_k, self.num_head_kv, head_dim),
+            None, None, None,
+        )
+
+
+def variant_cases(direction, head_dim):
+    """Returns cases whose lengths, windows and batches come from the limits of the variants declared for this
+    direction and head dim and from the thresholds of the dispatch: smallest first, after the cases whose rows and
+    keys fill at least one query tile, which give the checks rows with margins to measure."""
+    infos = [info for _, info in specialization.declared_variants(DEVICE_ID, direction, head_dim)]
+    tile = min(info.block_m for info in infos)
+    lengths = {1, tile, *SM80_HEAD_SPLIT_MINIMUM_SEQLEN.get(head_dim, ())}
+    for info in infos:
+        lengths |= {info.min_seqlen_q, info.max_seqlen_q, info.max_seqlen_k}
+    lengths.discard(0)
+    split_keys = 2 * SPLIT_KV_MIN_BLOCKS * max(info.block_n for info in infos)
+    windows = {specialization.UNBOUNDED, (-1, 0), (tile, tile), (tile, 0)}
+    for info in infos:
+        if info.max_window_size:
+            windows |= {(info.max_window_size // 4, info.max_window_size // 4), (info.max_window_size // 2, 0)}
+    heads = ((4, 4), (8, 2), (HEAD_SPLIT_MINIMUM_GROUP, 1))
+    cases = set()
+    for seqlen_q in lengths:
+        keys = {seqlen_q, max(SPLIT_KV_KEYS_PER_QUERY * seqlen_q, split_keys)}
+        keys |= {info.max_seqlen_k for info in infos if info.max_seqlen_k >= seqlen_q}
+        for seqlen_k, varlen, batch, (num_head, num_head_kv), window in itertools.product(
+            keys, (False, True), (2, SCHEDULER_METADATA_MIN_BATCH), heads, windows
+        ):
+            cases.add(VariantCase(varlen, batch, seqlen_q, seqlen_k, num_head, num_head_kv, window))
+    return sorted(cases, key=lambda c: (
+        min(c.seqlen_q, c.seqlen_k) < tile, c.batch * c.seqlen_q * c.seqlen_k * c.num_head, c.varlen, c.window
+    ))
+
+
+def selected_variant(direction, head_dim, variant_case):
+    q_shape, k_shape, cu_seqlens_shape, max_seqlen_q, max_seqlen_k = variant_case.dispatch_arguments(head_dim)
+    if direction == "fwd":
+        return chosen_forward(q_shape, k_shape, variant_case.window, cu_seqlens_shape, max_seqlen_q, max_seqlen_k)
+    return backward_variant(DEVICE_ID, q_shape, k_shape, *variant_case.window, cu_seqlens_shape, max_seqlen_q,
+                            max_seqlen_k)
+
+
+def variant_problem_inputs(variant_case):
+    """Returns the cu_seqlens of the keys, the mask and the attention function of a case."""
+    window = variant_case.window
+    cu_q = uniform_cu_seqlens(variant_case.batch, variant_case.seqlen_q)
+    cu_k = uniform_cu_seqlens(variant_case.batch, variant_case.seqlen_k)
+    mask = varlen_visible(cu_q, cu_k, window).cuda()
+    if variant_case.varlen:
+        return cu_k, mask, varlen_attention(cu_q, cu_k, window)
+    return cu_k, mask, batched_attention(variant_case.batch, window)
+
+
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("direction", ["fwd", "bwd"])
+def test_each_variant_keeps_zero_maximum_and_peaked_rows_accurate(restrict_candidates, head_dim, direction):
+    variants = [
+        variant for variant in runtime.variant_names(DEVICE_ID, direction, head_dim)
+        if variant and runtime.INTER_SEQUENCE not in variant
+    ]
+    cases = variant_cases(direction, head_dim)
+    for variant in variants:
+        restrict_candidates((variant,))
+        variant_case = next((c for c in cases if selected_variant(direction, head_dim, c) == variant), None)
+        queue_requirement(f"{direction} {variant}: a case built from the variant limits selects it",
+                          torch.tensor(variant_case is not None, device="cuda"))
+        if variant_case is None:
+            continue
+        rows_q = variant_case.batch * variant_case.seqlen_q
+        rows_k = variant_case.batch * variant_case.seqlen_k
+        cu_k, mask, attend = variant_problem_inputs(variant_case)
+        with case(**{"forward" if direction == "fwd" else "backward": variant}):
+            cuda_seed(head_dim + rows_q)
+            tensors = random_tensors(rows_q, rows_k, variant_case.num_head, variant_case.num_head_kv, head_dim)
+            if direction == "fwd":
+                zero_keys = torch.zeros(rows_k, variant_case.num_head_kv, dtype=torch.bool, device="cuda")
+                zero_keys[cu_k[:-1].long().cuda()] = True
+                with case(rows="zero maximum"):
+                    check(zero_maximum_problem(tensors, mask, attend, zero_keys), zero_maximum=True)
+            with case(rows="sink"):
+                check(peaked_problem(tensors, mask, attend, first_visible_keys), pivots_required=True)
+
+
 def inter_sequence_layouts(head_dim):
-    layouts = {"i2t": build_layout("i2t", head_dim)}
+    layouts = {"i2t": build_layout("i2t", head_dim), "i2t_mha": (build_layout("i2t", head_dim), GQA_HEADS[0])}
     if head_dim in PERSISTENT_HEAD_DIMS:
         instance = inter_sequence.persistent_instance(head_dim, 1)
         ctas = inter_sequence.resident_ctas(DEVICE_ID, instance)
@@ -427,7 +550,7 @@ def first_keys_of_samples(layout, cu_k):
 
 
 @pytest.mark.parametrize("head_dim", INTER_SEQUENCE_FORWARD_HEAD_DIMS)
-@pytest.mark.parametrize("layout_name", ["i2t", "persistent_splits", "key_slices"])
+@pytest.mark.parametrize("layout_name", ["i2t", "i2t_mha", "persistent_splits", "key_slices"])
 def test_zero_maximum_and_peaked_inter_sequence_rows(head_dim, layout_name):
     layouts = inter_sequence_layouts(head_dim)
     if layout_name not in layouts:
@@ -440,12 +563,12 @@ def test_zero_maximum_and_peaked_inter_sequence_rows(head_dim, layout_name):
     zero_keys = torch.zeros(tensors[1].shape[:2], dtype=torch.bool, device="cuda")
     zero_keys[first_keys_of_samples(layout, cu_k).cuda()] = True
     with case(rows="zero maximum"):
-        problem = zero_maximum_problem(tensors, mask, attend, zero_keys, exp2_error=0.0)
+        problem = zero_maximum_problem(tensors, mask, attend, zero_keys)
         check(problem, gradients, zero_maximum=True, pivots_required=gradients)
     if gradients:
         for name, pivot_choice in (("sink", first_visible_keys), ("peaked", random_visible_keys)):
             with case(rows=name):
-                check(peaked_problem(tensors, mask, attend, pivot_choice, exp2_error=0.0), pivots_required=True)
+                check(peaked_problem(tensors, mask, attend, pivot_choice), pivots_required=True)
 
 
 PEAKED_CASES = {"short": ((3, 128, 128), None), "scaled": ((2, 256, 320), OTHER_SCALE)}
@@ -508,7 +631,8 @@ def test_query_gradient_ignores_a_common_key_shift(head_dim):
     exact = (shifted.k.double() == problem.k.double() + KEY_SHIFT).all()
     queue_requirement("the shifted keys are exact in bfloat16", exact)
     _, _, shifted_dq, _, _ = run(shifted)
-    allowed = SHIFT_UNIT * (ref.dq.norm(dim=-1) + ref.dq_scale / 8) + FLUSHED_TERM * ref.visible.T
+    flushed = flush_allowances(problem)[0] + flush_allowances(shifted)[0]
+    allowed = SHIFT_UNIT * (ref.dq.norm(dim=-1) + ref.dq_scale / 8) + flushed
     ratio = (shifted_dq.double() - dq.double()).norm(dim=-1) / allowed
     queue_worst("dq change under a common key shift, rows with a pivot", ratio, checked_rows(ref) & ref.pivot.T, True)
 
@@ -615,7 +739,7 @@ def test_rows_without_keys_keep_an_lse_of_minus_infinity_and_zero_gradients():
             layout.visible[2] = False
             layout.visible[5, 5] = False
             tensors, mask, attend, _ = inter_sequence_problem(layout, *GQA_HEADS, INTER_SEQUENCE_HEAD_DIMS[0])
-            check(peaked_problem(tensors, mask, attend, first_visible_keys, exp2_error=0.0), accuracy=False)
+            check(peaked_problem(tensors, mask, attend, first_visible_keys), accuracy=False)
 
 
 # The tied scores lie on a grid of 1/8 and the other scores on a grid of 1/2 at least 22 nats lower, so k holds every
