@@ -1,4 +1,5 @@
 .venv/
+.pixi/
 .scratch/
 .zig-cache/
 zig-out/
