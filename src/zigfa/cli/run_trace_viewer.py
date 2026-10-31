@@ -21,7 +21,7 @@ CONTENT_TYPES = {
 
 
 def viewer_files():
-    package = Path(__file__).parent
+    package = Path(__file__).parents[1]
     for directory in (package / "viewer", package.parents[1] / "reports"):
         if (directory / "profile_viewer.html").exists():
             return directory / "profile_viewer.html", directory / "assets" / "report.css"
@@ -80,7 +80,7 @@ def serve(paths, host="127.0.0.1", port=PORT):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        prog="python -m zigfa.view",
+        prog="python -m zigfa.cli.run_trace_viewer",
         description=__doc__.split("\n\n")[0],
         epilog=__doc__.split("\n\n")[1],
     )

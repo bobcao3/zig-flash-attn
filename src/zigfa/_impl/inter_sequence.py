@@ -1,6 +1,6 @@
 import functools
 import math
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 from . import runtime
 from .backward import (
@@ -71,7 +71,7 @@ class Sequences(NamedTuple):
     visibility_bits_t: object
     cu_visible_k: object
     cu_visible_q: object
-    window_sizes: Optional[object] = None
+    window_sizes: object | None = None
 
 
 def words_per_row(num_sequences):
@@ -149,7 +149,7 @@ def o_accum_of(q_shape, num_sequences, num_head_kv=None):
     return OAccum(offset, SPLITS_PER_CTA * ctas, accumulators * threads * ACCUMULATOR_BYTES)
 
 
-def forward_workspace_shapes(q_shape, num_sequences, num_head_kv=None):
+def compute_forward_scratch_shapes(q_shape, num_sequences, num_head_kv=None):
     o_accum = o_accum_of(q_shape, num_sequences, num_head_kv)
     end = o_accum.split_counters(0) + 4 * o_accum.splits
     return ((-(-end // 4),),)
@@ -169,10 +169,10 @@ def block_table(workspace, capacity, block_m):
 
 
 def forward_workspace(workspace, q_shape, num_sequences, num_head_kv=None):
-    (shape,) = forward_workspace_shapes(q_shape, num_sequences, num_head_kv)
+    (shape,) = compute_forward_scratch_shapes(q_shape, num_sequences, num_head_kv)
     view = view_of(workspace[0])
     if len(workspace) != 1 or math.prod(view.shape) < shape[0]:
-        raise ValueError("the workspace does not match forward_workspace_shapes")
+        raise ValueError("the workspace does not match compute_forward_scratch_shapes")
     packing = packing_of(q_shape, num_head_kv)
     return view.pointer, block_table_capacity(q_shape[0], num_sequences, packing)
 
@@ -258,10 +258,12 @@ def prepare_metadata(
 def persistent_sources(device_id):
     """Returns the persistent forward sources that run on this GPU, preferred first: the GPU's own arch where its
     kernels run here, then the SM80 kernels where the SM80 inter-sequence kernels run."""
+    from cuda.core import Device
+
     archs = []
     try:
         arch = runtime.arch_name(device_id)
-        if PERSISTENT_CAPABILITIES.get(arch, ()) in ((), tuple(runtime.Device(device_id).compute_capability)):
+        if PERSISTENT_CAPABILITIES.get(arch, ()) in ((), tuple(Device(device_id).compute_capability)):
             archs.append(arch)
         archs.append(runtime.arch_name(device_id, inter_sequence=True))
     except RuntimeError:
@@ -283,7 +285,7 @@ def resident_ctas(device_id, instance):
     return runtime.num_sm(device_id) * max(1, occupancy)
 
 
-def backward_workspace_shapes(q_shape, lse_shape, k_shape, num_sequences):
+def compute_backward_scratch_shapes(q_shape, lse_shape, k_shape, num_sequences):
     device_id = runtime.current_device().device_id
     info = kernel_info(device_id, "bwd", q_shape[-1])
     lse_elements = math.prod(lse_shape) + info.block_m
@@ -484,7 +486,7 @@ def backward(
         num_n_blocks = scheduler_metadata_entries(rows_k, num_sequences, key_block)
         scheduler_metadata = (build_scheduler_metadata(
             table, "bwd", head_dim, VARIANT, "flash_attn_bwd", cu_seqlens_k, view_of(sequences.cu_visible_q).pointer,
-            num_sequences, num_n_blocks, "backward_workspace_shapes", stream,
+            num_sequences, num_n_blocks, "compute_backward_scratch_shapes", stream,
         ),)
     else:
         num_n_blocks = varlen_blocks(rows_k, num_sequences, key_block)

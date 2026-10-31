@@ -27,34 +27,35 @@ jobs:
           persist-credentials: false
       - name: Install build environment
         run: |
-          pixi install --locked
-          pixi run --locked ptxas --version
-          pixi run --locked fatbinary --version
+          pixi install -e build --locked
+          pixi run -e build --locked ptxas --version
+          pixi run -e build --locked fatbinary --version
       - name: Install Zig NVPTX compiler
         run: |
           set -euo pipefail
-          pixi run --locked curl --fail --location --retry 3 \
+          pixi run -e build --locked curl --fail --location --retry 3 \
             "https://github.com/bobcao3/zig-nvptx-test/releases/download/$ZIG_RELEASE/$ZIG_ARCHIVE" \
             --output "$RUNNER_TEMP/$ZIG_ARCHIVE"
           echo "$ZIG_SHA256  $RUNNER_TEMP/$ZIG_ARCHIVE" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/zig-nvptx"
-          pixi run --locked tar -xJf "$RUNNER_TEMP/$ZIG_ARCHIVE" -C "$RUNNER_TEMP/zig-nvptx" --strip-components=1
+          pixi run -e build --locked tar -xJf "$RUNNER_TEMP/$ZIG_ARCHIVE" -C "$RUNNER_TEMP/zig-nvptx" --strip-components=1
           echo "ZIG=$RUNNER_TEMP/zig-nvptx/zig" >> "$GITHUB_ENV"
           "$RUNNER_TEMP/zig-nvptx/zig" version
       - name: Run host unit tests
-        run: pixi run --locked "$ZIG" build test
+        run: pixi run -e build --locked "$ZIG" build test
       - name: Build wheel
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            pixi run --locked python -m build
+            export ZIGFA_RELEASE_VERSION="$GITHUB_REF_NAME"
+            pixi run -e build --locked python -m build
           else
             export ZIGFA_HEAD_DIM=64 ZIGFA_VARIANT=unrestricted ZIGFA_ALLOW_PARTIAL=1
-            pixi run --locked python -m build --wheel
+            pixi run -e build --locked python -m build --wheel
           fi
       - name: Verify wheel contents
         run: |
-          pixi run --locked python - <<'PY'
+          pixi run -e build --locked python - <<'PY'
           import os
           from pathlib import Path, PurePosixPath
           from zipfile import ZipFile

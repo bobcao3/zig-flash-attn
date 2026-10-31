@@ -1,13 +1,18 @@
+from __future__ import annotations
+
 import functools
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from cuda.bindings import driver
-from cuda.core import Device, LaunchConfig, ObjectCode, Stream, launch
 
-from . import profile
+from .. import profile
+
+if TYPE_CHECKING:
+    from cuda.core import Device
 
 ARCHS = {8: "sm80", 9: "sm90", 10: "sm100", 12: "sm120"}
 INTER_SEQUENCE_ARCHS = {8: "sm80", 9: "sm90", 10: "sm100", 12: "sm80"}
@@ -69,7 +74,7 @@ def manifest_value(text):
 
 @functools.cache
 def manifest():
-    package = Path(__file__).parent
+    package = Path(__file__).parents[1]
     for directory in (package / "cubin", package.parents[1] / "zig-out"):
         path = directory / "kernels.manifest"
         if path.exists():
@@ -94,7 +99,9 @@ def declared():
     return partial, tuple(lines[1:] if partial else lines)
 
 
-def current_device():
+def current_device() -> Device:
+    from cuda.core import Device
+
     device = Device()
     device.set_current()
     return device
@@ -106,11 +113,15 @@ def load(direction, head_dim, kernel_name, variant="", dynamic_shared=True):
 
 @functools.cache
 def num_sm(device_id):
+    from cuda.core import Device
+
     return Device(device_id).properties.multiprocessor_count
 
 
 @functools.cache
 def l2_bytes(device_id):
+    from cuda.core import Device
+
     return Device(device_id).properties.l2_cache_size
 
 
@@ -122,6 +133,8 @@ def head_dims():
 
 @functools.cache
 def arch_name(device_id, inter_sequence=False):
+    from cuda.core import Device
+
     major = Device(device_id).compute_capability.major
     arch = os.environ.get("ZIGFA_ARCH") or (INTER_SEQUENCE_ARCHS if inter_sequence else ARCHS).get(major)
     if arch is None:
@@ -154,6 +167,8 @@ def load_for(device_id, direction, head_dim, kernel_name, variant="", dynamic_sh
 
 @functools.cache
 def load_instance(device_id, instance, kernel_name, dynamic_shared=True):
+    from cuda.core import Device, ObjectCode
+
     directory, entries = manifest()
     if instance not in entries:
         major = Device(device_id).compute_capability.major
@@ -201,6 +216,8 @@ def verify_parameters(kernel, signature):
 
 @functools.cache
 def stream_from_handle(handle):
+    from cuda.core import Stream
+
     # Each Stream.from_handle builds a new wrapper class, which only the cycle collector frees.
     return Stream.from_handle(handle)
 
@@ -214,6 +231,8 @@ def stream_of(stream):
 
 
 def run(kernel, grid, threads, shared_bytes, signature, values, stream, pdl=False, cluster_dims=None, cooperative=False):
+    from cuda.core import LaunchConfig, launch
+
     if takes_profile(kernel, signature):
         label = kernel_labels.get(kernel, "kernel")
         address = profile.launch_argument(kernel, label, grid, threads, cluster_dims, stream_of(stream).handle)

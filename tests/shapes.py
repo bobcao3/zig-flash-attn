@@ -1,6 +1,6 @@
 import torch
 
-from zigfa import runtime
+from zigfa._impl import runtime
 
 HEAD_DIMS = runtime.head_dims()
 HEAD_DIM = 64

@@ -1,7 +1,7 @@
 import itertools
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 import pytest
 import torch
@@ -16,11 +16,11 @@ from reference import (
 )
 from shapes import HEAD_DIMS, cu_seqlens_of, cuda_seed
 from test_inter_sequence import CAUSAL, DENSE, build_layout, layout_tensors, sample_layout
-from zigfa import inter_sequence, runtime, specialization
-from zigfa.backward import HEAD_SPLIT_MINIMUM_GROUP, SM80_HEAD_SPLIT_MINIMUM_SEQLEN, backward_variant
-from zigfa.forward import SPLIT_KV_KEYS_PER_QUERY, SPLIT_KV_MIN_BLOCKS, forward_variant, split_kv
-from zigfa.specialization import SCHEDULER_METADATA_MIN_BATCH
-from zigfa.torch import flash_attn_func, flash_attn_inter_sequence_func, flash_attn_varlen_func
+from zigfa import flash_attn_func, flash_attn_inter_sequence_func, flash_attn_varlen_func
+from zigfa._impl import inter_sequence, runtime, specialization
+from zigfa._impl.backward import HEAD_SPLIT_MINIMUM_GROUP, SM80_HEAD_SPLIT_MINIMUM_SEQLEN, backward_variant
+from zigfa._impl.forward import SPLIT_KV_KEYS_PER_QUERY, SPLIT_KV_MIN_BLOCKS, forward_variant, split_kv
+from zigfa._impl.specialization import SCHEDULER_METADATA_MIN_BATCH
 
 DEVICE_ID = runtime.current_device().device_id
 INTER_SEQUENCE_FORWARD_HEAD_DIMS = inter_sequence.forward_head_dims(DEVICE_ID)
@@ -77,7 +77,7 @@ class Problem:
     dout: torch.Tensor
     mask: torch.Tensor
     attend: Callable
-    softmax_scale: Optional[float] = None
+    softmax_scale: float | None = None
     exp2_error: float = EXP2_ERROR
 
 

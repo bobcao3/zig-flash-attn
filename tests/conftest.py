@@ -5,9 +5,9 @@ import torch
 
 import checks
 from shapes import HEAD_DIMS
-from zigfa import inter_sequence, runtime, specialization
-from zigfa.backward import backward_variant, backward_workspace_layout
-from zigfa.forward import forward_variant, forward_workspace_layout
+from zigfa._impl import inter_sequence, runtime, specialization
+from zigfa._impl.backward import backward_variant, backward_workspace_layout
+from zigfa._impl.forward import forward_variant, forward_workspace_layout
 
 SELECTION_CACHES = (
     forward_workspace_layout,

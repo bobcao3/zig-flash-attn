@@ -3,8 +3,7 @@ import itertools
 import pytest
 import torch
 
-import zigfa
-from zigfa import specialization
+from zigfa._impl import backward as backward_impl, forward as forward_impl, specialization
 from checks import case, queue_attention_checks, queue_requirement
 from reference import attention_ref, varlen_attention_ref
 from shapes import (
@@ -47,19 +46,19 @@ def launch_forward_backward(q, k, v, dout, lse_shape, window, **varlen):
     hints = {name: varlen[name] for name in ("max_seqlen_q", "max_seqlen_k") if name in varlen}
     forward_workspace = tuple(
         torch.empty(shape, dtype=torch.int32, device="cuda")
-        for shape in zigfa.forward_workspace_shapes(
+        for shape in forward_impl.compute_scratch_shapes(
             tuple(q.shape), k_shape=tuple(k.shape), cu_seqlens_shape=cu_seqlens_shape, **hints
         )
     )
-    zigfa.forward(q, k, v, out, lse, forward_workspace, **window_arguments, **varlen)
+    forward_impl.forward(q, k, v, out, lse, forward_workspace, **window_arguments, **varlen)
     dq, dk, dv = (torch.full_like(tensor, float("nan")) for tensor in (q, k, v))
     workspace = tuple(
         torch.empty(shape, device="cuda", dtype=torch.float32)
-        for shape in zigfa.backward_workspace_shapes(
+        for shape in backward_impl.compute_scratch_shapes(
             tuple(q.shape), tuple(lse.shape), tuple(k.shape), *window, cu_seqlens_shape=cu_seqlens_shape, **hints
         )
     )
-    zigfa.backward(q, k, v, out, dout, lse, dq, dk, dv, workspace, **window_arguments, **varlen)
+    backward_impl.backward(q, k, v, out, dout, lse, dq, dk, dv, workspace, **window_arguments, **varlen)
     return out, lse, dq, dk, dv
 
 

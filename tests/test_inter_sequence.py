@@ -8,11 +8,13 @@ from torch.library import opcheck
 from checks import case, queue_attention_checks, queue_requirement
 from reference import FULLY_MASKED_LSE, inter_sequence_attention_ref, inter_sequence_visible
 from shapes import HEAD_LAYOUTS, cu_seqlens_of, cuda_seed
-from zigfa import inter_sequence, runtime
-from zigfa.torch import (
+from zigfa import (
     flash_attn_inter_sequence_func,
     flash_attn_inter_sequence_kvpacked_func,
-    get_inter_sequence_scheduler_metadata,
+    prepare_inter_sequence_metadata,
+)
+from zigfa._impl import inter_sequence, runtime
+from zigfa._impl.ops import (
     inter_sequence_backward,
     inter_sequence_backward_packed,
     inter_sequence_forward,
@@ -272,15 +274,15 @@ def test_kvpacked_matches_unpacked():
     queue_requirement("kvpacked dkv stacks dk and dv", (dkv == torch.stack([dk, dv], dim=1)).all())
 
 
-def test_scheduler_metadata_is_reusable():
+def test_metadata_is_reusable():
     layout = build_layout("it2i", 7)
     cuda_seed(7)
     q, k, v = (tensor.detach() for tensor in leaves(layout, 4, 4, FORWARD_HEAD_DIMS[0]))
     cu_q, cu_k, bits, window_sizes = layout_tensors(layout)
-    metadata = get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits)
+    metadata = prepare_inter_sequence_metadata(cu_q, cu_k, bits)
     arguments = (q, k, v, cu_q, cu_k, max(layout.lengths_q), max(layout.lengths_k), bits)
     fresh = flash_attn_inter_sequence_func(*arguments, window_sizes=window_sizes)
-    reused = flash_attn_inter_sequence_func(*arguments, window_sizes=window_sizes, scheduler_metadata=metadata)
+    reused = flash_attn_inter_sequence_func(*arguments, window_sizes=window_sizes, metadata=metadata)
     queue_requirement("reused metadata gives the same output", (fresh == reused).all())
 
 
@@ -289,7 +291,7 @@ def test_metadata_matches_its_definition(count):
     generator = torch.Generator().manual_seed(count)
     layout = random_layout(count, generator, separate_keys=True)
     cu_q, cu_k, bits, _ = layout_tensors(layout)
-    visible_bits_t, cu_visible_k, cu_visible_q = get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits)
+    visible_bits_t, cu_visible_k, cu_visible_q = inter_sequence_metadata(cu_q, cu_k, bits)
     lengths_q, lengths_k = torch.tensor(layout.lengths_q), torch.tensor(layout.lengths_k)
     visible = layout.visible.long()
     expected_k = torch.cat([torch.zeros(1, dtype=torch.long), (visible @ lengths_k).cumsum(0)])
@@ -311,13 +313,13 @@ def test_block_tables_match_their_definition(count, persistent):
     layout.lengths_q[1::7] = [M64_MAX_ROWS - 70 + 37 * index for index in range(len(layout.lengths_q[1::7]))]
     cu_q, cu_k, bits, window_sizes = layout_tensors(layout)
     sequences = inter_sequence.Sequences(
-        cu_q, cu_k, bits, *get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits), window_sizes
+        cu_q, cu_k, bits, *inter_sequence_metadata(cu_q, cu_k, bits), window_sizes
     )
     q, k, v = (tensor.detach() for tensor in leaves(layout, 2, 2, head_dims[0]))
     out, lse = torch.empty_like(q), torch.empty(q.shape[1], q.shape[0], dtype=torch.float32, device=q.device)
     workspace = tuple(
         torch.empty(shape, dtype=torch.int32, device=q.device)
-        for shape in inter_sequence.forward_workspace_shapes(tuple(q.shape), count)
+        for shape in inter_sequence.compute_forward_scratch_shapes(tuple(q.shape), count)
     )
     inter_sequence.forward(q, k, v, out, lse, workspace, sequences)
     capacity = inter_sequence.block_table_capacity(q.shape[0], count)
@@ -382,7 +384,7 @@ def op_arguments():
     cuda_seed(9)
     q, k, v = (tensor.detach() for tensor in leaves(layout, 4, 2, HEAD_DIMS[0]))
     cu_q, cu_k, bits, window_sizes = layout_tensors(layout)
-    metadata = get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits)
+    metadata = inter_sequence_metadata(cu_q, cu_k, bits)
     return q, k, v, (cu_q, cu_k, bits, *metadata, window_sizes), HEAD_DIMS[0] ** -0.5
 
 
@@ -408,9 +410,9 @@ def test_compiled_attention_matches_eager():
     cu_q, cu_k, bits, window_sizes = layout_tensors(layout)
 
     def attention(q, k, v):
-        metadata = get_inter_sequence_scheduler_metadata(cu_q, cu_k, bits)
+        metadata = prepare_inter_sequence_metadata(cu_q, cu_k, bits)
         return flash_attn_inter_sequence_func(
-            q, k, v, cu_q, cu_k, 1, 1, bits, window_sizes=window_sizes, scheduler_metadata=metadata
+            q, k, v, cu_q, cu_k, 1, 1, bits, window_sizes=window_sizes, metadata=metadata
         )
 
     compiled = torch.compile(attention, fullgraph=True)

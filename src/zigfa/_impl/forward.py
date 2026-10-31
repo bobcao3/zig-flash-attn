@@ -102,7 +102,7 @@ def forward_variant(
     return variant
 
 
-def forward_workspace_shapes(q_shape, *, k_shape=None, cu_seqlens_shape=None, max_seqlen_q=None, max_seqlen_k=None):
+def compute_scratch_shapes(q_shape, *, k_shape=None, cu_seqlens_shape=None, max_seqlen_q=None, max_seqlen_k=None):
     layout = forward_workspace_layout(
         runtime.current_device().device_id, q_shape, k_shape, cu_seqlens_shape, max_seqlen_q, max_seqlen_k
     )
@@ -157,7 +157,7 @@ def forward(
     metadata_index = int(workspace_layout.semaphore)
     split_kv_index = metadata_index + bool(workspace_layout.scheduler_metadata_rows)
     if len(workspace) != split_kv_index + bool(workspace_layout.split_kv_words):
-        raise ValueError("pass the workspace that forward_workspace_shapes returns for these shapes")
+        raise ValueError("pass the workspace that compute_scratch_shapes returns for these shapes")
     if not layout.row_axis_len_q:
         return
     variant = forward_variant(*key, (window_size_left, window_size_right))
@@ -213,7 +213,7 @@ def forward(
                 if not workspace or math.prod(view_of(workspace[0]).shape) < 1:
                     raise ValueError(
                         "this kernel needs the int32 tile_count_semaphore at the head of the workspace that "
-                        "forward_workspace_shapes returns"
+                        "compute_scratch_shapes returns"
                     )
                 tile_count_semaphore_pointer = view_of(workspace[0]).pointer
                 status, = driver.cuMemsetD32Async(tile_count_semaphore_pointer, 0, 1, runtime.stream_of(stream).handle)
@@ -243,7 +243,7 @@ def forward(
             plan = split_kv(device_id, info, q_view.shape, k_view.shape, (window_size_left, window_size_right))
             split_workspace = view_of(workspace[split_kv_index])
             if math.prod(split_workspace.shape) < plan.words:
-                raise ValueError("the split-KV workspace is smaller than forward_workspace_shapes returns")
+                raise ValueError("the split-KV workspace is smaller than compute_scratch_shapes returns")
             counters = split_workspace.pointer
             status, = driver.cuMemsetD32Async(counters, 0, plan.tiles, runtime.stream_of(stream).handle)
             if status != driver.CUresult.CUDA_SUCCESS:
@@ -256,7 +256,7 @@ def forward(
         values += (
             build_scheduler_metadata(
                 workspace[metadata_index], "fwd", head_dim, variant, "flash_attn_fwd", layout.cu_seqlens_q_pointer,
-                layout.cu_seqlens_k_pointer, layout.batch_size, num_m_blocks, "forward_workspace_shapes", stream,
+                layout.cu_seqlens_k_pointer, layout.batch_size, num_m_blocks, "compute_scratch_shapes", stream,
             ),
         )
     runtime.run(

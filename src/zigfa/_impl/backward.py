@@ -138,7 +138,7 @@ def backward_variant(
     return variant
 
 
-def backward_workspace_shapes(
+def compute_scratch_shapes(
     q_shape,
     lse_shape,
     k_shape,
@@ -171,11 +171,11 @@ def backward_workspace_shapes(
         shapes += ((2, *accumulator_shape(k_shape, layout.accumulator_padding)),)
     elif layout.dk_fix:
         if k_shape is None:
-            raise ValueError("backward_workspace_shapes needs k_shape")
+            raise ValueError("compute_scratch_shapes needs k_shape")
         shapes += (dk_fix_shape(k_shape, layout.accumulator_padding),)
     if layout.scheduler_metadata_rows:
         if k_shape is None:
-            raise ValueError("backward_workspace_shapes needs k_shape for varlen inputs")
+            raise ValueError("compute_scratch_shapes needs k_shape for varlen inputs")
         shapes += ((scheduler_metadata_entries(k_shape[0], layout.facts.batch_size, layout.scheduler_metadata_rows), 2),)
     return shapes
 
@@ -357,7 +357,7 @@ def backward(
     )
     layout = backward_workspace_layout(*key)
     if len(extra) != (layout.dkv_accum or layout.dk_fix) + bool(layout.scheduler_metadata_rows):
-        raise ValueError("pass the workspace that backward_workspace_shapes returns for these shapes and this window")
+        raise ValueError("pass the workspace that compute_scratch_shapes returns for these shapes and this window")
     (
         batch_size, seqlen_q, seqlen_k, cu_seqlens_q_pointer, cu_seqlens_k_pointer, row_axis_len_q, row_axis_len_k,
         lse_batch_stride, lse_head_stride,
@@ -454,7 +454,7 @@ def backward(
         main_values += (
             build_scheduler_metadata(
                 extra[-1], "bwd", head_dim, variant, "flash_attn_bwd", cu_seqlens_k_pointer, cu_seqlens_q_pointer,
-                batch_size, num_n_blocks, "backward_workspace_shapes", stream,
+                batch_size, num_n_blocks, "compute_scratch_shapes", stream,
             ),
         )
     if info.dkv_box_rows:

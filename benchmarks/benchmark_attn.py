@@ -15,9 +15,8 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.varlen import varlen_attn
 
 import timing
-import zigfa
-from zigfa import runtime
-from zigfa.torch import softmax_lse_shape
+from zigfa._impl import backward as backward_impl, forward as forward_impl, runtime
+from zigfa._impl.ops import softmax_lse_shape
 
 SHAPES = ("mha", "gqa", "varlen", "sliding")
 MASKS = ("dense", "causal")
@@ -27,7 +26,7 @@ VARLEN_LENGTH_SPREAD = 2
 SDPA_BACKENDS = {"cuDNN": SDPBackend.CUDNN_ATTENTION, "flash": SDPBackend.FLASH_ATTENTION}
 FA4_MAJORS = (9, 10, 12)
 SM80_ON_MAJORS = (12,)
-SELECTION_MODULES = ("zigfa.forward", "zigfa.backward", "zigfa.specialization")
+SELECTION_MODULES = ("zigfa._impl.forward", "zigfa._impl.backward", "zigfa._impl.specialization")
 NATIVE_ARCH = os.environ.get("ZIGFA_ARCH")
 selected_arch = NATIVE_ARCH
 
@@ -303,7 +302,7 @@ def zigfa_functions(case, dout, arch):
     lse = torch.empty(softmax_lse_shape(case.q, case.varlen), device="cuda", dtype=torch.float32)
     forward_workspace = tuple(
         torch.empty(shape, dtype=torch.int32, device="cuda")
-        for shape in zigfa.forward_workspace_shapes(
+        for shape in forward_impl.compute_scratch_shapes(
             tuple(case.q.shape),
             k_shape=tuple(case.k.shape),
             cu_seqlens_shape=cu_seqlens_shape,
@@ -314,7 +313,7 @@ def zigfa_functions(case, dout, arch):
     dq, dk, dv = torch.empty_like(case.q), torch.empty_like(case.k), torch.empty_like(case.v)
     backward_workspace = tuple(
         torch.empty(shape, device="cuda", dtype=torch.float32)
-        for shape in zigfa.backward_workspace_shapes(
+        for shape in backward_impl.compute_scratch_shapes(
             tuple(case.q.shape),
             tuple(lse.shape),
             tuple(case.k.shape),
@@ -328,12 +327,12 @@ def zigfa_functions(case, dout, arch):
     def forward():
         use_arch(arch)
         stream = torch.cuda.current_stream().cuda_stream
-        zigfa.forward(case.q, case.k, case.v, out, lse, forward_workspace, stream=stream, **options)
+        forward_impl.forward(case.q, case.k, case.v, out, lse, forward_workspace, stream=stream, **options)
 
     def backward():
         use_arch(arch)
         stream = torch.cuda.current_stream().cuda_stream
-        zigfa.backward(case.q, case.k, case.v, out, dout, lse, dq, dk, dv, backward_workspace, stream=stream, **options)
+        backward_impl.backward(case.q, case.k, case.v, out, dout, lse, dq, dk, dv, backward_workspace, stream=stream, **options)
 
     def backward_after_forward():
         forward()

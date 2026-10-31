@@ -1,4 +1,23 @@
-from .backward import backward, backward_workspace_shapes
-from .forward import forward, forward_workspace_shapes
+from .torch import (
+    InterSequenceMetadata,
+    flash_attn_func,
+    flash_attn_inter_sequence_func,
+    flash_attn_inter_sequence_kvpacked_func,
+    flash_attn_kvpacked_func,
+    flash_attn_qkvpacked_func,
+    flash_attn_varlen_func,
+    flash_attn_varlen_kvpacked_func,
+    prepare_inter_sequence_metadata,
+)
 
-__all__ = ["backward", "backward_workspace_shapes", "forward", "forward_workspace_shapes"]
+__all__ = [
+    "InterSequenceMetadata",
+    "flash_attn_func",
+    "flash_attn_inter_sequence_func",
+    "flash_attn_inter_sequence_kvpacked_func",
+    "flash_attn_kvpacked_func",
+    "flash_attn_qkvpacked_func",
+    "flash_attn_varlen_func",
+    "flash_attn_varlen_kvpacked_func",
+    "prepare_inter_sequence_metadata",
+]

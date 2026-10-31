@@ -4,20 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zigfa"
-version = "0.1.0"
-requires-python = ">=3.11"
+dynamic = ["version"]
+requires-python = ">=3.10"
 dependencies = [
-    "cuda-core[cu13]>=1.2",
-    "cuda-python>=13.4",
-    "numpy",
+	"cuda-core>=1.2,<2",
+	"numpy",
+	"torch>=2.6",
 ]
 
 [project.optional-dependencies]
-torch = ["torch>=2.6"]
-test = ["pytest", "zigfa[torch]"]
+cu12 = ["cuda-core[cu12]>=1.2,<2"]
+cu13 = ["cuda-core[cu13]>=1.2,<2"]
+test = ["pytest", "setuptools>=68"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+zigfa = ["py.typed"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]
@@ -34,5 +38,22 @@ cuda-nvcc-tools = "13.4.*"
 curl = "*"
 xz = "*"
 
+[tool.pixi.feature.test.dependencies]
+python = "3.11.*"
+
+[tool.pixi.feature.test.pypi-dependencies]
+zigfa = { path = ".", editable = true, extras = ["test"] }
+
+[tool.pixi.feature.cu12.pypi-dependencies]
+cuda-core = { version = ">=1.2,<2", extras = ["cu12"] }
+torch = { version = ">=2.6", index = "https://download.pytorch.org/whl/cu128" }
+
+[tool.pixi.feature.cu13.pypi-dependencies]
+cuda-core = { version = ">=1.2,<2", extras = ["cu13"] }
+torch = { version = ">=2.6", index = "https://download.pytorch.org/whl/cu130" }
+
 [tool.pixi.environments]
-default = { features = ["build"], no-default-feature = true }
+default = { features = ["build", "test", "cu13"], no-default-feature = true }
+build = { features = ["build"], no-default-feature = true }
+cu12 = { features = ["test", "cu12"], no-default-feature = true }
+cu13 = { features = ["test", "cu13"], no-default-feature = true }

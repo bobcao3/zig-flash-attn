@@ -1,6 +1,6 @@
 import inspect
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import pytest
 import torch
@@ -10,20 +10,18 @@ from torch.library import opcheck
 
 from checks import queue_attention_checks
 from conftest import clear_selection
-from zigfa import runtime
-from zigfa.forward import forward_variant
+from zigfa._impl import runtime
+from zigfa._impl.forward import forward_variant
 from reference import attention_ref, varlen_attention_ref
 from shapes import HEAD_DIM, HEAD_DIMS, HEAD_LAYOUTS, cu_seqlens_of, cuda_seed, uniform_lengths, window_for
-from zigfa.torch import (
-    flash_attn_backward,
-    flash_attn_backward_packed,
-    flash_attn_forward,
+from zigfa import (
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
     flash_attn_varlen_func,
     flash_attn_varlen_kvpacked_func,
 )
+from zigfa._impl.ops import flash_attn_backward, flash_attn_backward_packed, flash_attn_forward
 
 OPCHECK_TESTS = ("test_schema", "test_autograd_registration", "test_faketensor", "test_aot_dispatch_dynamic")
 DYNAMIC_SHAPES = [(2, 100, 130), (3, 64, 64), (4, 200, 96)]

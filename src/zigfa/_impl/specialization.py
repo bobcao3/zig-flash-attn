@@ -3,7 +3,6 @@ import logging
 import numbers
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 from . import runtime
 
@@ -23,15 +22,15 @@ logger = logging.getLogger("zigfa")
 @dataclass(frozen=True)
 class ShapeFacts:
     varlen: bool
-    qhead_per_kvhead: Optional[int]
-    batch_size: Optional[int]
+    qhead_per_kvhead: int | None
+    batch_size: int | None
     mean_seqlen_q: int
-    max_seqlen_q_hint: Optional[int]
-    max_seqlen_k_hint: Optional[int]
-    max_seqlen_q: Optional[int]
-    max_seqlen_k: Optional[int]
-    num_head_kv: Optional[int] = None
-    num_sm: Optional[int] = None
+    max_seqlen_q_hint: int | None
+    max_seqlen_k_hint: int | None
+    max_seqlen_q: int | None
+    max_seqlen_k: int | None
+    num_head_kv: int | None = None
+    num_sm: int | None = None
 
 
 def usable_max_seqlen(value, row_axis_len):

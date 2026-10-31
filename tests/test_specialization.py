@@ -2,8 +2,8 @@ import pytest
 import torch
 
 from shapes import HEAD_DIM
-from zigfa import runtime
-from zigfa.tensors import build_scheduler_metadata, varlen_blocks, view_of
+from zigfa._impl import runtime
+from zigfa._impl.tensors import build_scheduler_metadata, varlen_blocks, view_of
 
 SCHEDULER_METADATA_KERNELS = {"forward": ("fwd", "flash_attn_fwd"), "backward": ("bwd", "flash_attn_bwd")}
 SCHEDULER_METADATA_BATCHES = [1, 4, 31, 32, 33, 1023, 1024, 1025, 2049, 3000]

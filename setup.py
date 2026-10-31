@@ -1,13 +1,47 @@
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
+from email.parser import Parser
 from pathlib import Path
 
 from setuptools import setup
 from setuptools.command.build_py import build_py
 
 ROOT = Path(__file__).parent
+
+
+def package_version():
+    release_version = (ROOT / "VERSION").read_text().strip()
+    release_tag = os.environ.get("ZIGFA_RELEASE_VERSION")
+    if release_tag is not None:
+        if release_tag.removeprefix("v") != release_version:
+            raise RuntimeError("ZIGFA_RELEASE_VERSION must match VERSION")
+        return release_version
+    metadata = ROOT / "PKG-INFO"
+    if metadata.is_file() and Parser().parsestr(metadata.read_text())["Version"] == release_version:
+        return release_version
+    sources = [ROOT / name for name in (
+        "VERSION",
+        "LICENSE",
+        "README.md",
+        "MANIFEST.in",
+        "pyproject.toml",
+        "setup.py",
+        "build.zig",
+        "reports/profile_viewer.html",
+        "reports/assets/report.css",
+    )]
+    sources.extend((ROOT / "src" / "zigfa").rglob("*.py"))
+    sources.extend((ROOT / "src" / "zigfa").rglob("py.typed"))
+    sources.extend((ROOT / "zig").rglob("*.zig"))
+    digest = hashlib.sha256()
+    for path in sorted(sources, key=lambda path: path.relative_to(ROOT).as_posix()):
+        for part in (path.relative_to(ROOT).as_posix().encode(), path.read_bytes()):
+            digest.update(len(part).to_bytes(8, "big"))
+            digest.update(part)
+    return f"{release_version}.dev0+s{digest.hexdigest()[:16]}"
 
 
 def zig_arguments():
@@ -63,4 +97,4 @@ class BuildKernels(build_py):
             shutil.copy(ROOT / "reports" / page, viewer / page)
 
 
-setup(cmdclass={"build_py": BuildKernels})
+setup(version=package_version(), cmdclass={"build_py": BuildKernels})

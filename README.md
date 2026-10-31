@@ -7,7 +7,7 @@ PTX, for SM80, SM90, SM100 and SM120 GPUs, with a drop-in torch interface.
 
 ```python
 import torch
-from zigfa.torch import flash_attn_func, flash_attn_inter_sequence_func
+from zigfa import flash_attn_func, flash_attn_inter_sequence_func, prepare_inter_sequence_metadata
 
 q = torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(2, 1024, 2, 128, device="cuda", dtype=torch.bfloat16)
@@ -28,15 +28,18 @@ In `flash_attn_inter_sequence_func`, bit `j` of row `i` lets query sequence
 keys, as when extending a KV cache. It takes head dimensions 64, 128 and 256,
 and 512 without autograd.
 
-The lower-level `zigfa.backward` takes a workspace that the caller allocates.
-`zigfa.backward_workspace_shapes(q_shape, lse_shape, k_shape, window_size_left=-1,
-window_size_right=-1, *, cu_seqlens_shape=None, max_seqlen_q=None,
-max_seqlen_k=None)` returns the shapes of its buffers and requires `k_shape`,
-because the backward keeps the dK terms of keys whose probability exceeds 3/4 in
-a buffer sized by the keys. Allocate each shape as a `torch.float32` tensor on
-the device of `q` and pass the tensors as a tuple in the returned order. The
-number and the shapes of the buffers depend on the GPU, the shapes and the
-window, so do not unpack the tuple by position.
+Prepare metadata once and reuse the handle across calls with the same sequence
+boundaries and visibility:
+
+```python
+metadata = prepare_inter_sequence_metadata(cu, cu, bits)
+out = flash_attn_inter_sequence_func(q, k, v, cu, cu, 256, 256, bits, metadata=metadata)
+```
+
+`InterSequenceMetadata` is an opaque handle. Do not inspect or mutate its contents.
+Prepare a new handle when the sequence boundaries, visibility contents or device
+change. Continue passing `max_seqlen_q` and `max_seqlen_k` as usual; metadata does
+not replace those arguments.
 
 ## Numerics
 
@@ -94,7 +97,7 @@ print(cap.summary(by="sm"))
 ```
 
 The SM80 and SM120 forward kernels and the persistent inter-sequence forwards
-mark their zones. `python -m zigfa.view fwd.jsonl.gz --open` serves the trace
+mark their zones. `python -m zigfa.cli.run_trace_viewer fwd.jsonl.gz --open` serves the trace
 viewer on localhost and opens the trace; without `--open`, it prints the link. A
 link takes `group` (`sm`, `cluster`, `cta`, `wg` or `warp`), `start` and `end`
 in microseconds, and `expand`, the groups to unfold (or `all`, with `fold`
@@ -123,5 +126,18 @@ instances that the library can dispatch to on that GPU and whose main kernel no 
 
 ## Build from source
 
-`pip install .` needs the Zig compiler with the self-hosted PTX backend from
+Install with `pip install ".[cu12]"` or `pip install ".[cu13]"` to select the CUDA
+Python bindings and toolkit libraries. Do not select both extras in one environment.
+The installed driver must support the compiled kernels regardless of the extra.
+
+Building needs the Zig compiler with the self-hosted PTX backend from
 https://forge.bc3.moe/bob/zig-nvptx; set `ZIG` (and `PTXAS`) to the binaries.
+
+`pixi run -e build python -m build --wheel` builds with CUDA 13.4. The `cu12` and
+`cu13` Pixi environments select the matching bindings and CUDA-enabled Torch
+packages; run `pixi run -e cu12 pytest tests` or `pixi run -e cu13 pytest tests`.
+The default environment includes the build tools and the CUDA 13 test dependencies.
+
+Development versions use the release number in `VERSION` and a SHA-256 hash of
+the package sources, without reading Git metadata. Tagged CI builds check that
+the tag matches `VERSION` and use that release number without a development suffix.

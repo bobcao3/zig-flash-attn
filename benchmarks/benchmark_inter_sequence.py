@@ -10,8 +10,8 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 import timing
 from benchmark_attn import attention_bytes, attention_flops, gradient_of, versions, visible_pairs
-from zigfa import inter_sequence, runtime
-from zigfa.torch import flash_attn_inter_sequence_func, get_inter_sequence_scheduler_metadata
+from zigfa import flash_attn_inter_sequence_func, prepare_inter_sequence_metadata
+from zigfa._impl import inter_sequence, runtime
 
 DENSE = (-1, -1)
 CAUSAL = (-1, 0)
@@ -206,7 +206,7 @@ def run(name, point, samples, parts, head_dim, arguments, output):
     )
     dout = torch.randn_like(q)
     longest = max(lengths)
-    metadata = get_inter_sequence_scheduler_metadata(cu_seqlens, cu_seqlens, bits)
+    metadata = prepare_inter_sequence_metadata(cu_seqlens, cu_seqlens, bits)
 
     def zigfa_forward():
         return flash_attn_inter_sequence_func(
@@ -219,7 +219,7 @@ def run(name, point, samples, parts, head_dim, arguments, output):
             longest,
             bits,
             window_sizes=window_sizes,
-            scheduler_metadata=metadata,
+            metadata=metadata,
         )
 
     tensors = mask_tensors(samples, parts)
