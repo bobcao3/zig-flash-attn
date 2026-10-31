@@ -1,143 +1,119 @@
 # zigfa
 
-FlashAttention-4 forward and backward kernels written in Zig and compiled to
-PTX, for SM80, SM90, SM100 and SM120 GPUs, with a drop-in torch interface.
+FlashAttention-4 forward and backward kernels for SM80, SM90, SM100 and SM120 GPUs,
+with PyTorch interfaces. The kernels are written in Zig and compiled to PTX with
+[this Zig compiler fork](https://forge.bc3.moe/bob/zig-nvptx). The Python host code
+loads and launches kernels through NVIDIA's
+[`cuda-core` bindings](https://nvidia.github.io/cuda-python/cuda-core/latest/).
+
+## Install
+
+Download a wheel from [releases](https://github.com/bobcao3/zig-flash-attn/releases)
+and install it with the `cu12` or `cu13` extra to select the CUDA Python dependencies:
+
+```sh
+pip install './zigfa-2026.10.30-py3-none-any.whl[cu13]'
+```
+
+Use CUDA-enabled PyTorch for the same CUDA major. Python 3.10 or later is required.
+The NVIDIA driver must support the compiled kernels, regardless of the extra.
 
 ## Usage
 
+Inputs must be CUDA BF16 tensors. Autograd, grouped-query attention and sliding
+windows are supported; dropout, ALiBi and deterministic backward are not.
+
 ```python
 import torch
-from zigfa import flash_attn_func, flash_attn_inter_sequence_func, prepare_inter_sequence_metadata
+from zigfa import flash_attn_func, flash_attn_varlen_func
 
 q = torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(2, 1024, 2, 128, device="cuda", dtype=torch.bfloat16)
 v = torch.randn_like(k)
-out = flash_attn_func(q, k, v, causal=True)  # (batch, seqlen, heads, dim)
+out = flash_attn_func(q, k, v, causal=True)
 
-# Packed sequences of 256 and 64 tokens; the second sees the first and itself.
-cu = torch.tensor([0, 256, 320], dtype=torch.int32, device="cuda")
-bits = torch.tensor([[0b01], [0b11]], dtype=torch.int32, device="cuda")
-q, k, v = (x[0, :320] for x in (q, k, v))
-out = flash_attn_inter_sequence_func(q, k, v, cu, cu, 256, 256, bits)
+cu_seqlens = torch.tensor([0, 1024, 2048], dtype=torch.int32, device="cuda")
+out = flash_attn_varlen_func(
+    q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1),
+    cu_seqlens, cu_seqlens, 1024, 1024, causal=True,
+)
 ```
 
-The arguments follow flash-attn's `flash_attn_func` and
-`flash_attn_varlen_func`; autograd, GQA and sliding windows are supported.
-In `flash_attn_inter_sequence_func`, bit `j` of row `i` lets query sequence
-`i` see key sequence `j`; a query sequence may be empty or shorter than its
-keys, as when extending a KV cache. It takes head dimensions 64, 128 and 256,
-and 512 without autograd.
+The package also exports `flash_attn_qkvpacked_func`, `flash_attn_kvpacked_func`
+and `flash_attn_varlen_kvpacked_func`. See [the public signatures](src/zigfa/torch.py)
+for the supported arguments.
 
-Prepare metadata once and reuse the handle across calls with the same sequence
-boundaries and visibility:
+## Inter-sequence attention
+
+`flash_attn_inter_sequence_func` lets each packed query sequence attend to a chosen
+set of key sequences. This example has a shared prefix of 256 tokens and two
+independent continuations of 64 tokens each. Each continuation sees the prefix and
+itself, but not the other continuation:
 
 ```python
-metadata = prepare_inter_sequence_metadata(cu, cu, bits)
-out = flash_attn_inter_sequence_func(q, k, v, cu, cu, 256, 256, bits, metadata=metadata)
+from zigfa import flash_attn_inter_sequence_func, prepare_inter_sequence_metadata
+
+cu_seqlens = torch.tensor([0, 256, 320, 384], dtype=torch.int32, device="cuda")
+visibility_bits = torch.tensor([[0b001], [0b011], [0b101]], dtype=torch.int32, device="cuda")
+metadata = prepare_inter_sequence_metadata(cu_seqlens, cu_seqlens, visibility_bits)
+
+q = torch.randn(384, 8, 128, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(384, 2, 128, device="cuda", dtype=torch.bfloat16)
+v = torch.randn_like(k)
+out = flash_attn_inter_sequence_func(
+    q, k, v,
+    cu_seqlens, cu_seqlens,
+    max_seqlen_q=256,
+    max_seqlen_k=256,
+    visibility_bits=visibility_bits,
+    causal=True,
+    metadata=metadata,
+)
 ```
 
-`InterSequenceMetadata` is an opaque handle. Do not inspect or mutate its contents.
-Prepare a new handle when the sequence boundaries, visibility contents or device
-change. Continue passing `max_seqlen_q` and `max_seqlen_k` as usual; metadata does
-not replace those arguments.
+Use `q` of shape `(total_q, heads_q, dim)` and `k` and `v` of shape
+`(total_k, heads_kv, dim)`. For `n` sequences, construct the layout tensors as follows:
 
-## Numerics
+- `cu_seqlens_q` and `cu_seqlens_k` each contain `n + 1` cumulative token offsets,
+  starting at zero and ending at the corresponding token total. Both describe
+  the same number of sequences. Query sequences may be empty or shorter than their
+  matching key sequences, for example when using cached keys and values.
+- `visibility_bits` has shape `(n, (n + 31) // 32)`. Bit `j % 32` of word `j // 32`
+  in row `i` lets query sequence `i` attend to key sequence `j`. All other pairs
+  are masked out. Leave unused bits zero. If a word sets bit 31, construct it as
+  `int64` and cast to `int32` to obtain the signed representation.
+- All layout tensors must be contiguous CUDA `int32` tensors on the input device.
 
-The kernels apply the fix of "A Fix for Softmax and Cross-Entropy" (Barron,
-Gnanapragasam and Tschannen) to attention. The forward leaves the exponential of
-a key that scores the stored maximum of its row out of the running sum of the
-row and adds it back as an exact 1, so the log-sum-exp of a row that puts almost
-all of its weight on one key keeps the small terms of the other keys. The SM100
-forward can leave out several keys that score the stored maximum and adds each
-of them back as an exact 1. During its pass over the keys of a row, the forward
-raises the stored maximum only when a score exceeds it by more than about
-8 / (softmax_scale * log2(e)), so the stored maximum can lie up to that amount
-below the largest score of the row. In a row whose other scores all lie more
-than that amount below its largest score, the key with the largest score is left
-out. In the backward, the score of a key whose probability exceeds 3/4 gets the
-negated sum of the other score gradients of its row as its gradient, which keeps
-dQ and dK accurate on such rows, for example rows dominated by an attention
-sink. The SM80, SM90 and SM120 backward kernels compare the probability
-rounded to BF16 with 3/4. Kernels that write dK in BF16 add the dK terms of
-such a key in a second pass, which can cost half a BF16 unit of the dK before
-those terms. The SM100 backward for head dimension 256 instead rounds the
-gradient of such a key to BF16 before it multiplies the gradient into dK, which
-costs less than one BF16 unit of each such term.
+Set `max_seqlen_q` and `max_seqlen_k` to the largest individual query and key
+sequence lengths.
 
-A row that splits its weight over several keys with nearly equal scores has no
-such key and keeps the standard backward formula. The exponentials flush values
-below 2^-126 to zero, so the fix holds up to margins of about 87 - ln(n) nats
-when n keys carry the rest of the weight; the SM100 backward also flushes the
-products that form the gradients and loses accuracy a few nats earlier. In the
-forward, the exponential of a score can exceed that of the stored maximum by a
-factor of up to about 2^8. When the exponential of the stored maximum grows by a
-factor above 2^126, the factor that rescales the earlier sum flushes to zero and
-drops the terms of that sum, which lie below 2^-118 times the largest
-exponential of the row. The forward log-sum-exp therefore holds only up to
-margins of about 118 ln(2) - ln(n), or 82 - ln(n), nats. The SM100 forward
-computes some exponentials with a polynomial whose relative error reaches about
-9e-5. Any key that the SM100 forward does not leave out can carry that error in
-its exponential, so the SM100 log-sum-exp can be off by up to about 9e-5 * l'
-nats, where l' is the sum of the exponentials of those keys relative to the
-exponential of the stored maximum.
+Causal and sliding-window masks apply only within a matching query/key sequence.
+Other visible key sequences remain fully visible. For a shorter query sequence,
+the causal mask aligns its queries to the end of the matching key sequence.
 
-## Profiling
+Prepare metadata once and reuse the handle with new Q/K/V tensors for the same
+layout. Prepare a new handle when sequence boundaries, visibility contents or the
+device change. Leave the handle's contents unchanged, and keep passing the
+boundaries, visibility and maximum sequence lengths on every call. Omitting
+`metadata` makes each call prepare its own handle.
 
-Kernels built with `zig build -Dprofile`, or packaged with `ZIGFA_PROFILE=1`,
-record the begin and end of named zones in each warp. Builds without the
-option compile the same code as before:
+Inter-sequence attention supports head dimensions 64, 128 and 256, plus 512 for
+forward only. `flash_attn_inter_sequence_kvpacked_func` accepts packed keys and
+values.
 
-```python
-from zigfa import profile
+## Build and test
 
-with profile.capture() as cap:
-    out = flash_attn_func(q, k, v)
-cap.save("fwd.jsonl.gz")
-print(cap.summary(by="sm"))
+Set `ZIG` to the compiler fork's executable. The Pixi build environment supplies
+CUDA 13.4 tools:
+
+```sh
+pixi run -e build --locked python -m build --wheel
+pixi run -e cu13 --locked pytest tests --kernel-coverage=require
 ```
 
-The SM80 and SM120 forward kernels and the persistent inter-sequence forwards
-mark their zones. `python -m zigfa.cli.run_trace_viewer fwd.jsonl.gz --open` serves the trace
-viewer on localhost and opens the trace; without `--open`, it prints the link. A
-link takes `group` (`sm`, `cluster`, `cta`, `wg` or `warp`), `start` and `end`
-in microseconds, and `expand`, the groups to unfold (or `all`, with `fold`
-naming the exceptions), for example
-`http://127.0.0.1:8732/?trace=traces/0/fwd.jsonl.gz&group=sm&start=100&end=140&expand=sm2`.
-`reports/profile_viewer.html` also opens a trace that you drop onto it, and
-`reports/profile_design.html` describes the record and file formats.
+Use `-e cu12` to test with CUDA 12 dependencies. The default environment combines
+the build tools and CUDA 13 test dependencies. Development versions append a
+source hash to the base in `VERSION`; tagged builds use the release version.
 
-## Benchmarks
-
-`benchmarks/benchmark_attn.py` times zigfa against torch SDPA, which runs cuDNN where cuDNN accepts
-the case and FlashAttention otherwise, and against FlashAttention-4 on SM90, SM100 and SM120 GPUs.
-`benchmarks/benchmark_inter_sequence.py` times inter-sequence attention against compiled
-FlexAttention with a block mask of the same visibility, on its Triton kernels and, on SM90 and SM100
-GPUs, on its FlashAttention-4 kernels (`kernel_options={"BACKEND": "FLASH"}`); `--gqa 4` gives the
-keys and values a quarter of the query heads. Their default arguments measure the points of
-`reports/perf_report.html`; with `--json PATH`, each script writes one record per point, and
-`python reports/update_perf_report.py DEVICE PATH...` writes the records of one device into the
-report.
-
-## Tests
-
-`pytest tests` runs the test suite on the current GPU. At the end it lists the built kernel
-instances that the library can dispatch to on that GPU and whose main kernel no test launched;
-`--kernel-coverage=require` fails the run when it lists any.
-
-## Build from source
-
-Install with `pip install ".[cu12]"` or `pip install ".[cu13]"` to select the CUDA
-Python bindings and toolkit libraries. Do not select both extras in one environment.
-The installed driver must support the compiled kernels regardless of the extra.
-
-Building needs the Zig compiler with the self-hosted PTX backend from
-https://forge.bc3.moe/bob/zig-nvptx; set `ZIG` (and `PTXAS`) to the binaries.
-
-`pixi run -e build python -m build --wheel` builds with CUDA 13.4. The `cu12` and
-`cu13` Pixi environments select the matching bindings and CUDA-enabled Torch
-packages; run `pixi run -e cu12 pytest tests` or `pixi run -e cu13 pytest tests`.
-The default environment includes the build tools and the CUDA 13 test dependencies.
-
-Development versions use the release number in `VERSION` and a SHA-256 hash of
-the package sources, without reading Git metadata. Tagged CI builds check that
-the tag matches `VERSION` and use that release number without a development suffix.
+See [the benchmark scripts](benchmarks/) and [performance report](reports/perf_report.html)
+for measurements.
